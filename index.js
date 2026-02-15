@@ -173,7 +173,7 @@ function fetchTestGifts() {
 // Portal: GET URL из PORTAL_SEARCH_URL
 // Поддерживает два варианта:
 // 1) /api/collections/filters/backdrops  → массив бэкдропов с floor_price
-// 2) /api/nfts/search?...                → объект { results: [...] }
+// 2) /api/nfts/search?...                → объект { results: [...] } с tg_id
 async function fetchPortalGifts() {
   const url =
     process.env.PORTAL_SEARCH_URL ||
@@ -217,7 +217,7 @@ async function fetchPortalGifts() {
         market: 'Portal',
         name: `Backdrop: ${item.name}`,
         priceTon,
-        url: 'https://t.me/portals',
+        url: 'https://t.me/portals', // для бэкдропа нет tg_id, оставляем общий портал
         attrs: {
           backdrop: item.name || null,
         },
@@ -246,12 +246,18 @@ async function fetchPortalGifts() {
         }
       }
 
+      // Формируем ссылку на сам NFT в Telegram, если есть tg_id
+      let tgUrl = 'https://t.me/portals';
+      if (nft.tg_id) {
+        tgUrl = `https://t.me/nft/${nft.tg_id}`;
+      }
+
       gifts.push({
         id: `portal_${nft.id}`,
         market: 'Portal',
         name: nft.name || 'NFT',
         priceTon,
-        url: 'https://t.me/portals',
+        url: tgUrl,
         attrs: { model, symbol, backdrop },
       });
     }
@@ -327,7 +333,7 @@ async function checkMarketsForAllUsers() {
         'Каждый конкретный подарок отправляется один раз, чтобы не спамить.';
 
       try {
-        await bot.sendMessage(chatId, text, { disable_web_page_preview: true });
+        await bot.sendMessage(chatId, text, { disable_web_page_preview: false });
       } catch (e) {
         console.error('Ошибка при отправке сообщения пользователю', userId, e);
       }
