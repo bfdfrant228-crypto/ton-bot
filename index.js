@@ -176,7 +176,7 @@ async function fetchPortalGifts() {
     'https://portal-market.com/api/collections/filters/backdrops';
 
   const headers = {
-    'Accept': 'application/json',
+    Accept: 'application/json',
   };
 
   if (process.env.PORTAL_AUTH) {
@@ -242,6 +242,7 @@ async function fetchPortalGifts() {
         }
       }
 
+      // Ссылка на сам NFT в Telegram
       let tgUrl = 'https://t.me/portals';
       if (nft.tg_id) {
         tgUrl = `https://t.me/nft/${nft.tg_id}`;
@@ -284,7 +285,7 @@ async function fetchMrktGifts() {
 
   const headers = {
     'Content-Type': 'application/json',
-    'Accept': 'application/json',
+    Accept: 'application/json',
   };
 
   if (process.env.MRKT_AUTH) {
@@ -323,12 +324,18 @@ async function fetchMrktGifts() {
 
     const priceTon = nanoNum / 1e9;
 
+    // Прямая ссылка на картинку гифта на CDN MRKT
+    let mrktUrl = 'https://t.me/mrkt';
+    if (item.modelStickerThumbnailKey) {
+      mrktUrl = `https://cdn.tgmrkt.io/${item.modelStickerThumbnailKey}`;
+    }
+
     gifts.push({
       id: `mrkt_${item.collectionName}_${item.modelName}`,
       market: 'MRKT',
       name: `${item.collectionTitle || item.collectionName} — ${item.modelTitle || item.modelName}`,
       priceTon,
-      url: 'https://t.me/mrkt',
+      url: mrktUrl,
       attrs: {
         collection: item.collectionName || null,
         model: item.modelName || null,
