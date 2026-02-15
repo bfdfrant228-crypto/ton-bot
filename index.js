@@ -44,6 +44,17 @@ function formatAttrs(attrs) {
   return '\n' + lines.join('\n');
 }
 
+function buildLinksText(gift) {
+  let out = '';
+  if (gift.urlTelegram) {
+    out += `Ссылка (Telegram): ${gift.urlTelegram}\n`;
+  }
+  if (gift.urlMarket) {
+    out += `Ссылка (маркет): ${gift.urlMarket}\n`;
+  }
+  return out.trimEnd();
+}
+
 // =====================
 // Команды бота
 // =====================
@@ -152,7 +163,8 @@ function fetchTestGifts() {
       market: 'Portal',
       name: 'Тестовый подарок #1',
       priceTon: randomPrice(),
-      url: 'https://t.me/portals',
+      urlTelegram: 'https://t.me/portals',
+      urlMarket: 'https://portal-market.com',
       attrs: {},
     },
     {
@@ -160,7 +172,8 @@ function fetchTestGifts() {
       market: 'MRKT',
       name: 'Тестовый подарок MRKT',
       priceTon: randomPrice(),
-      url: 'https://t.me/mrkt',
+      urlTelegram: 'https://t.me/mrkt',
+      urlMarket: 'https://tgmrkt.io',
       attrs: {},
     },
   ];
@@ -213,7 +226,8 @@ async function fetchPortalGifts() {
         market: 'Portal',
         name: `Backdrop: ${item.name}`,
         priceTon,
-        url: 'https://t.me/portals',
+        urlTelegram: 'https://t.me/portals',
+        urlMarket: 'https://portal-market.com',
         attrs: {
           backdrop: item.name || null,
         },
@@ -242,18 +256,39 @@ async function fetchPortalGifts() {
         }
       }
 
+      // Номер подарка: external_collection_number или из tg_id (PrettyPosy-40935)
+      let number = null;
+      if (nft.external_collection_number) {
+        number = nft.external_collection_number;
+      } else if (nft.tg_id) {
+        const parts = String(nft.tg_id).split('-');
+        const last = parts[parts.length - 1];
+        if (/^\d+$/.test(last)) {
+          number = last;
+        }
+      }
+
+      let displayName = nft.name || 'NFT';
+      if (number) {
+        displayName = `${displayName} #${number}`;
+      }
+
       // Ссылка на сам NFT в Telegram
       let tgUrl = 'https://t.me/portals';
       if (nft.tg_id) {
         tgUrl = `https://t.me/nft/${nft.tg_id}`;
       }
 
+      // Примерная ссылка на страницу NFT на портале по id
+      const marketUrl = `https://portal-market.com/nfts/${nft.id}`;
+
       gifts.push({
         id: `portal_${nft.id}`,
         market: 'Portal',
-        name: nft.name || 'NFT',
+        name: displayName,
         priceTon,
-        url: tgUrl,
+        urlTelegram: tgUrl,
+        urlMarket: marketUrl,
         attrs: { model, symbol, backdrop },
       });
     }
@@ -324,18 +359,17 @@ async function fetchMrktGifts() {
 
     const priceTon = nanoNum / 1e9;
 
-    // Прямая ссылка на картинку гифта на CDN MRKT
-    let mrktUrl = 'https://t.me/mrkt';
-    if (item.modelStickerThumbnailKey) {
-      mrktUrl = `https://cdn.tgmrkt.io/${item.modelStickerThumbnailKey}`;
-    }
+    // Пока нет точного URL страницы гифта MRKT — даём общие ссылки
+    const urlTelegram = 'https://t.me/mrkt';
+    const urlMarket = 'https://tgmrkt.io';
 
     gifts.push({
       id: `mrkt_${item.collectionName}_${item.modelName}`,
       market: 'MRKT',
       name: `${item.collectionTitle || item.collectionName} — ${item.modelTitle || item.modelName}`,
       priceTon,
-      url: mrktUrl,
+      urlTelegram,
+      urlMarket,
       attrs: {
         collection: item.collectionName || null,
         model: item.modelName || null,
@@ -402,7 +436,6 @@ async function checkMarketsForAllUsers() {
       if (!gift.priceTon || gift.priceTon > settings.maxPriceTon) continue;
 
       const key = `${userId}:${gift.id}`;
-
       if (sentDeals.has(key)) {
         continue;
       }
@@ -414,8 +447,8 @@ async function checkMarketsForAllUsers() {
         `Название: ${gift.name}\n` +
         `Цена: ${gift.priceTon.toFixed(3)} TON` +
         formatAttrs(gift.attrs) +
-        `\nСсылка: ${gift.url}\n\n` +
-        'Каждый конкретный подарок отправляется один раз, чтобы не спамить.';
+        `\n\n` +
+        buildLinksText(gift);
 
       try {
         await bot.sendMessage(chatId, text, { disable_web_page_preview: false });
