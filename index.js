@@ -1,7 +1,8 @@
 const TelegramBot = require('node-telegram-bot-api');
 
 const token = process.env.TELEGRAM_TOKEN;
-const MODE = process.env.MODE || 'test'; // 'test' или 'real'
+const MODE = process.env.MODE || 'real'; // 'test' или 'real'
+const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5000);
 
 if (!token) {
   console.error('Ошибка: TELEGRAM_TOKEN не задан. Добавь токен бота в переменные окружения Railway.');
@@ -13,24 +14,35 @@ console.log('Режим работы бота MODE =', MODE);
 // Создаём Telegram-бота
 const bot = new TelegramBot(token, { polling: true });
 
-// Память для настроек пользователей (пока в ОЗУ, без базы)
+// Память для настроек пользователей (пока в ОЗУ)
 // userId -> { maxPriceTon: number }
 const users = new Map();
 
-// Чтобы не спамить одинаковыми «сделками»
+// Чтобы не спамить одинаковыми сделками
 const sentDeals = new Set();
 
-// Интервал проверки маркетов (в миллисекундах)
-const CHECK_INTERVAL_MS = 5000;
+// =====================
+// Вспомогательные функции
+// =====================
 
-// Получить или создать настройки пользователя
 function getOrCreateUser(userId) {
   if (!users.has(userId)) {
     users.set(userId, {
-      maxPriceTon: null, // максимальная цена в TON
+      maxPriceTon: null,
     });
   }
   return users.get(userId);
+}
+
+function formatAttrs(attrs) {
+  if (!attrs) return '';
+  const lines = [];
+  if (attrs.collection) lines.push(`Коллекция: ${attrs.collection}`);
+  if (attrs.model) lines.push(`Модель: ${attrs.model}`);
+  if (attrs.symbol) lines.push(`Символ: ${attrs.symbol}`);
+  if (attrs.backdrop) lines.push(`Фон: ${attrs.backdrop}`);
+  if (!lines.length) return '';
+  return '\n' + lines.join('\n');
 }
 
 // =====================
@@ -43,7 +55,7 @@ bot.onText(/^\/start\b/, (msg) => {
 
   const text =
     'Бот запущен и работает.\n\n' +
-    `Текущий режим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ (как только подключим API)'}\n\n` +
+    `Текущий режим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ с маркетов Tonnel / MRKT / Portal'}\n\n` +
     'Команды:\n' +
     '/setmaxprice 0.5 — установить максимальную цену в TON\n' +
     '/status — показать текущие настройки\n' +
@@ -55,11 +67,10 @@ bot.onText(/^\/start\b/, (msg) => {
 bot.onText(/^\/help\b/, (msg) => {
   const chatId = msg.chat.id;
   const text =
-    'Этот бот задуман для автоматического отслеживания и покупки NFT‑подарков ' +
-    'на маркетах Tonnel / Portal / MRKT.\n\n' +
+    'Этот бот отслеживает NFT‑подарки на маркетах Tonnel / MRKT / Portal.\n\n' +
     'Сейчас:\n' +
-    '• В режиме test — бот генерирует случайные цены для проверки логики.\n' +
-    '• В режиме real — сюда подключим реальные API маркетов.\n\n' +
+    '• В режиме test — генерирует случайные цены (для проверки логики);\n' +
+    '• В режиме real — тянет реальные цены из API маркетов.\n\n' +
     'Команды:\n' +
     '/setmaxprice 0.5 — максимальная цена подарка в TON\n' +
     '/status — показать текущие настройки\n' +
@@ -113,7 +124,6 @@ bot.onText(/^\/status\b/, (msg) => {
   }
 
   text += `\nТекущий режим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ (через API маркетов)'}.\n`;
-  text += 'Как только подключим реальные API Tonnel / Portal / MRKT — здесь будут настоящие цены с маркетов.';
 
   bot.sendMessage(chatId, text);
 });
@@ -129,14 +139,9 @@ bot.on('message', (msg) => {
 });
 
 // =====================
-// Работа с "подарками"
+// TEST-режим (случайные цены)
 // =====================
 
-// Унифицированный формат подарка
-// { id, market, name, priceTon, url }
-
-// Тестовая генерация подарков (как раньше)
-// В реальной версии сюда не лезем, используем fetchRealGifts()
 function fetchTestGifts() {
   function randomPrice() {
     return 0.1 + Math.random() * 0.9;
@@ -149,6 +154,7 @@ function fetchTestGifts() {
       name: 'Тестовый подарок Tonnel',
       priceTon: randomPrice(),
       url: 'https://t.me/Tonnel_Network_bot',
+      attrs: {},
     },
     {
       id: 'portal_test',
@@ -156,6 +162,7 @@ function fetchTestGifts() {
       name: 'Тестовый подарок Portal',
       priceTon: randomPrice(),
       url: 'https://t.me/portals',
+      attrs: {},
     },
     {
       id: 'mrkt_test',
@@ -163,91 +170,281 @@ function fetchTestGifts() {
       name: 'Тестовый подарок MRKT',
       priceTon: randomPrice(),
       url: 'https://t.me/mrkt',
+      attrs: {},
     },
   ];
 }
 
-// Заглушка для реальных маркетов.
-// СЮДА МЫ ПОТОМ ДОБАВИМ ЗАПРОСЫ К Tonnel / Portal / MRKT.
-async function fetchRealGifts() {
+// =====================
+// REAL-режим: запросы к маркетам
+// =====================
+
+// Tonnel: POST https://gifts2.tonnel.network/api/pageGifts
+async function fetchTonnelGifts() {
+  const url = 'https://gifts2.tonnel.network/api/pageGifts';
+  const userAuth = process.env.TONNEL_USER_AUTH;
+
+  if (!userAuth) {
+    console.warn('TONNEL_USER_AUTH не задан, Tonnel будет пропущен.');
+    return [];
+  }
+
+  const tonnelGiftName = process.env.TONNEL_GIFT_NAME || null;
+
+  const filter = {
+    price: { $exists: true },
+    buyer: { $exists: false },
+    asset: 'TON',
+  };
+  if (tonnelGiftName) {
+    filter.gift_name = tonnelGiftName;
+  }
+
+  const body = {
+    page: 1,
+    limit: 30,
+    sort: JSON.stringify({ message_post_time: -1, gift_id: -1 }),
+    filter: JSON.stringify(filter),
+    price_range: null,
+    ref: 0,
+    user_auth: userAuth,
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    console.error('Tonnel HTTP error', res.status, txt);
+    return [];
+  }
+
+  const data = await res.json().catch((e) => {
+    console.error('Tonnel JSON parse error:', e);
+    return null;
+  });
+  if (!Array.isArray(data)) {
+    console.error('Tonnel: неожиданный формат ответа, ожидается массив.');
+    return [];
+  }
+
   const gifts = [];
+  for (const item of data) {
+    const price = Number(item.price);
+    if (!price || Number.isNaN(price)) continue;
 
-  // Пример структуры: читаем URL-ы из переменных окружения
-  // TONNEL_API_URL, PORTAL_API_URL, MRKT_API_URL
-  const markets = [
-    {
-      name: 'Tonnel',
-      env: 'TONNEL_API_URL',
-      fallbackUrl: 'https://t.me/Tonnel_Network_bot',
-    },
-    {
-      name: 'Portal',
-      env: 'PORTAL_API_URL',
-      fallbackUrl: 'https://t.me/portals',
-    },
-    {
-      name: 'MRKT',
-      env: 'MRKT_API_URL',
-      fallbackUrl: 'https://t.me/mrkt',
-    },
-  ];
-
-  for (const m of markets) {
-    const url = process.env[m.env];
-    if (!url) {
-      continue; // для этого маркета URL ещё не настроен
-    }
-
-    try {
-      // В Node 18+ fetch уже встроен
-      const res = await fetch(url);
-      if (!res.ok) {
-        console.error(`Ошибка HTTP от ${m.name}:`, res.status);
-        continue;
-      }
-
-      const data = await res.json();
-
-      // ВАЖНО:
-      // Тут нужно адаптировать под реальный формат ответа API.
-      // Ниже — пример, который нужно будет подправить под конкретный JSON.
-
-      // Предположим, API возвращает массив объектов:
-      // [
-      //   { "id": "123", "name": "Gift #1", "priceTon": 0.42, "url": "https://..." },
-      //   ...
-      // ]
-      if (Array.isArray(data)) {
-        for (const item of data) {
-          if (typeof item.priceTon !== 'number') continue;
-
-          gifts.push({
-            id: `${m.name}_${item.id || item.name}`,
-            market: m.name,
-            name: item.name || 'Gift',
-            priceTon: item.priceTon,
-            url: item.url || m.fallbackUrl,
-          });
-        }
-      } else {
-        console.error(`Непонятный формат ответа от ${m.name}, ожидается массив.`);
-      }
-
-    } catch (e) {
-      console.error(`Ошибка при запросе к ${m.name}:`, e);
-    }
+    gifts.push({
+      id: `tonnel_${item.gift_id ?? item.gift_num}`,
+      market: 'Tonnel',
+      name: item.name || 'Gift',
+      priceTon: price,
+      url: 'https://t.me/Tonnel_Network_bot',
+      attrs: {
+        model: item.model || null,
+        symbol: item.symbol || null,
+        backdrop: item.backdrop || null,
+      },
+    });
   }
 
   return gifts;
 }
 
-// Общая функция: выбирает, откуда брать данные
-async function fetchGifts() {
-  if (MODE === 'real') {
-    return await fetchRealGifts();
+// MRKT: POST https://api.tgmrkt.io/api/v1/gifts/models
+async function fetchMrktGifts() {
+  const url = 'https://api.tgmrkt.io/api/v1/gifts/models';
+  const raw = process.env.MRKT_COLLECTIONS || '';
+  const collections = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (!collections.length) {
+    console.warn('MRKT_COLLECTIONS не задан, MRKT будет пропущен.');
+    return [];
   }
-  // по умолчанию — тестовый режим
-  return fetchTestGifts();
+
+  const body = { collections };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    console.error('MRKT HTTP error', res.status, txt);
+    return [];
+  }
+
+  const data = await res.json().catch((e) => {
+    console.error('MRKT JSON parse error:', e);
+    return null;
+  });
+  if (!Array.isArray(data)) {
+    console.error('MRKT: неожиданный формат ответа, ожидается массив.');
+    return [];
+  }
+
+  const gifts = [];
+  for (const item of data) {
+    const nano = item.floorPriceNanoTons;
+    const nanoNum = Number(nano);
+    if (!nanoNum || Number.isNaN(nanoNum)) continue;
+
+    const priceTon = nanoNum / 1e9;
+
+    gifts.push({
+      id: `mrkt_${item.collectionName}_${item.modelName}`,
+      market: 'MRKT',
+      name: `${item.collectionTitle || item.collectionName} — ${item.modelTitle || item.modelName}`,
+      priceTon,
+      url: 'https://t.me/mrkt',
+      attrs: {
+        collection: item.collectionName || null,
+        model: item.modelName || null,
+      },
+    });
+  }
+
+  return gifts;
+}
+
+// Portal: GET URL из PORTAL_SEARCH_URL
+// Поддерживает два варианта:
+// 1) /api/collections/filters/backdrops  → массив бэкдропов с floor_price
+// 2) /api/nfts/search?...                → объект { results: [...] }
+async function fetchPortalGifts() {
+  const url =
+    process.env.PORTAL_SEARCH_URL ||
+    'https://portal-market.com/api/collections/filters/backdrops';
+
+  const headers = {
+    'Accept': 'application/json',
+  };
+
+  if (process.env.PORTAL_AUTH) {
+    headers['Authorization'] = process.env.PORTAL_AUTH;
+  }
+
+  const res = await fetch(url, {
+    method: 'GET',
+    headers,
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    console.error('Portal HTTP error', res.status, txt);
+    return [];
+  }
+
+  const data = await res.json().catch((e) => {
+    console.error('Portal JSON parse error:', e);
+    return null;
+  });
+
+  const gifts = [];
+
+  // Вариант 1: массив бэкдропов
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      const fp = item.floor_price || item.floorPrice;
+      const priceTon = fp ? Number(fp) : NaN;
+      if (!priceTon || Number.isNaN(priceTon)) continue;
+
+      gifts.push({
+        id: `portal_backdrop_${item.name}`,
+        market: 'Portal',
+        name: `Backdrop: ${item.name}`,
+        priceTon,
+        url: 'https://t.me/portals',
+        attrs: {
+          backdrop: item.name || null,
+        },
+      });
+    }
+    return gifts;
+  }
+
+  // Вариант 2: поиск NFT: { results: [...] }
+  if (data && Array.isArray(data.results)) {
+    for (const nft of data.results) {
+      const priceStr = nft.price || nft.floor_price;
+      const priceTon = priceStr ? Number(priceStr) : NaN;
+      if (!priceTon || Number.isNaN(priceTon)) continue;
+
+      let model = null;
+      let symbol = null;
+      let backdrop = null;
+
+      if (Array.isArray(nft.attributes)) {
+        for (const attr of nft.attributes) {
+          if (!attr || !attr.type) continue;
+          if (attr.type === 'model') model = attr.value;
+          else if (attr.type === 'symbol') symbol = attr.value;
+          else if (attr.type === 'backdrop') backdrop = attr.value;
+        }
+      }
+
+      gifts.push({
+        id: `portal_${nft.id}`,
+        market: 'Portal',
+        name: nft.name || 'NFT',
+        priceTon,
+        url: 'https://t.me/portals',
+        attrs: { model, symbol, backdrop },
+      });
+    }
+    return gifts;
+  }
+
+  console.error('Portal: неожиданный формат ответа.');
+  return [];
+}
+
+// =====================
+// Общая точка: откуда брать подарки
+// =====================
+
+async function fetchGifts() {
+  if (MODE === 'test') {
+    return fetchTestGifts();
+  }
+
+  const all = [];
+
+  try {
+    const t = await fetchTonnelGifts();
+    all.push(...t);
+  } catch (e) {
+    console.error('Ошибка при запросе к Tonnel:', e);
+  }
+
+  try {
+    const m = await fetchMrktGifts();
+    all.push(...m);
+  } catch (e) {
+    console.error('Ошибка при запросе к MRKT:', e);
+  }
+
+  try {
+    const p = await fetchPortalGifts();
+    all.push(...p);
+  } catch (e) {
+    console.error('Ошибка при запросе к Portal:', e);
+  }
+
+  return all;
 }
 
 // =====================
@@ -255,61 +452,54 @@ async function fetchGifts() {
 // =====================
 
 async function checkMarketsForAllUsers() {
-  if (users.size === 0) {
-    return; // никто не настроился — никого не тревожим
-  }
+  if (users.size === 0) return;
 
   let gifts;
   try {
     gifts = await fetchGifts();
   } catch (e) {
-    console.error('Ошибка при получении подарков:', e);
+    console.error('Ошибка в fetchGifts:', e);
     return;
   }
 
-  if (!gifts || gifts.length === 0) {
-    // В реальном режиме это значит, что API ничего не вернуло
+  if (!gifts || !gifts.length) {
     return;
   }
 
   for (const [userId, settings] of users.entries()) {
-    if (!settings.maxPriceTon) {
-      continue; // у пользователя ещё нет максимальной цены
-    }
+    if (!settings.maxPriceTon) continue;
 
-    const chatId = userId; // считаем, что бот в личке
+    const chatId = userId;
 
     for (const gift of gifts) {
-      if (gift.priceTon <= settings.maxPriceTon) {
-        const key = `${userId}:${gift.id}`;
+      if (!gift.priceTon || gift.priceTon > settings.maxPriceTon) continue;
 
-        // Чтобы не спамить одним и тем же подарком
-        if (sentDeals.has(key)) {
-          continue;
-        }
-        sentDeals.add(key);
+      const key = `${userId}:${gift.id}`;
 
-        const text =
-          `Найден подходящий подарок (${MODE === 'test' ? 'ТЕСТОВЫЕ ДАННЫЕ' : 'РЕАЛЬНЫЙ МАРКЕТ'}):\n\n` +
-          `Маркет: ${gift.market}\n` +
-          `Название: ${gift.name}\n` +
-          `Цена: ${gift.priceTon.toFixed(3)} TON\n` +
-          `Ссылка: ${gift.url}\n\n` +
-          (MODE === 'test'
-            ? 'Сейчас цены генерируются случайно. Как только добавим реальные API — здесь будут настоящие сделки.'
-            : 'Это реальный лот с маркета. На следующем шаге сюда добавим автоматическую покупку.');
+      if (sentDeals.has(key)) {
+        continue;
+      }
+      sentDeals.add(key);
 
-        try {
-          await bot.sendMessage(chatId, text, { disable_web_page_preview: true });
-        } catch (e) {
-          console.error('Ошибка при отправке сообщения пользователю', userId, e);
-        }
+      const text =
+        `Найден подходящий подарок (REAL):\n\n` +
+        `Маркет: ${gift.market}\n` +
+        `Название: ${gift.name}\n` +
+        `Цена: ${gift.priceTon.toFixed(3)} TON` +
+        formatAttrs(gift.attrs) +
+        `\nСсылка: ${gift.url}\n\n` +
+        'Дальше можно добавить автопокупку через Tonkeeper / TonConnect.';
+
+      try {
+        await bot.sendMessage(chatId, text, { disable_web_page_preview: true });
+      } catch (e) {
+        console.error('Ошибка при отправке сообщения пользователю', userId, e);
       }
     }
   }
 }
 
-// Запускаем периодический опрос "маркетов"
+// Запускаем периодический опрос
 setInterval(() => {
   checkMarketsForAllUsers().catch((e) =>
     console.error('Ошибка в checkMarketsForAllUsers:', e)
