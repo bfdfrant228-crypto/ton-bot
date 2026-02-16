@@ -964,4 +964,77 @@ async function checkMarketsForAllUsers() {
   if (users.size === 0) return;
 
   for (const [userId, user] of users.entries()) {
-    if (!user.enabled) 
+    if (!user.enabled) continue;
+    if (!user.maxPriceTon) continue;
+
+    let gifts;
+    try {
+      gifts = await fetchGiftsForUser(user);
+    } catch (e) {
+      console.error('Ошибка в fetchGiftsForUser:', e);
+      continue;
+    }
+    if (!gifts || !gifts.length) continue;
+
+    gifts.sort((a, b) => a.priceTon - b.priceTon);
+
+    const chatId = userId;
+
+    for (const gift of gifts) {
+      if (!gift.priceTon || gift.priceTon > user.maxPriceTon) continue;
+
+      const attrs = gift.attrs || {};
+
+      const key = `${userId}:${gift.id}`;
+      if (sentDeals.has(key)) {
+        continue;
+      }
+      sentDeals.add(key);
+
+      let text =
+        `Price: ${gift.priceTon.toFixed(3)} TON\n` +
+        `Gift: ${gift.name}\n`;
+
+      if (attrs.model) {
+        text += `Model: ${attrs.model}\n`;
+      }
+      if (attrs.symbol) {
+        text += `Symbol: ${attrs.symbol}\n`;
+      }
+      if (attrs.backdrop) {
+        text += `Backdrop: ${attrs.backdrop}\n`;
+      }
+
+      text += `Market: ${gift.market}\n`;
+
+      if (gift.urlTelegram) {
+        text += `${gift.urlTelegram}`;
+      }
+
+      const replyMarkup = gift.urlMarket
+        ? {
+            inline_keyboard: [
+              [{ text: 'Открыть в Portal', url: gift.urlMarket }],
+            ],
+          }
+        : undefined;
+
+      try {
+        await bot.sendMessage(chatId, text, {
+          disable_web_page_preview: false,
+          reply_markup: replyMarkup,
+        });
+      } catch (e) {
+        console.error('Ошибка при отправке сообщения пользователю', userId, e);
+      }
+    }
+  }
+}
+
+setInterval(() => {
+  checkMarketsForAllUsers().catch((e) =>
+    console.error('Ошибка в checkMarketsForAllUsers:', e)
+  );
+}, CHECK_INTERVAL_MS);
+
+console.log('Бот запущен. Ожидаю команды /start в Telegram.');
