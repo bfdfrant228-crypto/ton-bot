@@ -53,7 +53,7 @@ function getOrCreateUser(userId) {
     users.set(userId, {
       maxPriceTon: null,
       enabled: true,
-      state: null, // awaiting_max_price / awaiting_gift_search / awaiting_model_search / awaiting_backdrop_search
+      state: null, // awaiting_max_price / awaiting_*_search
       filters: {
         gifts: [],      // подарки (Fresh Socks, Victory Medal, ...)
         models: [],     // модели (Night Bat, Genius, ...)
@@ -1197,7 +1197,7 @@ async function portalSearch({
 }
 
 // =====================
-// MRKT: /gifts/saling
+// MRKT: /gifts/saling (с salePrice)
 // =====================
 
 async function fetchMrktGiftsForUser(user) {
@@ -1213,7 +1213,7 @@ async function fetchMrktGiftsForUser(user) {
   const body = {
     collectionNames: giftsFilter,    // ["Lunar Snake", ...]
     modelNames: modelsFilter,        // ["Albino", ...]
-    backdropNames: backdropsFilter,  // по желанию
+    backdropNames: backdropsFilter,  // ["Indigo Dye", ...] при необходимости
     symbolNames: [],
     ordering: 'Price',
     lowToHigh: true,
@@ -1261,14 +1261,12 @@ async function fetchMrktGiftsForUser(user) {
   for (const g of rawGifts) {
     if (!g) continue;
 
-    // Пытаемся вытащить цену
+    // MRKT JSON: цена в поле salePrice (наноTON)
     let priceTon = NaN;
-    if (g.priceNanoTons != null) {
-      priceTon = Number(g.priceNanoTons) / 1e9;
-    } else if (g.priceNanoTon != null) {
-      priceTon = Number(g.priceNanoTon) / 1e9;
-    } else if (g.price != null) {
-      priceTon = typeof g.price === 'number' ? g.price : Number(g.price);
+    if (g.salePrice != null) {
+      priceTon = Number(g.salePrice) / 1e9;
+    } else if (g.salePriceWithoutFee != null) {
+      priceTon = Number(g.salePriceWithoutFee) / 1e9;
     }
 
     if (!priceTon || Number.isNaN(priceTon)) continue;
@@ -1367,11 +1365,11 @@ async function checkMarketsForAllUsers() {
     }
     if (!gifts || !gifts.length) continue;
 
-    gifts.sort((a, b) => a.priceTon - b.priceTon);
-
     const markets = user.filters.markets || ['Portal', 'MRKT'];
     const wantPortal = markets.includes('Portal');
     const wantMrkt = markets.includes('MRKT');
+
+    gifts.sort((a, b) => a.priceTon - b.priceTon);
 
     const chatId = userId;
 
@@ -1384,7 +1382,7 @@ async function checkMarketsForAllUsers() {
 
       const attrs = gift.attrs || {};
 
-      // жёсткий фильтр по подарку/модели/фону (для всех маркетов)
+      // Жёсткий фильтр по подарку/модели/фону для ВСЕХ маркетов (Portal и MRKT)
       const giftNameVal = (gift.baseName || gift.name || '').toLowerCase().trim();
       if (user.filters.gifts.length && !user.filters.gifts.includes(giftNameVal)) {
         continue;
@@ -1460,3 +1458,25 @@ setInterval(() => {
 }, CHECK_INTERVAL_MS);
 
 console.log('Бот запущен. Ожидаю команды /start в Telegram.');
+2. Что проверить после обновления
+В Railway:
+убедись, что MRKT_AUTH = твой токен (5ec7c087-...), без кавычек.
+В боте:
+/start
+🎛 Фильтры → 🏦 Маркеты → 🅼 Только MRKT
+🎁 Выбрать подарок → Hanging Star (из твоего JSON — там collectionName: "Hanging Star")
+🎯 Выбрать модель → Cucumber
+/setmaxprice 20
+🔍 Запустить поиск
+Если в MRKT по таким фильтрам есть продающиеся подарки ≤20 TON (а по JSON видно: salePrice: 8700000000 → 8.7 TON), бот должен начать слать:
+
+text
+
+Price: 8.700 TON
+Gift: Hanging Star #7463
+Collection: Hanging Star
+Model: Cucumber
+Backdrop: Indigo Dye
+Market: MRKT
+https://t.me/mrkt
+[Открыть в MRKT]
