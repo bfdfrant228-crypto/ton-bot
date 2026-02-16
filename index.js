@@ -36,38 +36,13 @@ function getOrCreateUser(userId) {
       enabled: true, // мониторинг включён по умолчанию
       state: null,   // состояние для ввода (цена/фильтры)
       filters: {
-        models: [],     // массив строк (lowercase)
-        backdrops: [],  // массив строк (lowercase)
+        gifts: [],      // подарки (Victory Medal, ...)
+        models: [],     // модели (Toy Joy, ...)
+        backdrops: [],  // фоны (Black, ...)
       },
     });
   }
   return users.get(userId);
-}
-
-function formatAttrs(attrs) {
-  if (!attrs) return '';
-  const lines = [];
-  if (attrs.model) lines.push(`Модель: ${attrs.model}`);
-  if (attrs.symbol) lines.push(`Символ: ${attrs.symbol}`);
-  if (attrs.backdrop) lines.push(`Фон: ${attrs.backdrop}`);
-  if (!lines.length) return '';
-  return '\n' + lines.join('\n');
-}
-
-function buildLinksText(gift) {
-  if (!gift.urlTelegram) return '';
-  const label = escapeHtml(gift.linkLabel || gift.name || 'Подарок');
-  const url = gift.urlTelegram;
-  return `Ссылка (Telegram): <a href="${url}">${label}</a>`;
-}
-
-function escapeHtml(str) {
-  return String(str).replace(/[&<>]/g, (c) => {
-    if (c === '&') return '&amp;';
-    if (c === '<') return '&lt;';
-    if (c === '>') return '&gt;';
-    return c;
-  });
 }
 
 function parseListInput(text) {
@@ -89,11 +64,11 @@ bot.onText(/^\/start\b/, (msg) => {
   const text =
     'Бот запущен.\n\n' +
     `Режим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ с Portal'}\n\n` +
-    'Используй кнопки снизу:\n' +
+    'Кнопки снизу:\n' +
     '🔍 Запустить поиск — включить мониторинг\n' +
     '⏹ Остановить поиск — выключить мониторинг\n' +
     '💰 Установить цену — задать максимум в TON\n' +
-    '🎛 Фильтры — настроить модели/фоны';
+    '🎛 Фильтры — выбрать подарки/модели/фоны';
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -101,15 +76,17 @@ bot.onText(/^\/start\b/, (msg) => {
 bot.onText(/^\/help\b/, (msg) => {
   const chatId = msg.chat.id;
   const text =
-    'Бот отслеживает NFT‑подарки (Portal).\n\n' +
+    'Бот отслеживает NFT‑подарки Portal.\n\n' +
     'Кнопки:\n' +
-    '🔍 Запустить поиск — бот начнёт слать найденные гифты\n' +
-    '⏹ Остановить поиск — временно остановить уведомления\n' +
+    '🔍 Запустить поиск — начать слать найденные гифты\n' +
+    '⏹ Остановить поиск — временно остановить\n' +
     '💰 Установить цену — максимум в TON\n' +
-    '🎛 Фильтры — задать модели и фоны\n\n' +
-    'Также доступны команды:\n' +
+    '🎛 Фильтры — подарки / модели / фоны\n\n' +
+    'Команды:\n' +
     '/setmaxprice 0.5 — задать цену\n' +
-    '/status — показать настройки';
+    '/status — показать настройки\n' +
+    '/listgifts — список доступных подарков\n' +
+    '/listmodels — список моделей и фонов';
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -156,6 +133,12 @@ bot.onText(/^\/status\b/, (msg) => {
 
   text += `• Мониторинг: ${user.enabled ? 'включён' : 'выключен'}\n`;
 
+  if (user.filters.gifts.length) {
+    text += `• Фильтр по подаркам: ${user.filters.gifts.join(', ')}\n`;
+  } else {
+    text += '• Фильтр по подаркам: нет\n';
+  }
+
   if (user.filters.models.length) {
     text += `• Фильтр по моделям: ${user.filters.models.join(', ')}\n`;
   } else {
@@ -174,7 +157,7 @@ bot.onText(/^\/status\b/, (msg) => {
 });
 
 // =====================
-// Обработка кнопок и состояний
+// Callback-кнопки (inline)
 // =====================
 
 bot.on('callback_query', async (query) => {
@@ -183,25 +166,33 @@ bot.on('callback_query', async (query) => {
   const data = query.data;
   const user = getOrCreateUser(userId);
 
-  if (data === 'filter_model') {
+  if (data === 'filter_gift') {
+    user.state = 'awaiting_gifts';
+    await bot.sendMessage(
+      chatId,
+      'Напиши названия подарков через запятую.\nНапример:\nVictory Medal, Heart Locket',
+      { reply_markup: MAIN_KEYBOARD }
+    );
+  } else if (data === 'filter_model') {
     user.state = 'awaiting_models';
     await bot.sendMessage(
       chatId,
-      'Напиши названия моделей через запятую.\nНапример:\nToy Joy, Pretty Posy',
+      'Напиши названия моделей через запятую.\nНапример:\nToy Joy, Queen Bee',
       { reply_markup: MAIN_KEYBOARD }
     );
   } else if (data === 'filter_backdrop') {
     user.state = 'awaiting_backdrops';
     await bot.sendMessage(
       chatId,
-      'Напиши названия фонов через запятую.\nНапример:\nKhaki Green, Deep Cyan',
+      'Напиши названия фонов через запятую.\nНапример:\nBlack, Khaki Green',
       { reply_markup: MAIN_KEYBOARD }
     );
   } else if (data === 'filters_clear') {
+    user.filters.gifts = [];
     user.filters.models = [];
     user.filters.backdrops = [];
     user.state = null;
-    await bot.sendMessage(chatId, 'Фильтры моделей и фонов сброшены.', {
+    await bot.sendMessage(chatId, 'Фильтры подарков, моделей и фонов сброшены.', {
       reply_markup: MAIN_KEYBOARD,
     });
   }
@@ -209,18 +200,21 @@ bot.on('callback_query', async (query) => {
   bot.answerCallbackQuery(query.id).catch(() => {});
 });
 
+// =====================
+// Обработка сообщений (состояния + кнопки)
+// =====================
+
 bot.on('message', (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   if (!msg.text) return;
 
   const text = msg.text.trim();
-  // Команды уже пойманы выше
-  if (text.startsWith('/')) return;
+  if (text.startsWith('/')) return; // команды уже обработаны
 
   const user = getOrCreateUser(userId);
 
-  // Обработка состояний (ожидаем ввода)
+  // Состояния ввода
   if (user.state === 'awaiting_max_price') {
     const value = parseFloat(text.replace(',', '.'));
     if (Number.isNaN(value) || value <= 0) {
@@ -232,6 +226,20 @@ bot.on('message', (msg) => {
     bot.sendMessage(
       chatId,
       `Максимальная цена установлена: ${value.toFixed(3)} TON.`,
+      { reply_markup: MAIN_KEYBOARD }
+    );
+    return;
+  }
+
+  if (user.state === 'awaiting_gifts') {
+    const list = parseListInput(text);
+    user.filters.gifts = list;
+    user.state = null;
+    bot.sendMessage(
+      chatId,
+      list.length
+        ? `Фильтр по подаркам установлен: ${list.join(', ')}`
+        : 'Фильтр по подаркам очищен.',
       { reply_markup: MAIN_KEYBOARD }
     );
     return;
@@ -265,7 +273,7 @@ bot.on('message', (msg) => {
     return;
   }
 
-  // Обработка нажатий на кнопки
+  // Кнопки
   if (text === '💰 Установить цену') {
     user.state = 'awaiting_max_price';
     bot.sendMessage(chatId, 'Введи максимальную цену в TON, например: 4.5', {
@@ -293,6 +301,7 @@ bot.on('message', (msg) => {
   if (text === '🎛 Фильтры') {
     const inlineKeyboard = {
       inline_keyboard: [
+        [{ text: 'Фильтр по подарку', callback_data: 'filter_gift' }],
         [
           { text: 'Фильтр по модели', callback_data: 'filter_model' },
           { text: 'Фильтр по фону', callback_data: 'filter_backdrop' },
@@ -328,8 +337,8 @@ function fetchTestGifts() {
     {
       id: 'portal_test_1',
       market: 'Portal',
-      name: 'Тестовый подарок #1',
-      linkLabel: 'Тестовый подарок #1',
+      name: 'Test Gift #1',
+      baseName: 'Test Gift',
       priceTon: randomPrice(),
       urlTelegram: 'https://t.me/portals',
       urlMarket: 'https://t.me/portals',
@@ -380,11 +389,13 @@ async function fetchPortalGifts() {
       const priceTon = fp ? Number(fp) : NaN;
       if (!priceTon || Number.isNaN(priceTon)) continue;
 
+      const baseName = item.name || 'Backdrop';
+
       gifts.push({
         id: `portal_backdrop_${item.name}`,
         market: 'Portal',
         name: `Backdrop: ${item.name}`,
-        linkLabel: `Backdrop: ${item.name}`,
+        baseName,
         priceTon,
         urlTelegram: 'https://t.me/portals',
         urlMarket: 'https://t.me/portals',
@@ -416,6 +427,8 @@ async function fetchPortalGifts() {
         }
       }
 
+      const baseName = nft.name || 'NFT';
+
       // Номер подарка: external_collection_number или из tg_id (PrettyPosy-40935)
       let number = null;
       if (nft.external_collection_number) {
@@ -428,7 +441,7 @@ async function fetchPortalGifts() {
         }
       }
 
-      let displayName = nft.name || 'NFT';
+      let displayName = baseName;
       if (number) {
         displayName = `${displayName} #${number}`;
       }
@@ -449,7 +462,7 @@ async function fetchPortalGifts() {
         id: `portal_${nft.id}`,
         market: 'Portal',
         name: displayName,
-        linkLabel: displayName,
+        baseName,
         priceTon,
         urlTelegram: tgUrl,
         urlMarket: marketUrl,
@@ -485,6 +498,130 @@ async function fetchGifts() {
 }
 
 // =====================
+// /listgifts и /listmodels
+// =====================
+
+bot.onText(/^\/listgifts\b/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  let gifts;
+  try {
+    gifts = await fetchGifts();
+  } catch (e) {
+    console.error('/listgifts fetchGifts error:', e);
+    bot.sendMessage(chatId, 'Не получилось получить список подарков.');
+    return;
+  }
+
+  if (!gifts || !gifts.length) {
+    bot.sendMessage(chatId, 'Подарков сейчас не найдено (по текущему запросу Portal).');
+    return;
+  }
+
+  const namesMap = new Map(); // lower -> original
+  for (const g of gifts) {
+    const base = (g.baseName || g.name || '').trim();
+    if (!base) continue;
+    const key = base.toLowerCase();
+    if (!namesMap.has(key)) namesMap.set(key, base);
+  }
+
+  if (!namesMap.size) {
+    bot.sendMessage(chatId, 'Не удалось выделить названия подарков.');
+    return;
+  }
+
+  const lines = Array.from(namesMap.values())
+    .sort()
+    .map((n) => `- ${n}`);
+
+  let text = 'Доступные подарки (по текущему запросу Portal):\n' + lines.join('\n');
+  if (text.length > 4000) {
+    text = text.slice(0, 3990) + '\n...';
+  }
+
+  bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
+});
+
+bot.onText(/^\/listmodels\b/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  let gifts;
+  try {
+    gifts = await fetchGifts();
+  } catch (e) {
+    console.error('/listmodels fetchGifts error:', e);
+    bot.sendMessage(chatId, 'Не получилось получить список моделей и фонов.');
+    return;
+  }
+
+  if (!gifts || !gifts.length) {
+    bot.sendMessage(chatId, 'Данные пока не найдены (по текущему запросу Portal).');
+    return;
+  }
+
+  const giftNames = new Map();
+  const models = new Map();
+  const backdrops = new Map();
+
+  for (const g of gifts) {
+    const base = (g.baseName || g.name || '').trim();
+    if (base) {
+      const k = base.toLowerCase();
+      if (!giftNames.has(k)) giftNames.set(k, base);
+    }
+
+    const m = g.attrs?.model;
+    if (m) {
+      const k = m.toLowerCase();
+      if (!models.has(k)) models.set(k, m);
+    }
+
+    const b = g.attrs?.backdrop;
+    if (b) {
+      const k = b.toLowerCase();
+      if (!backdrops.has(k)) backdrops.set(k, b);
+    }
+  }
+
+  let text = 'Подарки:\n';
+  if (giftNames.size) {
+    text += Array.from(giftNames.values())
+      .sort()
+      .map((n) => `- ${n}`)
+      .join('\n');
+  } else {
+    text += '(нет данных)\n';
+  }
+
+  text += '\n\nМодели:\n';
+  if (models.size) {
+    text += Array.from(models.values())
+      .sort()
+      .map((n) => `- ${n}`)
+      .join('\n');
+  } else {
+    text += '(нет данных)\n';
+  }
+
+  text += '\n\nФоны:\n';
+  if (backdrops.size) {
+    text += Array.from(backdrops.values())
+      .sort()
+      .map((n) => `- ${n}`)
+      .join('\n');
+  } else {
+    text += '(нет данных)\n';
+  }
+
+  if (text.length > 4000) {
+    text = text.slice(0, 3990) + '\n...';
+  }
+
+  bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
+});
+
+// =====================
 // Мониторинг
 // =====================
 
@@ -512,14 +649,22 @@ async function checkMarketsForAllUsers() {
     for (const gift of gifts) {
       if (!gift.priceTon || gift.priceTon > user.maxPriceTon) continue;
 
+      const attrs = gift.attrs || {};
+
+      // Фильтр по подаркам
+      const giftNameVal = (gift.baseName || gift.name || '').toLowerCase();
+      if (user.filters.gifts.length && !user.filters.gifts.includes(giftNameVal)) {
+        continue;
+      }
+
       // Фильтр по моделям
-      const modelVal = (gift.attrs?.model || '').toLowerCase();
+      const modelVal = (attrs.model || '').toLowerCase();
       if (user.filters.models.length && !user.filters.models.includes(modelVal)) {
         continue;
       }
 
       // Фильтр по фонам
-      const backdropVal = (gift.attrs?.backdrop || '').toLowerCase();
+      const backdropVal = (attrs.backdrop || '').toLowerCase();
       if (user.filters.backdrops.length && !user.filters.backdrops.includes(backdropVal)) {
         continue;
       }
@@ -530,17 +675,23 @@ async function checkMarketsForAllUsers() {
       }
       sentDeals.add(key);
 
-      const attrsText = formatAttrs(gift.attrs);
-      const linksText = buildLinksText(gift);
+      let text = `Gift: ${gift.name}\n`;
 
-      let text =
-        `Найден подходящий подарок:\n\n` +
-        `Маркет: ${gift.market}\n` +
-        `Название: ${gift.name}\n` +
-        `Цена: ${gift.priceTon.toFixed(3)} TON`;
+      if (attrs.model) {
+        text += `Model: ${attrs.model}\n`;
+      }
+      if (attrs.symbol) {
+        text += `Symbol: ${attrs.symbol}\n`;
+      }
+      if (attrs.backdrop) {
+        text += `Backdrop: ${attrs.backdrop}\n`;
+      }
 
-      if (attrsText) text += attrsText;
-      if (linksText) text += `\n\n${linksText}`;
+      text += `Market: ${gift.market}\n`;
+
+      if (gift.urlTelegram) {
+        text += `${gift.urlTelegram}`;
+      }
 
       const replyMarkup = gift.urlMarket
         ? {
@@ -552,7 +703,6 @@ async function checkMarketsForAllUsers() {
 
       try {
         await bot.sendMessage(chatId, text, {
-          parse_mode: 'HTML',
           disable_web_page_preview: false,
           reply_markup: replyMarkup,
         });
