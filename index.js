@@ -5,6 +5,9 @@ const MODE = process.env.MODE || 'real'; // 'test' или 'real'
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5000);
 // сколько страниц Portal запрашивать (умножается на limit из URL)
 const PORTAL_PAGES = Number(process.env.PORTAL_PAGES || 3);
+// сколько превью с картинками показывать максимум (пока картинки не используем, но оставим запас)
+const MAX_GIFT_PREVIEWS = Number(process.env.MAX_GIFT_PREVIEWS || 12);
+const MAX_MODEL_PREVIEWS = Number(process.env.MAX_MODEL_PREVIEWS || 12);
 
 if (!token) {
   console.error('Ошибка: TELEGRAM_TOKEN не задан. Добавь токен бота в переменные окружения Railway.');
@@ -48,9 +51,9 @@ function getOrCreateUser(userId) {
       enabled: true, // мониторинг включён
       state: null,   // состояние ввода (только для цены)
       filters: {
-        gifts: [],      // подарки (Victory Medal, ...)
-        models: [],     // модели (Genius, ...)
-        backdrops: [],  // фоны (Black, ...)
+        gifts: [],      // подарки (Fresh Socks, Victory Medal, ...)
+        models: [],     // модели (Night Bat, Genius, ...)
+        backdrops: [],  // фоны (Black, Dark Green, ...)
       },
     });
   }
@@ -167,7 +170,7 @@ bot.onText(/^\/status\b/, (msg) => {
 
 async function getCurrentGifts() {
   try {
-    return await fetchGifts();
+    return await fetchGiftsForListing();
   } catch (e) {
     console.error('getCurrentGifts error:', e);
     return [];
@@ -308,11 +311,24 @@ bot.on('callback_query', async (query) => {
       if (!gifts.length) {
         await bot.sendMessage(chatId, 'Сейчас подарков не найдено.');
       } else {
-        const { giftNames } = buildNameMapFromGifts(gifts);
-        if (!giftNames.size) {
+        const giftMap = new Map(); // lowerName -> { name }
+        for (const g of gifts) {
+          const base = (g.baseName || g.name || '').trim();
+          if (!base) continue;
+          const key = base.toLowerCase();
+          if (!giftMap.has(key)) {
+            giftMap.set(key, { name: base });
+          }
+        }
+
+        if (!giftMap.size) {
           await bot.sendMessage(chatId, 'Не удалось выделить названия подарков.');
         } else {
-          const names = Array.from(giftNames.values()).sort();
+          const items = Array.from(giftMap.values()).sort((a, b) =>
+            a.name.localeCompare(b.name)
+          );
+
+          const names = items.map((i) => i.name);
           const inline_keyboard = buildInlineButtons('set_gift:', names);
           await bot.sendMessage(chatId, 'Выбери подарок:', { reply_markup: { inline_keyboard } });
         }
@@ -325,28 +341,29 @@ bot.on('callback_query', async (query) => {
           { reply_markup: MAIN_KEYBOARD }
         );
       } else {
-        const selectedGift = user.filters.gifts[0]; // одна коллекция (lowercase)
+        const selectedGift = user.filters.gifts[0]; // lower-case
         const gifts = await getCurrentGifts();
-        const modelsSet = new Map();
+        const modelMap = new Map(); // lowerModel -> original
 
         for (const g of gifts) {
           const base = (g.baseName || g.name || '').toLowerCase().trim();
           if (base !== selectedGift) continue;
           const m = g.attrs?.model;
-          if (m) {
-            const k = m.toLowerCase().trim();
-            if (!modelsSet.has(k)) modelsSet.set(k, m);
+          if (!m) continue;
+          const mk = m.toLowerCase().trim();
+          if (!modelMap.has(mk)) {
+            modelMap.set(mk, m);
           }
         }
 
-        if (!modelsSet.size) {
+        if (!modelMap.size) {
           await bot.sendMessage(
             chatId,
             'Не нашёл моделей для выбранного подарка (по текущему запросу Portal).',
             { reply_markup: MAIN_KEYBOARD }
           );
         } else {
-          const names = Array.from(modelsSet.values()).sort();
+          const names = Array.from(modelMap.values()).sort();
           const inline_keyboard = buildInlineButtons('set_model:', names);
           await bot.sendMessage(chatId, 'Выбери модель:', {
             reply_markup: { inline_keyboard },
@@ -633,140 +650,151 @@ function fetchTestGifts() {
 }
 
 // =====================
-// REAL-режим: Portal (многолепестковый fetch + сортировка)
+// REAL-режим: Portal (как portalsmp.search)
 // =====================
 
-async function fetchPortalGifts() {
-  const confUrl =
-    process.env.PORTAL_SEARCH_URL ||
-    'https://portal-market.com/api/nfts/search?offset=0&limit=100&status=listed&exclude_bundled=true&premarket_status=all';
+const API_URL = 'https://portals-market.com/api/';
+const SORTS = {
+  latest: '&sort_by=listed_at+desc',
+  price_asc: '&sort_by=price+asc',
+  price_desc: '&sort_by=price+desc',
+  gift_id_asc: '&sort_by=external_collection_number+asc',
+  gift_id_desc: '&sort_by=external_collection_number+desc',
+  model_rarity_asc: '&sort_by=model_rarity+asc',
+  model_rarity_desc: '&sort_by=model_rarity+desc',
+};
 
-  // Если это URL бэкдропов — старый простой режим
-  if (confUrl.includes('/api/collections/filters/backdrops')) {
-    const res = await fetch(confUrl, {
-      method: 'GET',
-      headers: buildPortalHeaders(),
-    });
+function cap(text) {
+  // повторяем логику Python cap(): каждое слово -> с большой буквы
+  return String(text).replace(/\w+(?:'\w+)?/g, (word) => {
+    return word.charAt(0).toUpperCase() + word.slice(1);
+  });
+}
 
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      console.error('Portal HTTP error (backdrops)', res.status, txt.slice(0, 200));
-      return [];
-    }
+function quotePlus(str) {
+  return encodeURIComponent(str).replace(/%20/g, '+');
+}
 
-    const data = await res.json().catch((e) => {
-      console.error('Portal JSON parse error (backdrops):', e);
-      return null;
-    });
+function listToURL(list) {
+  return list.map((s) => quotePlus(cap(s))).join('%2C');
+}
 
-    if (!Array.isArray(data)) {
-      console.error('Portal: ожидался массив для бэкдропов.');
-      return [];
-    }
+function buildPortalHeaders(auth) {
+  const headers = {
+    Authorization: auth,
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+    Origin: 'https://portals-market.com',
+    Referer: 'https://portals-market.com/',
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+  };
+  return headers;
+}
 
-    const gifts = [];
-    for (const item of data) {
-      const fp = item.floor_price || item.floorPrice;
-      const priceTon = fp ? Number(fp) : NaN;
-      if (!priceTon || Number.isNaN(priceTon)) continue;
-
-      const baseName = item.name || 'Backdrop';
-
-      gifts.push({
-        id: `portal_backdrop_${item.name}`,
-        market: 'Portal',
-        name: `Backdrop: ${item.name}`,
-        baseName,
-        priceTon,
-        urlTelegram: 'https://t.me/portals',
-        urlMarket: 'https://t.me/portals',
-        attrs: {
-          backdrop: item.name || null,
-        },
-      });
-    }
-
-    gifts.sort((a, b) => a.priceTon - b.priceTon);
-    return gifts;
-  }
-
-  // Многопоточный fetch для /api/nfts/search
-  let urlObj;
-  try {
-    urlObj = new URL(confUrl);
-  } catch (e) {
-    console.error('Portal URL parse error:', e);
+// JS-версия portalsmp.search()
+async function portalSearch({
+  sort = 'price_asc',
+  offset = 0,
+  limit = 20,
+  giftNames = [],
+  models = [],
+  backdrops = [],
+  symbols = [],
+  minPrice = 0,
+  maxPrice = 100000,
+}) {
+  const authData = process.env.PORTAL_AUTH;
+  if (!authData) {
+    console.warn('PORTAL_AUTH не задан, Portal API будет пропущен.');
     return [];
   }
 
-  const baseUrl = urlObj.origin + urlObj.pathname;
-  const baseParams = new URLSearchParams(urlObj.searchParams);
+  let url = `${API_URL}nfts/search?offset=${offset}&limit=${limit}`;
+  url += SORTS[sort] || SORTS.price_asc;
 
-  let limit = Number(baseParams.get('limit') || 100);
-  if (!Number.isFinite(limit) || limit <= 0) limit = 100;
-  if (limit > 500) limit = 500;
+  minPrice = Number(minPrice) || 0;
+  maxPrice = Number(maxPrice) || 100000;
 
-  const maxPages = PORTAL_PAGES > 0 ? PORTAL_PAGES : 1;
+  if (maxPrice < 100000) {
+    url += `&min_price=${minPrice}&max_price=${maxPrice}`;
+  }
 
-  const allNfts = new Map(); // id -> nft
-
-  for (let page = 0; page < maxPages; page++) {
-    const params = new URLSearchParams(baseParams);
-    params.set('offset', String(page * limit));
-    params.set('limit', String(limit));
-
-    const pageUrl = `${baseUrl}?${params.toString()}`;
-
-    let res;
-    try {
-      res = await fetch(pageUrl, {
-        method: 'GET',
-        headers: buildPortalHeaders(),
-      });
-    } catch (e) {
-      console.error('Portal fetch error (page):', e);
-      break;
-    }
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      console.error('Portal HTTP error (page)', res.status, txt.slice(0, 200));
-      break;
-    }
-
-    const data = await res.json().catch((e) => {
-      console.error('Portal JSON parse error (page):', e);
-      return null;
-    });
-    if (!data) break;
-
-    let pageResults = [];
-    if (Array.isArray(data.results)) {
-      pageResults = data.results;
-    } else if (Array.isArray(data)) {
-      pageResults = data;
+  const g = giftNames.filter(Boolean);
+  if (g.length) {
+    if (g.length === 1) {
+      url += `&filter_by_collections=${quotePlus(cap(g[0]))}`;
     } else {
-      console.error('Portal: неожиданный формат ответа на странице, ожидался массив/результаты.');
-      break;
-    }
-
-    for (const nft of pageResults) {
-      if (!nft || !nft.id) continue;
-      if (!allNfts.has(nft.id)) {
-        allNfts.set(nft.id, nft);
-      }
-    }
-
-    if (pageResults.length < limit) {
-      break; // дальше страниц нет
+      url += `&filter_by_collections=${listToURL(g)}`;
     }
   }
 
-  if (!allNfts.size) return [];
+  const m = models.filter(Boolean);
+  if (m.length) {
+    if (m.length === 1) {
+      url += `&filter_by_models=${quotePlus(cap(m[0]))}`;
+    } else {
+      url += `&filter_by_models=${listToURL(m)}`;
+    }
+  }
+
+  const b = backdrops.filter(Boolean);
+  if (b.length) {
+    if (b.length === 1) {
+      url += `&filter_by_backdrops=${quotePlus(cap(b[0]))}`;
+    } else {
+      url += `&filter_by_backdrops=${listToURL(b)}`;
+    }
+  }
+
+  const s = symbols.filter(Boolean);
+  if (s.length) {
+    if (s.length === 1) {
+      url += `&filter_by_symbols=${quotePlus(cap(s[0]))}`;
+    } else {
+      url += `&filter_by_symbols=${listToURL(s)}`;
+    }
+  }
+
+  url += '&status=listed';
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'GET',
+      headers: buildPortalHeaders(authData),
+    });
+  } catch (e) {
+    console.error('Portal fetch error:', e);
+    return [];
+  }
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    console.error('Portal HTTP error', res.status, txt.slice(0, 200));
+    return [];
+  }
+
+  const data = await res.json().catch((e) => {
+    console.error('Portal JSON parse error:', e);
+    return null;
+  });
+  if (!data) return [];
+
+  let results = [];
+  if (Array.isArray(data.results)) {
+    results = data.results;
+  } else if (Array.isArray(data)) {
+    results = data;
+  } else {
+    console.error('Portal: неожиданный формат ответа, ожидается массив или {results:[...]}');
+    return [];
+  }
 
   const gifts = [];
+  for (const nft of results) {
+    if (!nft) continue;
 
-  for (const nft of allNfts.values()) {
     const priceStr = nft.price || nft.floor_price;
     const priceTon = priceStr ? Number(priceStr) : NaN;
     if (!priceTon || Number.isNaN(priceTon)) continue;
@@ -786,7 +814,6 @@ async function fetchPortalGifts() {
 
     const baseName = nft.name || 'NFT';
 
-    // Номер подарка: external_collection_number или из tg_id (PrettyPosy-40935)
     let number = null;
     if (nft.external_collection_number) {
       number = nft.external_collection_number;
@@ -803,13 +830,11 @@ async function fetchPortalGifts() {
       displayName = `${displayName} #${number}`;
     }
 
-    // 1) ссылка на сам NFT в Telegram
     let tgUrl = 'https://t.me/portals';
     if (nft.tg_id) {
       tgUrl = `https://t.me/nft/${nft.tg_id}`;
     }
 
-    // 2) ссылка на этот же гифт в Portal WebApp
     let marketUrl = 'https://t.me/portals';
     if (nft.id) {
       marketUrl = `https://t.me/portals_market_bot/market?startapp=gift_${nft.id}`;
@@ -831,33 +856,54 @@ async function fetchPortalGifts() {
   return gifts;
 }
 
-function buildPortalHeaders() {
-  const headers = { Accept: 'application/json' };
-  if (process.env.PORTAL_AUTH) {
-    headers['Authorization'] = process.env.PORTAL_AUTH;
+// Для /listgifts и /listmodels — общий запрос без фильтров
+async function fetchGiftsForListing() {
+  if (MODE === 'test') return fetchTestGifts();
+
+  // берём несколько страниц дешёвых лотов, чтобы увидеть побольше подарков и моделей
+  const all = [];
+  for (let page = 0; page < PORTAL_PAGES; page++) {
+    const pageGifts = await portalSearch({
+      sort: 'price_asc',
+      offset: page * 100,
+      limit: 100,
+      minPrice: 0,
+      maxPrice: 100000,
+    });
+    all.push(...pageGifts);
+    if (pageGifts.length < 100) break;
   }
-  return headers;
+  return all;
+}
+
+// Для основного мониторинга — per-user запрос с его фильтрами
+async function fetchGiftsForUser(user) {
+  if (MODE === 'test') return fetchTestGifts();
+
+  const giftsFilter = user.filters.gifts.map((x) => x.trim());
+  const modelsFilter = user.filters.models.map((x) => x.trim());
+  const backdropsFilter = user.filters.backdrops.map((x) => x.trim());
+
+  const gifts = await portalSearch({
+    sort: 'price_asc',
+    offset: 0,
+    limit: 50,
+    giftNames: giftsFilter,
+    models: modelsFilter,
+    backdrops: backdropsFilter,
+    minPrice: 0,
+    maxPrice: user.maxPriceTon ?? 100000,
+  });
+
+  return gifts;
 }
 
 // =====================
-// Общая точка получения подарков
+// Общая точка получения подарков (для /listgifts и т.п.)
 // =====================
 
 async function fetchGifts() {
-  if (MODE === 'test') {
-    return fetchTestGifts();
-  }
-
-  const all = [];
-
-  try {
-    const p = await fetchPortalGifts();
-    all.push(...p);
-  } catch (e) {
-    console.error('Ошибка при запросе к Portal:', e);
-  }
-
-  return all;
+  return await fetchGiftsForListing();
 }
 
 // =====================
@@ -867,24 +913,21 @@ async function fetchGifts() {
 async function checkMarketsForAllUsers() {
   if (users.size === 0) return;
 
-  let gifts;
-  try {
-    gifts = await fetchGifts();
-  } catch (e) {
-    console.error('Ошибка в fetchGifts:', e);
-    return;
-  }
-
-  if (!gifts || !gifts.length) {
-    return;
-  }
-
-  // На всякий случай сортируем по цене
-  gifts.sort((a, b) => a.priceTon - b.priceTon);
-
   for (const [userId, user] of users.entries()) {
     if (!user.enabled) continue;
     if (!user.maxPriceTon) continue;
+
+    let gifts;
+    try {
+      gifts = await fetchGiftsForUser(user);
+    } catch (e) {
+      console.error('Ошибка в fetchGiftsForUser:', e);
+      continue;
+    }
+    if (!gifts || !gifts.length) continue;
+
+    // На всякий случай сортируем по цене
+    gifts.sort((a, b) => a.priceTon - b.priceTon);
 
     const chatId = userId;
 
@@ -892,24 +935,6 @@ async function checkMarketsForAllUsers() {
       if (!gift.priceTon || gift.priceTon > user.maxPriceTon) continue;
 
       const attrs = gift.attrs || {};
-
-      // Фильтр по подаркам
-      const giftNameVal = (gift.baseName || gift.name || '').toLowerCase().trim();
-      if (user.filters.gifts.length && !user.filters.gifts.includes(giftNameVal)) {
-        continue;
-      }
-
-      // Фильтр по моделям
-      const modelVal = (attrs.model || '').toLowerCase().trim();
-      if (user.filters.models.length && !user.filters.models.includes(modelVal)) {
-        continue;
-      }
-
-      // Фильтр по фонам
-      const backdropVal = (attrs.backdrop || '').toLowerCase().trim();
-      if (user.filters.backdrops.length && !user.filters.backdrops.includes(backdropVal)) {
-        continue;
-      }
 
       const key = `${userId}:${gift.id}`;
       if (sentDeals.has(key)) {
