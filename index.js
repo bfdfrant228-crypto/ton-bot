@@ -663,4 +663,76 @@ async function checkMarketsForAllUsers() {
     const chatId = userId;
 
     for (const gift of gifts) {
-      if (!gift.priceTon || gift.priceTon > user.maxPriceTon) 
+      if (!gift.priceTon || gift.priceTon > user.maxPriceTon) continue;
+
+      const attrs = gift.attrs || {};
+
+      // Фильтр по подаркам
+      const giftNameVal = (gift.baseName || gift.name || '').toLowerCase();
+      if (user.filters.gifts.length && !user.filters.gifts.includes(giftNameVal)) {
+        continue;
+      }
+
+      // Фильтр по моделям
+      const modelVal = (attrs.model || '').toLowerCase();
+      if (user.filters.models.length && !user.filters.models.includes(modelVal)) {
+        continue;
+      }
+
+      // Фильтр по фонам
+      const backdropVal = (attrs.backdrop || '').toLowerCase();
+      if (user.filters.backdrops.length && !user.filters.backdrops.includes(backdropVal)) {
+        continue;
+      }
+
+      const key = `${userId}:${gift.id}`;
+      if (sentDeals.has(key)) {
+        continue;
+      }
+      sentDeals.add(key);
+
+      let text = `Gift: ${gift.name}\n`;
+
+      if (attrs.model) {
+        text += `Model: ${attrs.model}\n`;
+      }
+      if (attrs.symbol) {
+        text += `Symbol: ${attrs.symbol}\n`;
+      }
+      if (attrs.backdrop) {
+        text += `Backdrop: ${attrs.backdrop}\n`;
+      }
+
+      text += `Market: ${gift.market}\n`;
+
+      if (gift.urlTelegram) {
+        text += `${gift.urlTelegram}`;
+      }
+
+      const replyMarkup = gift.urlMarket
+        ? {
+            inline_keyboard: [
+              [{ text: 'Открыть в Portal', url: gift.urlMarket }],
+            ],
+          }
+        : undefined;
+
+      try {
+        await bot.sendMessage(chatId, text, {
+          disable_web_page_preview: false,
+          reply_markup: replyMarkup,
+        });
+      } catch (e) {
+        console.error('Ошибка при отправке сообщения пользователю', userId, e);
+      }
+    }
+  }
+}
+
+setInterval(() => {
+  checkMarketsForAllUsers().catch((e) =>
+    console.error('Ошибка в checkMarketsForAllUsers:', e)
+  );
+}, CHECK_INTERVAL_MS);
+
+console.log('Бот запущен. Ожидаю команды /start в Telegram.');
