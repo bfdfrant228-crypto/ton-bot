@@ -5,6 +5,8 @@ const MODE = process.env.MODE || 'real'; // 'test' или 'real'
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5000);
 // сколько страниц Portal запрашивать для поиска (умножается на limit)
 const PORTAL_PAGES = Number(process.env.PORTAL_PAGES || 3);
+// максимум результатов в выдаче поиска по названию
+const MAX_SEARCH_RESULTS = Number(process.env.MAX_SEARCH_RESULTS || 10);
 
 if (!token) {
   console.error('Ошибка: TELEGRAM_TOKEN не задан. Добавь токен бота в переменные окружения Railway.');
@@ -51,7 +53,7 @@ function getOrCreateUser(userId) {
     users.set(userId, {
       maxPriceTon: null,
       enabled: true,
-      state: null,
+      state: null, // awaiting_max_price / awaiting_gift_search / awaiting_model_search / awaiting_backdrop_search
       filters: {
         gifts: [],      // подарки (Fresh Socks, Victory Medal, ...)
         models: [],     // модели (Night Bat, Genius, ...)
@@ -90,7 +92,7 @@ bot.onText(/^\/help\b/, (msg) => {
     '🔍 Запустить поиск — начать слать найденные гифты\n' +
     '⏹ Остановить поиск — временно остановить\n' +
     '💰 Установить цену — максимум в TON\n' +
-    '🎛 Фильтры — подарки / модели / фоны\n\n' +
+    '🎛 Фильтры — подарки / модели / фоны (в том числе поиск по названию)\n\n' +
     'Команды:\n' +
     '/setmaxprice 0.5 — задать цену\n' +
     '/status — показать настройки\n' +
@@ -435,7 +437,7 @@ bot.onText(/^\/listmodels\b/, async (msg) => {
 });
 
 // =====================
-// Callback-кнопки (фильтры и выборы через collections/filters)
+// Callback-кнопки (фильтры, выборы, поиск по названию)
 // =====================
 
 bot.on('callback_query', async (query) => {
@@ -456,6 +458,13 @@ bot.on('callback_query', async (query) => {
           reply_markup: { inline_keyboard },
         });
       }
+    } else if (data === 'search_gift') {
+      user.state = 'awaiting_gift_search';
+      await bot.sendMessage(
+        chatId,
+        'Напиши часть названия подарка.\nНапример: medal, socks, snake',
+        { reply_markup: MAIN_KEYBOARD }
+      );
     } else if (data === 'filter_model') {
       if (!user.filters.gifts.length) {
         await bot.sendMessage(
@@ -498,6 +507,21 @@ bot.on('callback_query', async (query) => {
           }
         }
       }
+    } else if (data === 'search_model') {
+      if (!user.filters.gifts.length) {
+        await bot.sendMessage(
+          chatId,
+          'Сначала выбери подарок (кнопка "Фильтр по подарку").',
+          { reply_markup: MAIN_KEYBOARD }
+        );
+      } else {
+        user.state = 'awaiting_model_search';
+        await bot.sendMessage(
+          chatId,
+          'Напиши часть названия модели.\nНапример: night, crab, vampire',
+          { reply_markup: MAIN_KEYBOARD }
+        );
+      }
     } else if (data === 'filter_backdrop') {
       if (!user.filters.gifts.length) {
         await bot.sendMessage(
@@ -539,6 +563,21 @@ bot.on('callback_query', async (query) => {
             }
           }
         }
+      }
+    } else if (data === 'search_backdrop') {
+      if (!user.filters.gifts.length) {
+        await bot.sendMessage(
+          chatId,
+          'Сначала выбери подарок (кнопка "Фильтр по подарку").',
+          { reply_markup: MAIN_KEYBOARD }
+        );
+      } else {
+        user.state = 'awaiting_backdrop_search';
+        await bot.sendMessage(
+          chatId,
+          'Напиши часть названия фона.\nНапример: black, green, gold',
+          { reply_markup: MAIN_KEYBOARD }
+        );
       }
     } else if (data === 'filters_clear') {
       user.filters.gifts = [];
@@ -676,10 +715,10 @@ bot.on('callback_query', async (query) => {
 });
 
 // =====================
-// Обработка обычных сообщений (кнопки + ввод цены)
+// Обработка обычных сообщений (кнопки + ввод цены + поиск по строке)
 // =====================
 
-bot.on('message', (msg) => {
+bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   if (!msg.text) return;
@@ -689,6 +728,7 @@ bot.on('message', (msg) => {
 
   const user = getOrCreateUser(userId);
 
+  // ввод цены
   if (user.state === 'awaiting_max_price') {
     const value = parseFloat(text.replace(',', '.'));
     if (Number.isNaN(value) || value <= 0) {
@@ -706,6 +746,161 @@ bot.on('message', (msg) => {
     return;
   }
 
+  // поиск подарка по части названия
+  if (user.state === 'awaiting_gift_search') {
+    user.state = null;
+    const q = text.toLowerCase().trim();
+    if (!q) {
+      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "Поиск подарка".', {
+        reply_markup: MAIN_KEYBOARD,
+      });
+      return;
+    }
+
+    const { byLowerName } = await portalCollections(200);
+    const all = Array.from(byLowerName.values()).map((x) => x.name);
+    const matched = all.filter((name) => name.toLowerCase().includes(q)).sort();
+
+    if (!matched.length) {
+      bot.sendMessage(
+        chatId,
+        'Ничего не нашёл по этому запросу. Попробуй укороченное название или другую часть слова.',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+      return;
+    }
+
+    const limited = matched.slice(0, MAX_SEARCH_RESULTS);
+    const inline_keyboard = buildInlineButtons('set_gift:', limited);
+    await bot.sendMessage(chatId, 'Нашёл такие подарки, выбери:', {
+      reply_markup: { inline_keyboard },
+    });
+    return;
+  }
+
+  // поиск модели по части названия
+  if (user.state === 'awaiting_model_search') {
+    user.state = null;
+    if (!user.filters.gifts.length) {
+      bot.sendMessage(
+        chatId,
+        'Сначала выбери подарок (кнопка "Фильтр по подарку").',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+      return;
+    }
+    const q = text.toLowerCase().trim();
+    if (!q) {
+      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "Поиск модели".', {
+        reply_markup: MAIN_KEYBOARD,
+      });
+      return;
+    }
+
+    const giftLower = user.filters.gifts[0];
+    const { byLowerName } = await portalCollections(200);
+    const col = byLowerName.get(giftLower);
+    if (!col) {
+      bot.sendMessage(
+        chatId,
+        'Не нашёл такой подарок в Portal collections.',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+      return;
+    }
+
+    const filters = await portalCollectionFilters(col.shortName);
+    if (!filters) {
+      bot.sendMessage(
+        chatId,
+        'Не удалось получить модели для этой коллекции.',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+      return;
+    }
+
+    const models = extractTraitNames(filters.models);
+    const matched = models.filter((m) => m.toLowerCase().includes(q)).sort();
+
+    if (!matched.length) {
+      bot.sendMessage(
+        chatId,
+        'Модели по этому запросу не найдены.',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+      return;
+    }
+
+    const limited = matched.slice(0, MAX_SEARCH_RESULTS);
+    const inline_keyboard = buildInlineButtons('set_model:', limited);
+    await bot.sendMessage(chatId, 'Нашёл такие модели, выбери:', {
+      reply_markup: { inline_keyboard },
+    });
+    return;
+  }
+
+  // поиск фона по части названия
+  if (user.state === 'awaiting_backdrop_search') {
+    user.state = null;
+    if (!user.filters.gifts.length) {
+      bot.sendMessage(
+        chatId,
+        'Сначала выбери подарок (кнопка "Фильтр по подарку").',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+      return;
+    }
+    const q = text.toLowerCase().trim();
+    if (!q) {
+      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "Поиск фона".', {
+        reply_markup: MAIN_KEYBOARD,
+      });
+      return;
+    }
+
+    const giftLower = user.filters.gifts[0];
+    const { byLowerName } = await portalCollections(200);
+    const col = byLowerName.get(giftLower);
+    if (!col) {
+      bot.sendMessage(
+        chatId,
+        'Не нашёл такой подарок в Portal collections.',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+      return;
+    }
+
+    const filters = await portalCollectionFilters(col.shortName);
+    if (!filters) {
+      bot.sendMessage(
+        chatId,
+        'Не удалось получить фоны для этой коллекции.',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+      return;
+    }
+
+    const backdrops = extractTraitNames(filters.backdrops);
+    const matched = backdrops.filter((b) => b.toLowerCase().includes(q)).sort();
+
+    if (!matched.length) {
+      bot.sendMessage(
+        chatId,
+        'Фоны по этому запросу не найдены.',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+      return;
+    }
+
+    const limited = matched.slice(0, MAX_SEARCH_RESULTS);
+    const inline_keyboard = buildInlineButtons('set_backdrop:', limited);
+    await bot.sendMessage(chatId, 'Нашёл такие фоны, выбери:', {
+      reply_markup: { inline_keyboard },
+    });
+    return;
+  }
+
+  // обычные кнопки
   if (text === '💰 Установить цену') {
     user.state = 'awaiting_max_price';
     bot.sendMessage(chatId, 'Введи максимальную цену в TON, например: 4.5', {
@@ -737,6 +932,11 @@ bot.on('message', (msg) => {
         [
           { text: 'Выбрать модель', callback_data: 'filter_model' },
           { text: 'Выбрать фон', callback_data: 'filter_backdrop' },
+        ],
+        [
+          { text: 'Поиск подарка', callback_data: 'search_gift' },
+          { text: 'Поиск модели', callback_data: 'search_model' },
+          { text: 'Поиск фона', callback_data: 'search_backdrop' },
         ],
         [
           { text: 'Список подарков', callback_data: 'list_gifts_inline' },
