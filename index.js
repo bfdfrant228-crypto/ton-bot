@@ -3,6 +3,8 @@ const TelegramBot = require('node-telegram-bot-api');
 const token = process.env.TELEGRAM_TOKEN;
 const MODE = process.env.MODE || 'real'; // 'test' или 'real'
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5000);
+// сколько страниц Portal запрашивать (умножается на limit из URL)
+const PORTAL_PAGES = Number(process.env.PORTAL_PAGES || 3);
 
 if (!token) {
   console.error('Ошибка: TELEGRAM_TOKEN не задан. Добавь токен бота в переменные окружения Railway.');
@@ -631,42 +633,38 @@ function fetchTestGifts() {
 }
 
 // =====================
-// REAL-режим: Portal
+// REAL-режим: Portal (многолепестковый fetch + сортировка)
 // =====================
 
 async function fetchPortalGifts() {
-  const url =
+  const confUrl =
     process.env.PORTAL_SEARCH_URL ||
-    'https://portal-market.com/api/collections/filters/backdrops';
+    'https://portal-market.com/api/nfts/search?offset=0&limit=100&status=listed&exclude_bundled=true&premarket_status=all';
 
-  const headers = {
-    Accept: 'application/json',
-  };
+  // Если это URL бэкдропов — старый простой режим
+  if (confUrl.includes('/api/collections/filters/backdrops')) {
+    const res = await fetch(confUrl, {
+      method: 'GET',
+      headers: buildPortalHeaders(),
+    });
 
-  if (process.env.PORTAL_AUTH) {
-    headers['Authorization'] = process.env.PORTAL_AUTH;
-  }
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      console.error('Portal HTTP error (backdrops)', res.status, txt.slice(0, 200));
+      return [];
+    }
 
-  const res = await fetch(url, {
-    method: 'GET',
-    headers,
-  });
+    const data = await res.json().catch((e) => {
+      console.error('Portal JSON parse error (backdrops):', e);
+      return null;
+    });
 
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    console.error('Portal HTTP error', res.status, txt.slice(0, 200));
-    return [];
-  }
+    if (!Array.isArray(data)) {
+      console.error('Portal: ожидался массив для бэкдропов.');
+      return [];
+    }
 
-  const data = await res.json().catch((e) => {
-    console.error('Portal JSON parse error:', e);
-    return null;
-  });
-
-  const gifts = [];
-
-  // Вариант 1: массив бэкдропов
-  if (Array.isArray(data)) {
+    const gifts = [];
     for (const item of data) {
       const fp = item.floor_price || item.floorPrice;
       const priceTon = fp ? Number(fp) : NaN;
@@ -687,76 +685,158 @@ async function fetchPortalGifts() {
         },
       });
     }
+
+    gifts.sort((a, b) => a.priceTon - b.priceTon);
     return gifts;
   }
 
-  // Вариант 2: поиск NFT: { results: [...] }
-  if (data && Array.isArray(data.results)) {
-    for (const nft of data.results) {
-      const priceStr = nft.price || nft.floor_price;
-      const priceTon = priceStr ? Number(priceStr) : NaN;
-      if (!priceTon || Number.isNaN(priceTon)) continue;
+  // Многопоточный fetch для /api/nfts/search
+  let urlObj;
+  try {
+    urlObj = new URL(confUrl);
+  } catch (e) {
+    console.error('Portal URL parse error:', e);
+    return [];
+  }
 
-      let model = null;
-      let symbol = null;
-      let backdrop = null;
+  const baseUrl = urlObj.origin + urlObj.pathname;
+  const baseParams = new URLSearchParams(urlObj.searchParams);
 
-      if (Array.isArray(nft.attributes)) {
-        for (const attr of nft.attributes) {
-          if (!attr || !attr.type) continue;
-          if (attr.type === 'model') model = attr.value;
-          else if (attr.type === 'symbol') symbol = attr.value;
-          else if (attr.type === 'backdrop') backdrop = attr.value;
-        }
-      }
+  let limit = Number(baseParams.get('limit') || 100);
+  if (!Number.isFinite(limit) || limit <= 0) limit = 100;
+  if (limit > 500) limit = 500;
 
-      const baseName = nft.name || 'NFT';
+  const maxPages = PORTAL_PAGES > 0 ? PORTAL_PAGES : 1;
 
-      // Номер подарка: external_collection_number или из tg_id (PrettyPosy-40935)
-      let number = null;
-      if (nft.external_collection_number) {
-        number = nft.external_collection_number;
-      } else if (nft.tg_id) {
-        const parts = String(nft.tg_id).split('-');
-        const last = parts[parts.length - 1];
-        if (/^\d+$/.test(last)) {
-          number = last;
-        }
-      }
+  const allNfts = new Map(); // id -> nft
 
-      let displayName = baseName;
-      if (number) {
-        displayName = `${displayName} #${number}`;
-      }
+  for (let page = 0; page < maxPages; page++) {
+    const params = new URLSearchParams(baseParams);
+    params.set('offset', String(page * limit));
+    params.set('limit', String(limit));
 
-      // 1) ссылка на сам NFT в Telegram
-      let tgUrl = 'https://t.me/portals';
-      if (nft.tg_id) {
-        tgUrl = `https://t.me/nft/${nft.tg_id}`;
-      }
+    const pageUrl = `${baseUrl}?${params.toString()}`;
 
-      // 2) ссылка на этот же гифт в Portal WebApp
-      let marketUrl = 'https://t.me/portals';
-      if (nft.id) {
-        marketUrl = `https://t.me/portals_market_bot/market?startapp=gift_${nft.id}`;
-      }
-
-      gifts.push({
-        id: `portal_${nft.id}`,
-        market: 'Portal',
-        name: displayName,
-        baseName,
-        priceTon,
-        urlTelegram: tgUrl,
-        urlMarket: marketUrl,
-        attrs: { model, symbol, backdrop },
+    let res;
+    try {
+      res = await fetch(pageUrl, {
+        method: 'GET',
+        headers: buildPortalHeaders(),
       });
+    } catch (e) {
+      console.error('Portal fetch error (page):', e);
+      break;
     }
-    return gifts;
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      console.error('Portal HTTP error (page)', res.status, txt.slice(0, 200));
+      break;
+    }
+
+    const data = await res.json().catch((e) => {
+      console.error('Portal JSON parse error (page):', e);
+      return null;
+    });
+    if (!data) break;
+
+    let pageResults = [];
+    if (Array.isArray(data.results)) {
+      pageResults = data.results;
+    } else if (Array.isArray(data)) {
+      pageResults = data;
+    } else {
+      console.error('Portal: неожиданный формат ответа на странице, ожидался массив/результаты.');
+      break;
+    }
+
+    for (const nft of pageResults) {
+      if (!nft || !nft.id) continue;
+      if (!allNfts.has(nft.id)) {
+        allNfts.set(nft.id, nft);
+      }
+    }
+
+    if (pageResults.length < limit) {
+      break; // дальше страниц нет
+    }
   }
 
-  console.error('Portal: неожиданный формат ответа.');
-  return [];
+  if (!allNfts.size) return [];
+
+  const gifts = [];
+
+  for (const nft of allNfts.values()) {
+    const priceStr = nft.price || nft.floor_price;
+    const priceTon = priceStr ? Number(priceStr) : NaN;
+    if (!priceTon || Number.isNaN(priceTon)) continue;
+
+    let model = null;
+    let symbol = null;
+    let backdrop = null;
+
+    if (Array.isArray(nft.attributes)) {
+      for (const attr of nft.attributes) {
+        if (!attr || !attr.type) continue;
+        if (attr.type === 'model') model = attr.value;
+        else if (attr.type === 'symbol') symbol = attr.value;
+        else if (attr.type === 'backdrop') backdrop = attr.value;
+      }
+    }
+
+    const baseName = nft.name || 'NFT';
+
+    // Номер подарка: external_collection_number или из tg_id (PrettyPosy-40935)
+    let number = null;
+    if (nft.external_collection_number) {
+      number = nft.external_collection_number;
+    } else if (nft.tg_id) {
+      const parts = String(nft.tg_id).split('-');
+      const last = parts[parts.length - 1];
+      if (/^\d+$/.test(last)) {
+        number = last;
+      }
+    }
+
+    let displayName = baseName;
+    if (number) {
+      displayName = `${displayName} #${number}`;
+    }
+
+    // 1) ссылка на сам NFT в Telegram
+    let tgUrl = 'https://t.me/portals';
+    if (nft.tg_id) {
+      tgUrl = `https://t.me/nft/${nft.tg_id}`;
+    }
+
+    // 2) ссылка на этот же гифт в Portal WebApp
+    let marketUrl = 'https://t.me/portals';
+    if (nft.id) {
+      marketUrl = `https://t.me/portals_market_bot/market?startapp=gift_${nft.id}`;
+    }
+
+    gifts.push({
+      id: `portal_${nft.id}`,
+      market: 'Portal',
+      name: displayName,
+      baseName,
+      priceTon,
+      urlTelegram: tgUrl,
+      urlMarket: marketUrl,
+      attrs: { model, symbol, backdrop },
+    });
+  }
+
+  gifts.sort((a, b) => a.priceTon - b.priceTon);
+  return gifts;
+}
+
+function buildPortalHeaders() {
+  const headers = { Accept: 'application/json' };
+  if (process.env.PORTAL_AUTH) {
+    headers['Authorization'] = process.env.PORTAL_AUTH;
+  }
+  return headers;
 }
 
 // =====================
@@ -798,6 +878,9 @@ async function checkMarketsForAllUsers() {
   if (!gifts || !gifts.length) {
     return;
   }
+
+  // На всякий случай сортируем по цене и здесь (если что-то добавится в будущем)
+  gifts.sort((a, b) => a.priceTon - b.priceTon);
 
   for (const [userId, user] of users.entries()) {
     if (!user.enabled) continue;
