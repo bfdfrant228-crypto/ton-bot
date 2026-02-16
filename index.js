@@ -164,7 +164,7 @@ function fetchTestGifts() {
       name: 'Тестовый подарок #1',
       priceTon: randomPrice(),
       urlTelegram: 'https://t.me/portals',
-      urlMarket: 'https://portal-market.com',
+      urlMarket: 'https://t.me/portals',
       attrs: {},
     },
     {
@@ -173,7 +173,7 @@ function fetchTestGifts() {
       name: 'Тестовый подарок MRKT',
       priceTon: randomPrice(),
       urlTelegram: 'https://t.me/mrkt',
-      urlMarket: 'https://tgmrkt.io',
+      urlMarket: 'https://t.me/mrkt',
       attrs: {},
     },
   ];
@@ -227,7 +227,7 @@ async function fetchPortalGifts() {
         name: `Backdrop: ${item.name}`,
         priceTon,
         urlTelegram: 'https://t.me/portals',
-        urlMarket: 'https://portal-market.com',
+        urlMarket: 'https://t.me/portals',
         attrs: {
           backdrop: item.name || null,
         },
@@ -273,14 +273,20 @@ async function fetchPortalGifts() {
         displayName = `${displayName} #${number}`;
       }
 
-      // Ссылка на сам NFT в Telegram
+      // 1) ссылка на сам NFT в Telegram (гифт-эмодзи)
       let tgUrl = 'https://t.me/portals';
       if (nft.tg_id) {
         tgUrl = `https://t.me/nft/${nft.tg_id}`;
       }
 
-      // Примерная ссылка на страницу NFT на портале по id
-      const marketUrl = `https://portal-market.com/nfts/${nft.id}`;
+      // 2) ссылка на этот же гифт в Portal WebApp (deep link)
+      // Пример от тебя:
+      // https://t.me/portals_market_bot/market?startapp=gift_<id>_qbl3o8
+      // Начинаем с простого варианта без суффикса: gift_<id>
+      let marketUrl = 'https://t.me/portals';
+      if (nft.id) {
+        marketUrl = `https://t.me/portals_market_bot/market?startapp=gift_${nft.id}`;
+      }
 
       gifts.push({
         id: `portal_${nft.id}`,
@@ -359,9 +365,9 @@ async function fetchMrktGifts() {
 
     const priceTon = nanoNum / 1e9;
 
-    // Пока нет точного URL страницы гифта MRKT — даём общие ссылки
+    // Пока нет нормальной web-страницы гифта MRKT — даём две ссылки на Telegram-бота
     const urlTelegram = 'https://t.me/mrkt';
-    const urlMarket = 'https://tgmrkt.io';
+    const urlMarket = 'https://t.me/mrkt';
 
     gifts.push({
       id: `mrkt_${item.collectionName}_${item.modelName}`,
