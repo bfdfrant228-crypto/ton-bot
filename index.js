@@ -74,12 +74,12 @@ bot.onText(/^\/start\b/, (msg) => {
 
   const text =
     'Бот запущен.\n\n' +
-    `Режим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ с Portal'}\n\n` +
+    `Режим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ с Portal + MRKT'}\n\n` +
     'Кнопки снизу:\n' +
     '🔍 Запустить поиск — включить мониторинг\n' +
     '⏹ Остановить поиск — выключить мониторинг\n' +
     '💰 Установить цену — задать максимум в TON\n' +
-    '🎛 Фильтры — выбрать подарки/модели/фоны';
+    '🎛 Фильтры — выбрать подарки/модели/фоны (есть поиск по названию)';
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -87,12 +87,12 @@ bot.onText(/^\/start\b/, (msg) => {
 bot.onText(/^\/help\b/, (msg) => {
   const chatId = msg.chat.id;
   const text =
-    'Бот отслеживает NFT‑подарки Portal.\n\n' +
+    'Бот отслеживает NFT‑подарки Portal и MRKT.\n\n' +
     'Кнопки:\n' +
     '🔍 Запустить поиск — начать слать найденные гифты\n' +
     '⏹ Остановить поиск — временно остановить\n' +
     '💰 Установить цену — максимум в TON\n' +
-    '🎛 Фильтры — подарки / модели / фоны (в том числе поиск по названию)\n\n' +
+    '🎛 Фильтры — подарки / модели / фоны (выбор и поиск по названию)\n\n' +
     'Команды:\n' +
     '/setmaxprice 0.5 — задать цену\n' +
     '/status — показать настройки\n' +
@@ -163,7 +163,7 @@ bot.onText(/^\/status\b/, (msg) => {
     text += '• Фильтр по фонам: нет\n';
   }
 
-  text += `\nРежим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ (Portal)'}.\n`;
+  text += `\nРежим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ (Portal + MRKT)'}.\n`;
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -182,6 +182,9 @@ const SORTS = {
   model_rarity_asc: '&sort_by=model_rarity+asc',
   model_rarity_desc: '&sort_by=model_rarity+desc',
 };
+
+// MRKT
+const MRKT_API_URL = 'https://api.tgmrkt.io/api/v1';
 
 function cap(text) {
   return String(text).replace(/\w+(?:'\w+)?/g, (word) => {
@@ -357,7 +360,7 @@ function buildInlineButtons(prefix, names) {
 }
 
 // =====================
-// /listgifts и /listmodels (через collections и collections/filters)
+// /listgifts и /listmodels (Portal)
 // =====================
 
 bot.onText(/^\/listgifts\b/, async (msg) => {
@@ -1152,26 +1155,148 @@ async function portalSearch({
   return gifts;
 }
 
-// Для пользователя — поиск по его фильтрам
-async function fetchGiftsForUser(user) {
+// =====================
+// MRKT: /gifts/saling
+// =====================
+
+async function fetchMrktGiftsForUser(user) {
+  const token = process.env.MRKT_AUTH;
+  if (!token) {
+    // Можно тихо пропустить, если MRKT ещё не настроен
+    return [];
+  }
+
+  const giftsFilter = user.filters.gifts.map((x) => cap(x.trim()));
+  const modelsFilter = user.filters.models.map((x) => cap(x.trim()));
+  const backdropsFilter = user.filters.backdrops.map((x) => cap(x.trim()));
+
+  const body = {
+    collectionNames: giftsFilter,    // ["Lunar Snake", ...]
+    modelNames: modelsFilter,        // ["Albino", ...]
+    backdropNames: backdropsFilter,  // ["Deep Cyan", ...] если понадобится
+    symbolNames: [],
+    ordering: 'Price',
+    lowToHigh: true,
+    maxPrice: user.maxPriceTon ?? null,
+    minPrice: null,
+    mintable: null,
+    number: null,
+    count: 20,       // лимит по доке = 20
+    cursor: '',
+    query: null,
+    promotedFirst: false,
+  };
+
+  let res;
+  try {
+    res = await fetch(`${MRKT_API_URL}/gifts/saling`, {
+      method: 'POST',
+      headers: {
+        Authorization: token,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    console.error('MRKT fetch error:', e);
+    return [];
+  }
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    console.error('MRKT HTTP error', res.status, txt.slice(0, 200));
+    return [];
+  }
+
+  const data = await res.json().catch((e) => {
+    console.error('MRKT JSON parse error:', e);
+    return null;
+  });
+  if (!data) return [];
+
+  const rawGifts = Array.isArray(data.gifts) ? data.gifts : Array.isArray(data) ? data : [];
+  const gifts = [];
+
+  for (const g of rawGifts) {
+    if (!g) continue;
+
+    // Пытаемся вытащить цену
+    let priceTon = NaN;
+    if (g.priceNanoTons != null) {
+      priceTon = Number(g.priceNanoTons) / 1e9;
+    } else if (g.priceNanoTon != null) {
+      priceTon = Number(g.priceNanoTon) / 1e9;
+    } else if (g.price != null) {
+      priceTon = typeof g.price === 'number' ? g.price : Number(g.price);
+    }
+
+    if (!priceTon || Number.isNaN(priceTon)) continue;
+    if (user.maxPriceTon && priceTon > user.maxPriceTon) continue;
+
+    const baseName = g.collectionName || g.collectionTitle || 'MRKT Gift';
+    const number = g.number ?? null;
+    let displayName = baseName;
+    if (number) displayName = `${displayName} #${number}`;
+
+    const model = g.modelName || g.modelTitle || null;
+    const symbol = g.symbolName || null;
+    const backdrop = g.backdropName || null;
+
+    const id = g.id || `${baseName}_${model || ''}_${number || ''}_${priceTon}`;
+
+    gifts.push({
+      id: `mrkt_${id}`,
+      market: 'MRKT',
+      name: displayName,
+      baseName,
+      priceTon,
+      urlTelegram: 'https://t.me/mrkt',
+      urlMarket: 'https://t.me/mrkt',
+      attrs: {
+        model,
+        symbol,
+        backdrop,
+        collection: baseName,
+      },
+    });
+  }
+
+  gifts.sort((a, b) => a.priceTon - b.priceTon);
+  return gifts;
+}
+
+// Для пользователя — поиск по его фильтрам (Portal + MRKT)
+async function fetchAllGiftsForUser(user) {
   if (MODE === 'test') return fetchTestGifts();
 
-  const giftsFilter = user.filters.gifts.map((x) => x.trim());
-  const modelsFilter = user.filters.models.map((x) => x.trim());
-  const backdropsFilter = user.filters.backdrops.map((x) => x.trim());
+  let portalGifts = [];
+  let mrktGifts = [];
 
-  const gifts = await portalSearch({
-    sort: 'price_asc',
-    offset: 0,
-    limit: 50,
-    giftNames: giftsFilter,
-    models: modelsFilter,
-    backdrops: backdropsFilter,
-    minPrice: 0,
-    maxPrice: user.maxPriceTon ?? 100000,
-  });
+  try {
+    portalGifts = await portalSearch({
+      sort: 'price_asc',
+      offset: 0,
+      limit: 50,
+      giftNames: user.filters.gifts.map((x) => x.trim()),
+      models: user.filters.models.map((x) => x.trim()),
+      backdrops: user.filters.backdrops.map((x) => x.trim()),
+      minPrice: 0,
+      maxPrice: user.maxPriceTon ?? 100000,
+    });
+  } catch (e) {
+    console.error('Ошибка в portalSearch:', e);
+  }
 
-  return gifts;
+  try {
+    mrktGifts = await fetchMrktGiftsForUser(user);
+  } catch (e) {
+    console.error('Ошибка в fetchMrktGiftsForUser:', e);
+  }
+
+  const all = [...portalGifts, ...mrktGifts];
+  all.sort((a, b) => a.priceTon - b.priceTon);
+  return all;
 }
 
 // =====================
@@ -1187,9 +1312,9 @@ async function checkMarketsForAllUsers() {
 
     let gifts;
     try {
-      gifts = await fetchGiftsForUser(user);
+      gifts = await fetchAllGiftsForUser(user);
     } catch (e) {
-      console.error('Ошибка в fetchGiftsForUser:', e);
+      console.error('Ошибка в fetchAllGiftsForUser:', e);
       continue;
     }
     if (!gifts || !gifts.length) continue;
@@ -1213,6 +1338,9 @@ async function checkMarketsForAllUsers() {
         `Price: ${gift.priceTon.toFixed(3)} TON\n` +
         `Gift: ${gift.name}\n`;
 
+      if (attrs.collection && gift.market === 'MRKT') {
+        text += `Collection: ${attrs.collection}\n`;
+      }
       if (attrs.model) {
         text += `Model: ${attrs.model}\n`;
       }
