@@ -4,12 +4,12 @@ const token = process.env.TELEGRAM_TOKEN;
 const SEARCH_URL = process.env.PORTAL_SEARCH_URL;
 
 if (!token) {
-  console.error("TELEGRAM_TOKEN не задан");
+  console.error("❌ TELEGRAM_TOKEN не задан");
   process.exit(1);
 }
 
 if (!SEARCH_URL) {
-  console.error("PORTAL_SEARCH_URL не задан");
+  console.error("❌ PORTAL_SEARCH_URL не задан");
   process.exit(1);
 }
 
@@ -39,9 +39,21 @@ async function loadNFTs() {
   try {
     const res = await fetch(SEARCH_URL);
     const data = await res.json();
-    return data.items || [];
+
+    console.log("====== PORTAL RAW RESPONSE ======");
+    console.log(JSON.stringify(data, null, 2));
+
+    // Автоопределение где массив
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data.items)) return data.items;
+    if (Array.isArray(data.data)) return data.data;
+    if (Array.isArray(data.results)) return data.results;
+
+    console.log("⚠ Не найден массив NFT в ответе");
+    return [];
+
   } catch (e) {
-    console.error("Ошибка загрузки Portal:", e.message);
+    console.error("❌ Ошибка загрузки Portal:", e.message);
     return [];
   }
 }
@@ -67,7 +79,7 @@ function extractAttributes(nfts, typeName) {
 }
 
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, "Управление ботом:", buildMenu());
+  bot.sendMessage(msg.chat.id, "Бот запущен. Выбери действие:", buildMenu());
 });
 
 bot.on('callback_query', async (query) => {
@@ -155,4 +167,4 @@ bot.on('callback_query', async (query) => {
   bot.answerCallbackQuery(query.id);
 });
 
-console.log("Бот запущен успешно 🚀");
+console.log("🚀 Бот запущен успешно");
