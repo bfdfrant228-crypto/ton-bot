@@ -29,6 +29,16 @@ const MAIN_KEYBOARD = {
   resize_keyboard: true,
 };
 
+// очистка истории отправленных подарков для конкретного пользователя
+function clearUserSentDeals(userId) {
+  const prefix = `${userId}:`;
+  for (const key of Array.from(sentDeals)) {
+    if (key.startsWith(prefix)) {
+      sentDeals.delete(key);
+    }
+  }
+}
+
 function getOrCreateUser(userId) {
   if (!users.has(userId)) {
     users.set(userId, {
@@ -110,6 +120,7 @@ bot.onText(/^\/setmaxprice\b(?:\s+(.+))?/, (msg, match) => {
 
   const user = getOrCreateUser(userId);
   user.maxPriceTon = value;
+  clearUserSentDeals(userId);
 
   bot.sendMessage(
     chatId,
@@ -192,6 +203,7 @@ bot.on('callback_query', async (query) => {
     user.filters.models = [];
     user.filters.backdrops = [];
     user.state = null;
+    clearUserSentDeals(userId);
     await bot.sendMessage(chatId, 'Фильтры подарков, моделей и фонов сброшены.', {
       reply_markup: MAIN_KEYBOARD,
     });
@@ -223,6 +235,7 @@ bot.on('message', (msg) => {
     }
     user.maxPriceTon = value;
     user.state = null;
+    clearUserSentDeals(userId);
     bot.sendMessage(
       chatId,
       `Максимальная цена установлена: ${value.toFixed(3)} TON.`,
@@ -235,6 +248,7 @@ bot.on('message', (msg) => {
     const list = parseListInput(text);
     user.filters.gifts = list;
     user.state = null;
+    clearUserSentDeals(userId);
     bot.sendMessage(
       chatId,
       list.length
@@ -249,6 +263,7 @@ bot.on('message', (msg) => {
     const list = parseListInput(text);
     user.filters.models = list;
     user.state = null;
+    clearUserSentDeals(userId);
     bot.sendMessage(
       chatId,
       list.length
@@ -263,6 +278,7 @@ bot.on('message', (msg) => {
     const list = parseListInput(text);
     user.filters.backdrops = list;
     user.state = null;
+    clearUserSentDeals(userId);
     bot.sendMessage(
       chatId,
       list.length
@@ -647,76 +663,4 @@ async function checkMarketsForAllUsers() {
     const chatId = userId;
 
     for (const gift of gifts) {
-      if (!gift.priceTon || gift.priceTon > user.maxPriceTon) continue;
-
-      const attrs = gift.attrs || {};
-
-      // Фильтр по подаркам
-      const giftNameVal = (gift.baseName || gift.name || '').toLowerCase();
-      if (user.filters.gifts.length && !user.filters.gifts.includes(giftNameVal)) {
-        continue;
-      }
-
-      // Фильтр по моделям
-      const modelVal = (attrs.model || '').toLowerCase();
-      if (user.filters.models.length && !user.filters.models.includes(modelVal)) {
-        continue;
-      }
-
-      // Фильтр по фонам
-      const backdropVal = (attrs.backdrop || '').toLowerCase();
-      if (user.filters.backdrops.length && !user.filters.backdrops.includes(backdropVal)) {
-        continue;
-      }
-
-      const key = `${userId}:${gift.id}`;
-      if (sentDeals.has(key)) {
-        continue;
-      }
-      sentDeals.add(key);
-
-      let text = `Gift: ${gift.name}\n`;
-
-      if (attrs.model) {
-        text += `Model: ${attrs.model}\n`;
-      }
-      if (attrs.symbol) {
-        text += `Symbol: ${attrs.symbol}\n`;
-      }
-      if (attrs.backdrop) {
-        text += `Backdrop: ${attrs.backdrop}\n`;
-      }
-
-      text += `Market: ${gift.market}\n`;
-
-      if (gift.urlTelegram) {
-        text += `${gift.urlTelegram}`;
-      }
-
-      const replyMarkup = gift.urlMarket
-        ? {
-            inline_keyboard: [
-              [{ text: 'Открыть в Portal', url: gift.urlMarket }],
-            ],
-          }
-        : undefined;
-
-      try {
-        await bot.sendMessage(chatId, text, {
-          disable_web_page_preview: false,
-          reply_markup: replyMarkup,
-        });
-      } catch (e) {
-        console.error('Ошибка при отправке сообщения пользователю', userId, e);
-      }
-    }
-  }
-}
-
-setInterval(() => {
-  checkMarketsForAllUsers().catch((e) =>
-    console.error('Ошибка в checkMarketsForAllUsers:', e)
-  );
-}, CHECK_INTERVAL_MS);
-
-console.log('Бот запущен. Ожидаю команды /start в Telegram.');
+      if (!gift.priceTon || gift.priceTon > user.maxPriceTon) 
