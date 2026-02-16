@@ -1030,7 +1030,7 @@ function fetchTestGifts() {
 }
 
 // =====================
-// REAL-режим: Portal search (как portalsmp.search)
+// REAL-режим: Portal search (фикс ссылок tg_id)
 // =====================
 
 async function portalSearch({
@@ -1170,9 +1170,20 @@ async function portalSearch({
       displayName = `${displayName} #${number}`;
     }
 
+    // Формируем корректный slug для t.me/nft:
+    // 1) если tg_id содержит '-', используем как есть;
+    // 2) если tg_id — просто число / странное, строим сами: `SnowMittens-25247`
+    let tgSlug = null;
+    if (nft.tg_id && String(nft.tg_id).includes('-')) {
+      tgSlug = String(nft.tg_id);
+    } else if (baseName && number != null) {
+      const slugName = baseName.replace(/['’\s-]+/g, '');
+      tgSlug = `${slugName}-${number}`;
+    }
+
     let tgUrl = 'https://t.me/portals';
-    if (nft.tg_id) {
-      tgUrl = `https://t.me/nft/${nft.tg_id}`;
+    if (tgSlug) {
+      tgUrl = `https://t.me/nft/${tgSlug}`;
     }
 
     let marketUrl = 'https://t.me/portals';
@@ -1211,8 +1222,8 @@ async function fetchMrktGiftsForUser(user) {
   const backdropsFilter = user.filters.backdrops.map((x) => cap(x.trim()));
 
   const body = {
-    collectionNames: giftsFilter,    // ["Lunar Snake", ...]
-    modelNames: modelsFilter,        // ["Albino", ...]
+    collectionNames: giftsFilter,    // ["Hanging Star", ...]
+    modelNames: modelsFilter,        // ["Cucumber", ...]
     backdropNames: backdropsFilter,  // ["Indigo Dye", ...] при необходимости
     symbolNames: [],
     ordering: 'Price',
@@ -1226,6 +1237,8 @@ async function fetchMrktGiftsForUser(user) {
     query: null,
     promotedFirst: false,
   };
+
+  console.log('MRKT request body:', JSON.stringify(body));
 
   let res;
   try {
@@ -1243,6 +1256,8 @@ async function fetchMrktGiftsForUser(user) {
     return [];
   }
 
+  console.log('MRKT response status:', res.status);
+
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
     console.error('MRKT HTTP error', res.status, txt.slice(0, 200));
@@ -1256,12 +1271,14 @@ async function fetchMrktGiftsForUser(user) {
   if (!data) return [];
 
   const rawGifts = Array.isArray(data.gifts) ? data.gifts : Array.isArray(data) ? data : [];
+  console.log('MRKT gifts length:', rawGifts.length);
+
   const gifts = [];
 
   for (const g of rawGifts) {
     if (!g) continue;
 
-    // MRKT JSON: цена в поле salePrice (наноTON)
+    // MRKT JSON: цена в salePrice (наноTON)
     let priceTon = NaN;
     if (g.salePrice != null) {
       priceTon = Number(g.salePrice) / 1e9;
@@ -1301,6 +1318,7 @@ async function fetchMrktGiftsForUser(user) {
   }
 
   gifts.sort((a, b) => a.priceTon - b.priceTon);
+  console.log('MRKT gifts after filter:', gifts.length);
   return gifts;
 }
 
@@ -1382,7 +1400,7 @@ async function checkMarketsForAllUsers() {
 
       const attrs = gift.attrs || {};
 
-      // Жёсткий фильтр по подарку/модели/фону для ВСЕХ маркетов (Portal и MRKT)
+      // Жёсткий фильтр по подарку/модели/фону для ВСЕХ маркетов
       const giftNameVal = (gift.baseName || gift.name || '').toLowerCase().trim();
       if (user.filters.gifts.length && !user.filters.gifts.includes(giftNameVal)) {
         continue;
