@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const token = process.env.TELEGRAM_TOKEN;
 const MODE = process.env.MODE || 'real'; // 'test' или 'real'
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5000);
-// сколько страниц Portal запрашивать (умножается на limit)
+// сколько страниц Portal запрашивать для поиска (умножается на limit)
 const PORTAL_PAGES = Number(process.env.PORTAL_PAGES || 3);
 
 if (!token) {
@@ -20,6 +20,11 @@ const bot = new TelegramBot(token, { polling: true });
 const users = new Map();
 // запоминаем, какие сделки уже отправляли (userId:giftId)
 const sentDeals = new Set();
+
+// кэш коллекций Portal
+let collectionsCache = null; // { list: [...], byLowerName: Map(lowerName -> {name, shortName, raw}) }
+let collectionsCacheTime = 0;
+const COLLECTIONS_CACHE_TTL_MS = 60_000; // 60 секунд
 
 // Основная клавиатура
 const MAIN_KEYBOARD = {
@@ -89,8 +94,8 @@ bot.onText(/^\/help\b/, (msg) => {
     'Команды:\n' +
     '/setmaxprice 0.5 — задать цену\n' +
     '/status — показать настройки\n' +
-    '/listgifts — список доступных подарков\n' +
-    '/listmodels — список моделей и фонов';
+    '/listgifts — список подарков из Portal\n' +
+    '/listmodels — модели/фоны для выбранного подарка';
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -162,86 +167,190 @@ bot.onText(/^\/status\b/, (msg) => {
 });
 
 // =====================
-// Вспомогательные для списков
+// Работа с коллекциями Portal
 // =====================
 
-async function getCurrentGifts() {
+const API_URL = 'https://portal-market.com/api/';
+const SORTS = {
+  latest: '&sort_by=listed_at+desc',
+  price_asc: '&sort_by=price+asc',
+  price_desc: '&sort_by=price+desc',
+  gift_id_asc: '&sort_by=external_collection_number+asc',
+  gift_id_desc: '&sort_by=external_collection_number+desc',
+  model_rarity_asc: '&sort_by=model_rarity+asc',
+  model_rarity_desc: '&sort_by=model_rarity+desc',
+};
+
+function cap(text) {
+  return String(text).replace(/\w+(?:'\w+)?/g, (word) => {
+    return word.charAt(0).toUpperCase() + word.slice(1);
+  });
+}
+
+function quotePlus(str) {
+  return encodeURIComponent(str).replace(/%20/g, '+');
+}
+
+function listToURL(list) {
+  return list.map((s) => quotePlus(cap(s))).join('%2C');
+}
+
+function buildPortalHeaders(auth) {
+  const headers = {
+    Authorization: auth,
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+    Origin: 'https://portal-market.com',
+    Referer: 'https://portal-market.com/',
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+  };
+  return headers;
+}
+
+// Получить список коллекций (подарков) Portal
+async function portalCollections(limit = 200) {
+  const now = Date.now();
+  if (collectionsCache && now - collectionsCacheTime < COLLECTIONS_CACHE_TTL_MS) {
+    return collectionsCache;
+  }
+
+  const authData = process.env.PORTAL_AUTH;
+  if (!authData) {
+    console.warn('PORTAL_AUTH не задан, Portal collections будет пропущен.');
+    return { list: [], byLowerName: new Map() };
+  }
+
+  const url = `${API_URL}collections?limit=${limit}`;
+
+  let res;
   try {
-    return await fetchGiftsForListing();
-  } catch (e) {
-    console.error('getCurrentGifts error:', e);
-    return [];
-  }
-}
-
-function buildNameMapFromGifts(gifts) {
-  const giftNames = new Map();
-  const models = new Map();
-  const backdrops = new Map();
-
-  for (const g of gifts) {
-    const base = (g.baseName || g.name || '').trim();
-    if (base) {
-      const k = base.toLowerCase();
-      if (!giftNames.has(k)) giftNames.set(k, base);
-    }
-
-    const m = g.attrs?.model;
-    if (m) {
-      const k = m.toLowerCase();
-      if (!models.has(k)) models.set(k, m);
-    }
-
-    const b = g.attrs?.backdrop;
-    if (b) {
-      const k = b.toLowerCase();
-      if (!backdrops.has(k)) backdrops.set(k, b);
-    }
-  }
-
-  return { giftNames, models, backdrops };
-}
-
-function buildInlineButtons(prefix, names) {
-  const buttons = [];
-  let row = [];
-  for (const name of names) {
-    row.push({
-      text: name,
-      callback_data: `${prefix}${name}`,
+    res = await fetch(url, {
+      method: 'GET',
+      headers: buildPortalHeaders(authData),
     });
-    if (row.length === 2) {
-      buttons.push(row);
-      row = [];
+  } catch (e) {
+    console.error('Portal collections fetch error:', e);
+    return { list: [], byLowerName: new Map() };
+  }
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    console.error('Portal collections HTTP error', res.status, txt.slice(0, 200));
+    return { list: [], byLowerName: new Map() };
+  }
+
+  const data = await res.json().catch((e) => {
+    console.error('Portal collections JSON parse error:', e);
+    return null;
+  });
+  if (!data) return { list: [], byLowerName: new Map() };
+
+  const arr = Array.isArray(data.collections) ? data.collections : Array.isArray(data) ? data : [];
+  const byLowerName = new Map();
+
+  for (const col of arr) {
+    const name = (col.name || col.title || '').trim();
+    const shortName = (col.short_name || col.shortName || '').trim();
+    if (!name) continue;
+    const lower = name.toLowerCase();
+    byLowerName.set(lower, { name, shortName, raw: col });
+  }
+
+  collectionsCache = { list: arr, byLowerName };
+  collectionsCacheTime = now;
+  return collectionsCache;
+}
+
+// Получить фильтры (модели/фоны) для конкретной коллекции по short_name
+async function portalCollectionFilters(shortName) {
+  const authData = process.env.PORTAL_AUTH;
+  if (!authData) {
+    console.warn('PORTAL_AUTH не задан, collection filters будет пропущен.');
+    return null;
+  }
+  if (!shortName) return null;
+
+  const url = `${API_URL}collections/filters?short_names=${encodeURIComponent(shortName)}`;
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'GET',
+      headers: buildPortalHeaders(authData),
+    });
+  } catch (e) {
+    console.error('Portal collection filters fetch error:', e);
+    return null;
+  }
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    console.error('Portal collection filters HTTP error', res.status, txt.slice(0, 200));
+    return null;
+  }
+
+  const data = await res.json().catch((e) => {
+    console.error('Portal collection filters JSON parse error:', e);
+    return null;
+  });
+  if (!data || !data.floor_prices) return null;
+
+  let key = shortName;
+  if (!data.floor_prices[key]) {
+    // иногда ключ может быть в другом регистре
+    const keys = Object.keys(data.floor_prices);
+    const found = keys.find((k) => k.toLowerCase() === shortName.toLowerCase());
+    if (!found) return null;
+    key = found;
+  }
+
+  return data.floor_prices[key];
+}
+
+function extractTraitNames(block) {
+  const names = new Set();
+  if (!block) return [];
+
+  if (Array.isArray(block)) {
+    for (const item of block) {
+      if (!item) continue;
+      if (typeof item === 'string') {
+        names.add(item);
+      } else if (item.name) {
+        names.add(item.name);
+      } else if (item.model) {
+        names.add(item.model);
+      } else if (item.value) {
+        names.add(item.value);
+      }
+    }
+  } else if (typeof block === 'object') {
+    for (const key of Object.keys(block)) {
+      names.add(key);
     }
   }
-  if (row.length) buttons.push(row);
-  return buttons;
+
+  return Array.from(names).sort();
 }
 
 // =====================
-// /listgifts и /listmodels
+// /listgifts и /listmodels (через collections и collections/filters)
 // =====================
 
 bot.onText(/^\/listgifts\b/, async (msg) => {
   const chatId = msg.chat.id;
-  const gifts = await getCurrentGifts();
-  if (!gifts.length) {
-    bot.sendMessage(chatId, 'Подарков сейчас не найдено (по текущему запросу Portal).');
+
+  const { byLowerName } = await portalCollections(200);
+  const names = Array.from(byLowerName.values()).map((x) => x.name);
+
+  if (!names.length) {
+    bot.sendMessage(chatId, 'Подарков сейчас не найдено (Portal collections).');
     return;
   }
 
-  const { giftNames } = buildNameMapFromGifts(gifts);
-  if (!giftNames.size) {
-    bot.sendMessage(chatId, 'Не удалось выделить названия подарков.');
-    return;
-  }
-
-  const lines = Array.from(giftNames.values())
-    .sort()
-    .map((n) => `- ${n}`);
-
-  let text = 'Доступные подарки (по текущему запросу Portal):\n' + lines.join('\n');
+  const lines = names.sort().map((n) => `- ${n}`);
+  let text = 'Подарки (из Portal collections):\n' + lines.join('\n');
   if (text.length > 4000) text = text.slice(0, 3990) + '\n...';
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
@@ -249,40 +358,53 @@ bot.onText(/^\/listgifts\b/, async (msg) => {
 
 bot.onText(/^\/listmodels\b/, async (msg) => {
   const chatId = msg.chat.id;
-  const gifts = await getCurrentGifts();
-  if (!gifts.length) {
-    bot.sendMessage(chatId, 'Данные пока не найдены (по текущему запросу Portal).');
+  const userId = msg.from.id;
+  const user = getOrCreateUser(userId);
+
+  if (!user.filters.gifts.length) {
+    bot.sendMessage(
+      chatId,
+      'Сначала выбери подарок через фильтр (кнопка "🎛 Фильтры" → "Выбрать подарок").',
+      { reply_markup: MAIN_KEYBOARD }
+    );
     return;
   }
 
-  const { giftNames, models, backdrops } = buildNameMapFromGifts(gifts);
-
-  let text = 'Подарки:\n';
-  if (giftNames.size) {
-    text += Array.from(giftNames.values())
-      .sort()
-      .map((n) => `- ${n}`)
-      .join('\n');
-  } else {
-    text += '(нет данных)\n';
+  const giftLower = user.filters.gifts[0];
+  const { byLowerName } = await portalCollections(200);
+  const col = byLowerName.get(giftLower);
+  if (!col) {
+    bot.sendMessage(
+      chatId,
+      'Не нашёл такой подарок в Portal collections (возможно другое название).',
+      { reply_markup: MAIN_KEYBOARD }
+    );
+    return;
   }
 
-  text += '\n\nМодели:\n';
-  if (models.size) {
-    text += Array.from(models.values())
-      .sort()
-      .map((n) => `- ${n}`)
-      .join('\n');
+  const filters = await portalCollectionFilters(col.shortName);
+  if (!filters) {
+    bot.sendMessage(
+      chatId,
+      'Не удалось получить модели/фоны для этой коллекции (collections/filters).',
+      { reply_markup: MAIN_KEYBOARD }
+    );
+    return;
+  }
+
+  const models = extractTraitNames(filters.models);
+  const backdrops = extractTraitNames(filters.backdrops);
+
+  let text = `Подарок: ${col.name}\n\nМодели:\n`;
+  if (models.length) {
+    text += models.map((m) => `- ${m}`).join('\n');
   } else {
     text += '(нет данных)\n';
   }
 
   text += '\n\nФоны:\n';
-  if (backdrops.size) {
-    text += Array.from(backdrops.values())
-      .sort()
-      .map((n) => `- ${n}`)
-      .join('\n');
+  if (backdrops.length) {
+    text += backdrops.map((b) => `- ${b}`).join('\n');
   } else {
     text += '(нет данных)\n';
   }
@@ -293,7 +415,7 @@ bot.onText(/^\/listmodels\b/, async (msg) => {
 });
 
 // =====================
-// Callback-кнопки (фильтры и выборы)
+// Callback-кнопки (фильтры и выборы через collections/filters)
 // =====================
 
 bot.on('callback_query', async (query) => {
@@ -304,31 +426,15 @@ bot.on('callback_query', async (query) => {
 
   try {
     if (data === 'filter_gift') {
-      const gifts = await getCurrentGifts();
-      if (!gifts.length) {
-        await bot.sendMessage(chatId, 'Сейчас подарков не найдено.');
+      const { byLowerName } = await portalCollections(200);
+      const names = Array.from(byLowerName.values()).map((x) => x.name);
+      if (!names.length) {
+        await bot.sendMessage(chatId, 'Сейчас подарков не найдено (Portal collections).');
       } else {
-        const giftMap = new Map(); // lowerName -> { name }
-        for (const g of gifts) {
-          const base = (g.baseName || g.name || '').trim();
-          if (!base) continue;
-          const key = base.toLowerCase();
-          if (!giftMap.has(key)) {
-            giftMap.set(key, { name: base });
-          }
-        }
-
-        if (!giftMap.size) {
-          await bot.sendMessage(chatId, 'Не удалось выделить названия подарков.');
-        } else {
-          const items = Array.from(giftMap.values()).sort((a, b) =>
-            a.name.localeCompare(b.name)
-          );
-
-          const names = items.map((i) => i.name);
-          const inline_keyboard = buildInlineButtons('set_gift:', names);
-          await bot.sendMessage(chatId, 'Выбери подарок:', { reply_markup: { inline_keyboard } });
-        }
+        const inline_keyboard = buildInlineButtons('set_gift:', names.sort());
+        await bot.sendMessage(chatId, 'Выбери подарок:', {
+          reply_markup: { inline_keyboard },
+        });
       }
     } else if (data === 'filter_model') {
       if (!user.filters.gifts.length) {
@@ -338,33 +444,38 @@ bot.on('callback_query', async (query) => {
           { reply_markup: MAIN_KEYBOARD }
         );
       } else {
-        const selectedGift = user.filters.gifts[0]; // lower-case
-        const gifts = await getCurrentGifts();
-        const modelMap = new Map(); // lowerModel -> original
-
-        for (const g of gifts) {
-          const base = (g.baseName || g.name || '').toLowerCase().trim();
-          if (base !== selectedGift) continue;
-          const m = g.attrs?.model;
-          if (!m) continue;
-          const mk = m.toLowerCase().trim();
-          if (!modelMap.has(mk)) {
-            modelMap.set(mk, m);
-          }
-        }
-
-        if (!modelMap.size) {
+        const giftLower = user.filters.gifts[0];
+        const { byLowerName } = await portalCollections(200);
+        const col = byLowerName.get(giftLower);
+        if (!col) {
           await bot.sendMessage(
             chatId,
-            'Не нашёл моделей для выбранного подарка (по текущему запросу Portal).',
+            'Не нашёл такой подарок в Portal collections (возможно другое название).',
             { reply_markup: MAIN_KEYBOARD }
           );
         } else {
-          const names = Array.from(modelMap.values()).sort();
-          const inline_keyboard = buildInlineButtons('set_model:', names);
-          await bot.sendMessage(chatId, 'Выбери модель:', {
-            reply_markup: { inline_keyboard },
-          });
+          const filters = await portalCollectionFilters(col.shortName);
+          if (!filters) {
+            await bot.sendMessage(
+              chatId,
+              'Не удалось получить модели для этой коллекции (collections/filters).',
+              { reply_markup: MAIN_KEYBOARD }
+            );
+          } else {
+            const models = extractTraitNames(filters.models);
+            if (!models.length) {
+              await bot.sendMessage(
+                chatId,
+                'Модели для этого подарка не найдены (по данным Portal).',
+                { reply_markup: MAIN_KEYBOARD }
+              );
+            } else {
+              const inline_keyboard = buildInlineButtons('set_model:', models);
+              await bot.sendMessage(chatId, 'Выбери модель:', {
+                reply_markup: { inline_keyboard },
+              });
+            }
+          }
         }
       }
     } else if (data === 'filter_backdrop') {
@@ -375,32 +486,38 @@ bot.on('callback_query', async (query) => {
           { reply_markup: MAIN_KEYBOARD }
         );
       } else {
-        const selectedGift = user.filters.gifts[0];
-        const gifts = await getCurrentGifts();
-        const backdropsSet = new Map();
-
-        for (const g of gifts) {
-          const base = (g.baseName || g.name || '').toLowerCase().trim();
-          if (base !== selectedGift) continue;
-          const b = g.attrs?.backdrop;
-          if (b) {
-            const k = b.toLowerCase().trim();
-            if (!backdropsSet.has(k)) backdropsSet.set(k, b);
-          }
-        }
-
-        if (!backdropsSet.size) {
+        const giftLower = user.filters.gifts[0];
+        const { byLowerName } = await portalCollections(200);
+        const col = byLowerName.get(giftLower);
+        if (!col) {
           await bot.sendMessage(
             chatId,
-            'Не нашёл фонов для выбранного подарка (по текущему запросу Portal).',
+            'Не нашёл такой подарок в Portal collections (возможно другое название).',
             { reply_markup: MAIN_KEYBOARD }
           );
         } else {
-          const names = Array.from(backdropsSet.values()).sort();
-          const inline_keyboard = buildInlineButtons('set_backdrop:', names);
-          await bot.sendMessage(chatId, 'Выбери фон:', {
-            reply_markup: { inline_keyboard },
-          });
+          const filters = await portalCollectionFilters(col.shortName);
+          if (!filters) {
+            await bot.sendMessage(
+              chatId,
+              'Не удалось получить фоны для этой коллекции (collections/filters).',
+              { reply_markup: MAIN_KEYBOARD }
+            );
+          } else {
+            const backdrops = extractTraitNames(filters.backdrops);
+            if (!backdrops.length) {
+              await bot.sendMessage(
+                chatId,
+                'Фоны для этого подарка не найдены (по данным Portal).',
+                { reply_markup: MAIN_KEYBOARD }
+              );
+            } else {
+              const inline_keyboard = buildInlineButtons('set_backdrop:', backdrops);
+              await bot.sendMessage(chatId, 'Выбери фон:', {
+                reply_markup: { inline_keyboard },
+              });
+            }
+          }
         }
       }
     } else if (data === 'filters_clear') {
@@ -413,60 +530,67 @@ bot.on('callback_query', async (query) => {
         reply_markup: MAIN_KEYBOARD,
       });
     } else if (data === 'list_gifts_inline') {
-      const gifts = await getCurrentGifts();
-      if (!gifts.length) {
-        await bot.sendMessage(chatId, 'Подарков сейчас не найдено (по текущему запросу Portal).');
+      const { byLowerName } = await portalCollections(200);
+      const names = Array.from(byLowerName.values()).map((x) => x.name);
+      if (!names.length) {
+        await bot.sendMessage(chatId, 'Подарков сейчас не найдено (Portal collections).');
       } else {
-        const { giftNames } = buildNameMapFromGifts(gifts);
-        if (!giftNames.size) {
-          await bot.sendMessage(chatId, 'Не удалось выделить названия подарков.');
-        } else {
-          const lines = Array.from(giftNames.values())
-            .sort()
-            .map((n) => `- ${n}`);
-          let text = 'Доступные подарки (по текущему запросу Portal):\n' + lines.join('\n');
-          if (text.length > 4000) text = text.slice(0, 3990) + '\n...';
-          await bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
-        }
-      }
-    } else if (data === 'list_models_inline') {
-      const gifts = await getCurrentGifts();
-      if (!gifts.length) {
-        await bot.sendMessage(chatId, 'Данные пока не найдены (по текущему запросу Portal).');
-      } else {
-        const { giftNames, models, backdrops } = buildNameMapFromGifts(gifts);
-        let text = 'Подарки:\n';
-        if (giftNames.size) {
-          text += Array.from(giftNames.values())
-            .sort()
-            .map((n) => `- ${n}`)
-            .join('\n');
-        } else {
-          text += '(нет данных)\n';
-        }
-
-        text += '\n\nМодели:\n';
-        if (models.size) {
-          text += Array.from(models.values())
-            .sort()
-            .map((n) => `- ${n}`)
-            .join('\n');
-        } else {
-          text += '(нет данных)\n';
-        }
-
-        text += '\n\nФоны:\n';
-        if (backdrops.size) {
-          text += Array.from(backdrops.values())
-            .sort()
-            .map((n) => `- ${n}`)
-            .join('\n');
-        } else {
-          text += '(нет данных)\n';
-        }
-
+        const lines = names.sort().map((n) => `- ${n}`);
+        let text = 'Подарки (из Portal collections):\n' + lines.join('\n');
         if (text.length > 4000) text = text.slice(0, 3990) + '\n...';
         await bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
+      }
+    } else if (data === 'list_models_inline') {
+      // то же, что /listmodels
+      const userId2 = query.from.id;
+      const user2 = getOrCreateUser(userId2);
+      if (!user2.filters.gifts.length) {
+        await bot.sendMessage(
+          chatId,
+          'Сначала выбери подарок через фильтр (кнопка "🎛 Фильтры" → "Выбрать подарок").',
+          { reply_markup: MAIN_KEYBOARD }
+        );
+      } else {
+        const giftLower = user2.filters.gifts[0];
+        const { byLowerName } = await portalCollections(200);
+        const col = byLowerName.get(giftLower);
+        if (!col) {
+          await bot.sendMessage(
+            chatId,
+            'Не нашёл такой подарок в Portal collections.',
+            { reply_markup: MAIN_KEYBOARD }
+          );
+        } else {
+          const filters2 = await portalCollectionFilters(col.shortName);
+          if (!filters2) {
+            await bot.sendMessage(
+              chatId,
+              'Не удалось получить модели/фоны для этой коллекции.',
+              { reply_markup: MAIN_KEYBOARD }
+            );
+          } else {
+            const models = extractTraitNames(filters2.models);
+            const backdrops = extractTraitNames(filters2.backdrops);
+
+            let text = `Подарок: ${col.name}\n\nМодели:\n`;
+            if (models.length) {
+              text += models.map((m) => `- ${m}`).join('\n');
+            } else {
+              text += '(нет данных)\n';
+            }
+
+            text += '\n\nФоны:\n';
+            if (backdrops.length) {
+              text += backdrops.map((b) => `- ${b}`).join('\n');
+            } else {
+              text += '(нет данных)\n';
+            }
+
+            if (text.length > 4000) text = text.slice(0, 3990) + '\n...';
+
+            await bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
+          }
+        }
       }
     } else if (data === 'show_filters') {
       const u = user;
@@ -644,46 +768,8 @@ function fetchTestGifts() {
 }
 
 // =====================
-// REAL-режим: Portal (JS-версия portalsmp.search)
+// REAL-режим: Portal search (как portalsmp.search)
 // =====================
-
-const API_URL = 'https://portal-market.com/api/'; // ВАЖНО: без "s"
-const SORTS = {
-  latest: '&sort_by=listed_at+desc',
-  price_asc: '&sort_by=price+asc',
-  price_desc: '&sort_by=price+desc',
-  gift_id_asc: '&sort_by=external_collection_number+asc',
-  gift_id_desc: '&sort_by=external_collection_number+desc',
-  model_rarity_asc: '&sort_by=model_rarity+asc',
-  model_rarity_desc: '&sort_by=model_rarity+desc',
-};
-
-function cap(text) {
-  return String(text).replace(/\w+(?:'\w+)?/g, (word) => {
-    return word.charAt(0).toUpperCase() + word.slice(1);
-  });
-}
-
-function quotePlus(str) {
-  return encodeURIComponent(str).replace(/%20/g, '+');
-}
-
-function listToURL(list) {
-  return list.map((s) => quotePlus(cap(s))).join('%2C');
-}
-
-function buildPortalHeaders(auth) {
-  const headers = {
-    Authorization: auth,
-    Accept: 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
-    Origin: 'https://portal-market.com',
-    Referer: 'https://portal-market.com/',
-    'User-Agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-  };
-  return headers;
-}
 
 async function portalSearch({
   sort = 'price_asc',
@@ -848,26 +934,7 @@ async function portalSearch({
   return gifts;
 }
 
-// Для /listgifts и /listmodels — общий запрос без фильтров
-async function fetchGiftsForListing() {
-  if (MODE === 'test') return fetchTestGifts();
-
-  const all = [];
-  for (let page = 0; page < PORTAL_PAGES; page++) {
-    const pageGifts = await portalSearch({
-      sort: 'price_asc',
-      offset: page * 100,
-      limit: 100,
-      minPrice: 0,
-      maxPrice: 100000,
-    });
-    all.push(...pageGifts);
-    if (pageGifts.length < 100) break;
-  }
-  return all;
-}
-
-// Для основного мониторинга — пер-пользовательский запрос с фильтрами
+// Для пользователя — поиск по его фильтрам
 async function fetchGiftsForUser(user) {
   if (MODE === 'test') return fetchTestGifts();
 
@@ -897,77 +964,4 @@ async function checkMarketsForAllUsers() {
   if (users.size === 0) return;
 
   for (const [userId, user] of users.entries()) {
-    if (!user.enabled) continue;
-    if (!user.maxPriceTon) continue;
-
-    let gifts;
-    try {
-      gifts = await fetchGiftsForUser(user);
-    } catch (e) {
-      console.error('Ошибка в fetchGiftsForUser:', e);
-      continue;
-    }
-    if (!gifts || !gifts.length) continue;
-
-    gifts.sort((a, b) => a.priceTon - b.priceTon);
-
-    const chatId = userId;
-
-    for (const gift of gifts) {
-      if (!gift.priceTon || gift.priceTon > user.maxPriceTon) continue;
-
-      const attrs = gift.attrs || {};
-
-      const key = `${userId}:${gift.id}`;
-      if (sentDeals.has(key)) {
-        continue;
-      }
-      sentDeals.add(key);
-
-      let text =
-        `Price: ${gift.priceTon.toFixed(3)} TON\n` +
-        `Gift: ${gift.name}\n`;
-
-      if (attrs.model) {
-        text += `Model: ${attrs.model}\n`;
-      }
-      if (attrs.symbol) {
-        text += `Symbol: ${attrs.symbol}\n`;
-      }
-      if (attrs.backdrop) {
-        text += `Backdrop: ${attrs.backdrop}\n`;
-      }
-
-      text += `Market: ${gift.market}\n`;
-
-      if (gift.urlTelegram) {
-        text += `${gift.urlTelegram}`;
-      }
-
-      const replyMarkup = gift.urlMarket
-        ? {
-            inline_keyboard: [
-              [{ text: 'Открыть в Portal', url: gift.urlMarket }],
-            ],
-          }
-        : undefined;
-
-      try {
-        await bot.sendMessage(chatId, text, {
-          disable_web_page_preview: false,
-          reply_markup: replyMarkup,
-        });
-      } catch (e) {
-        console.error('Ошибка при отправке сообщения пользователю', userId, e);
-      }
-    }
-  }
-}
-
-setInterval(() => {
-  checkMarketsForAllUsers().catch((e) =>
-    console.error('Ошибка в checkMarketsForAllUsers:', e)
-  );
-}, CHECK_INTERVAL_MS);
-
-console.log('Бот запущен. Ожидаю команды /start в Telegram.');
+    if (!user.enabled) 
