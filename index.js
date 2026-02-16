@@ -65,7 +65,7 @@ bot.onText(/^\/start\b/, (msg) => {
 
   const text =
     'Бот запущен.\n\n' +
-    `Режим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ с Portal и MRKT'}\n\n` +
+    `Режим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ с Portal'}\n\n` +
     'Команды:\n' +
     '/setmaxprice 0.5 — установить максимальную цену в TON\n' +
     '/status — показать текущие настройки\n' +
@@ -80,7 +80,7 @@ bot.onText(/^\/help\b/, (msg) => {
     'Бот отслеживает NFT‑подарки.\n\n' +
     'Сейчас:\n' +
     '• В режиме test — генерирует случайные цены (для проверки логики);\n' +
-    '• В режиме real — тянет реальные цены из API Portal и MRKT.\n\n' +
+    '• В режиме real — тянет реальные цены из API Portal.\n\n' +
     'Команды:\n' +
     '/setmaxprice 0.5 — максимальная цена подарка в TON\n' +
     '/status — показать текущие настройки\n' +
@@ -133,7 +133,7 @@ bot.onText(/^\/status\b/, (msg) => {
     text += '• Максимальная цена: не задана (установи через /setmaxprice)\n';
   }
 
-  text += `\nРежим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ (Portal + MRKT)'}.\n`;
+  text += `\nРежим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ (Portal)'}.\n`;
 
   bot.sendMessage(chatId, text);
 });
@@ -165,15 +165,6 @@ function fetchTestGifts() {
       priceTon: randomPrice(),
       urlTelegram: 'https://t.me/portals',
       urlMarket: 'https://t.me/portals',
-      attrs: {},
-    },
-    {
-      id: 'mrkt_test_1',
-      market: 'MRKT',
-      name: 'Тестовый подарок MRKT',
-      priceTon: randomPrice(),
-      urlTelegram: 'https://t.me/mrkt',
-      urlMarket: 'https://t.me/mrkt',
       attrs: {},
     },
   ];
@@ -280,9 +271,8 @@ async function fetchPortalGifts() {
       }
 
       // 2) ссылка на этот же гифт в Portal WebApp (deep link)
-      // Пример от тебя:
-      // https://t.me/portals_market_bot/market?startapp=gift_<id>_qbl3o8
-      // Начинаем с простого варианта без суффикса: gift_<id>
+      // Пример от тебя: https://t.me/portals_market_bot/market?startapp=gift_<id>_...
+      // Сейчас используем простой вариант: gift_<id>
       let marketUrl = 'https://t.me/portals';
       if (nft.id) {
         marketUrl = `https://t.me/portals_market_bot/market?startapp=gift_${nft.id}`;
@@ -306,87 +296,6 @@ async function fetchPortalGifts() {
 }
 
 // =====================
-// REAL-режим: MRKT
-// =====================
-
-async function fetchMrktGifts() {
-  const url = 'https://api.tgmrkt.io/api/v1/gifts/models';
-  const raw = process.env.MRKT_COLLECTIONS || '';
-  const collections = raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  if (!collections.length) {
-    console.warn('MRKT_COLLECTIONS не задан, MRKT будет пропущен.');
-    return [];
-  }
-
-  const body = { collections };
-
-  const headers = {
-    'Content-Type': 'application/json',
-    Accept: 'application/json',
-  };
-
-  if (process.env.MRKT_AUTH) {
-    headers['Authorization'] = process.env.MRKT_AUTH;
-    headers['Cookie'] = `access_token=${process.env.MRKT_AUTH}`;
-    headers['Origin'] = 'https://cdn.tgmrkt.io';
-    headers['Referer'] = 'https://cdn.tgmrkt.io/';
-  }
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    console.error('MRKT HTTP error', res.status, txt.slice(0, 200));
-    return [];
-  }
-
-  const data = await res.json().catch((e) => {
-    console.error('MRKT JSON parse error:', e);
-    return null;
-  });
-  if (!Array.isArray(data)) {
-    console.error('MRKT: неожиданный формат ответа, ожидается массив.');
-    return [];
-  }
-
-  const gifts = [];
-  for (const item of data) {
-    const nano = item.floorPriceNanoTons;
-    const nanoNum = Number(nano);
-    if (!nanoNum || Number.isNaN(nanoNum)) continue;
-
-    const priceTon = nanoNum / 1e9;
-
-    // Пока нет нормальной web-страницы гифта MRKT — даём две ссылки на Telegram-бота
-    const urlTelegram = 'https://t.me/mrkt';
-    const urlMarket = 'https://t.me/mrkt';
-
-    gifts.push({
-      id: `mrkt_${item.collectionName}_${item.modelName}`,
-      market: 'MRKT',
-      name: `${item.collectionTitle || item.collectionName} — ${item.modelTitle || item.modelName}`,
-      priceTon,
-      urlTelegram,
-      urlMarket,
-      attrs: {
-        collection: item.collectionName || null,
-        model: item.modelName || null,
-      },
-    });
-  }
-
-  return gifts;
-}
-
-// =====================
 // Общая точка: откуда брать подарки
 // =====================
 
@@ -396,13 +305,6 @@ async function fetchGifts() {
   }
 
   const all = [];
-
-  try {
-    const m = await fetchMrktGifts();
-    all.push(...m);
-  } catch (e) {
-    console.error('Ошибка при запросе к MRKT:', e);
-  }
 
   try {
     const p = await fetchPortalGifts();
