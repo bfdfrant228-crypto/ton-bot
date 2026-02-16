@@ -386,7 +386,7 @@ bot.onText(/^\/listmodels\b/, async (msg) => {
   if (!user.filters.gifts.length) {
     bot.sendMessage(
       chatId,
-      'Сначала выбери подарок через фильтр (кнопка "🎛 Фильтры" → "Выбрать подарок").',
+      'Сначала выбери подарок через фильтр (кнопка "🎛 Фильтры" → "🎁 Выбрать подарок" или "🔍 Подарок").',
       { reply_markup: MAIN_KEYBOARD }
     );
     return;
@@ -469,7 +469,7 @@ bot.on('callback_query', async (query) => {
       if (!user.filters.gifts.length) {
         await bot.sendMessage(
           chatId,
-          'Сначала выбери подарок (кнопка "Фильтр по подарку").',
+          'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
           { reply_markup: MAIN_KEYBOARD }
         );
       } else {
@@ -511,7 +511,7 @@ bot.on('callback_query', async (query) => {
       if (!user.filters.gifts.length) {
         await bot.sendMessage(
           chatId,
-          'Сначала выбери подарок (кнопка "Фильтр по подарку").',
+          'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
           { reply_markup: MAIN_KEYBOARD }
         );
       } else {
@@ -526,7 +526,7 @@ bot.on('callback_query', async (query) => {
       if (!user.filters.gifts.length) {
         await bot.sendMessage(
           chatId,
-          'Сначала выбери подарок (кнопка "Фильтр по подарку").',
+          'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
           { reply_markup: MAIN_KEYBOARD }
         );
       } else {
@@ -568,7 +568,7 @@ bot.on('callback_query', async (query) => {
       if (!user.filters.gifts.length) {
         await bot.sendMessage(
           chatId,
-          'Сначала выбери подарок (кнопка "Фильтр по подарку").',
+          'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
           { reply_markup: MAIN_KEYBOARD }
         );
       } else {
@@ -604,7 +604,7 @@ bot.on('callback_query', async (query) => {
       if (!user2.filters.gifts.length) {
         await bot.sendMessage(
           chatId,
-          'Сначала выбери подарок через фильтр (кнопка "🎛 Фильтры" → "Выбрать подарок").',
+          'Сначала выбери подарок через фильтр (кнопка "🎛 Фильтры" → "🎁 Выбрать подарок" или "🔍 Подарок").',
           { reply_markup: MAIN_KEYBOARD }
         );
       } else {
@@ -751,7 +751,7 @@ bot.on('message', async (msg) => {
     user.state = null;
     const q = text.toLowerCase().trim();
     if (!q) {
-      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "Поиск подарка".', {
+      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "🔍 Подарок".', {
         reply_markup: MAIN_KEYBOARD,
       });
       return;
@@ -784,14 +784,14 @@ bot.on('message', async (msg) => {
     if (!user.filters.gifts.length) {
       bot.sendMessage(
         chatId,
-        'Сначала выбери подарок (кнопка "Фильтр по подарку").',
+        'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
         { reply_markup: MAIN_KEYBOARD }
       );
       return;
     }
     const q = text.toLowerCase().trim();
     if (!q) {
-      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "Поиск модели".', {
+      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "🔍 Модель".', {
         reply_markup: MAIN_KEYBOARD,
       });
       return;
@@ -845,14 +845,14 @@ bot.on('message', async (msg) => {
     if (!user.filters.gifts.length) {
       bot.sendMessage(
         chatId,
-        'Сначала выбери подарок (кнопка "Фильтр по подарку").',
+        'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
         { reply_markup: MAIN_KEYBOARD }
       );
       return;
     }
     const q = text.toLowerCase().trim();
     if (!q) {
-      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "Поиск фона".', {
+      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "🔍 Фон".', {
         reply_markup: MAIN_KEYBOARD,
       });
       return;
@@ -928,23 +928,23 @@ bot.on('message', async (msg) => {
   if (text === '🎛 Фильтры') {
     const inlineKeyboard = {
       inline_keyboard: [
-        [{ text: 'Выбрать подарок', callback_data: 'filter_gift' }],
+        [{ text: '🎁 Выбрать подарок', callback_data: 'filter_gift' }],
         [
-          { text: 'Выбрать модель', callback_data: 'filter_model' },
-          { text: 'Выбрать фон', callback_data: 'filter_backdrop' },
+          { text: '🎯 Выбрать модель', callback_data: 'filter_model' },
+          { text: '🎨 Выбрать фон', callback_data: 'filter_backdrop' },
         ],
         [
-          { text: 'Поиск подарка', callback_data: 'search_gift' },
-          { text: 'Поиск модели', callback_data: 'search_model' },
-          { text: 'Поиск фона', callback_data: 'search_backdrop' },
+          { text: '🔍 Подарок', callback_data: 'search_gift' },
+          { text: '🔍 Модель', callback_data: 'search_model' },
+          { text: '🔍 Фон', callback_data: 'search_backdrop' },
         ],
         [
-          { text: 'Список подарков', callback_data: 'list_gifts_inline' },
-          { text: 'Список моделей', callback_data: 'list_models_inline' },
+          { text: '📜 Список подарков', callback_data: 'list_gifts_inline' },
+          { text: '📜 Список моделей', callback_data: 'list_models_inline' },
         ],
         [
-          { text: 'Показать фильтры', callback_data: 'show_filters' },
-          { text: 'Сбросить', callback_data: 'filters_clear' },
+          { text: 'ℹ️ Показать фильтры', callback_data: 'show_filters' },
+          { text: '♻️ Сбросить', callback_data: 'filters_clear' },
         ],
       ],
     };
