@@ -325,7 +325,7 @@ bot.on('callback_query', async (query) => {
           { reply_markup: MAIN_KEYBOARD }
         );
       } else {
-        const selectedGift = user.filters.gifts[0]; // одна коллекция
+        const selectedGift = user.filters.gifts[0]; // одна коллекция (lowercase)
         const gifts = await getCurrentGifts();
         const modelsSet = new Map();
 
@@ -334,7 +334,7 @@ bot.on('callback_query', async (query) => {
           if (base !== selectedGift) continue;
           const m = g.attrs?.model;
           if (m) {
-            const k = m.toLowerCase();
+            const k = m.toLowerCase().trim();
             if (!modelsSet.has(k)) modelsSet.set(k, m);
           }
         }
@@ -370,7 +370,7 @@ bot.on('callback_query', async (query) => {
           if (base !== selectedGift) continue;
           const b = g.attrs?.backdrop;
           if (b) {
-            const k = b.toLowerCase();
+            const k = b.toLowerCase().trim();
             if (!backdropsSet.has(k)) backdropsSet.set(k, b);
           }
         }
@@ -879,7 +879,7 @@ async function checkMarketsForAllUsers() {
     return;
   }
 
-  // На всякий случай сортируем по цене и здесь (если что-то добавится в будущем)
+  // На всякий случай сортируем по цене
   gifts.sort((a, b) => a.priceTon - b.priceTon);
 
   for (const [userId, user] of users.entries()) {
@@ -894,19 +894,19 @@ async function checkMarketsForAllUsers() {
       const attrs = gift.attrs || {};
 
       // Фильтр по подаркам
-      const giftNameVal = (gift.baseName || gift.name || '').toLowerCase();
+      const giftNameVal = (gift.baseName || gift.name || '').toLowerCase().trim();
       if (user.filters.gifts.length && !user.filters.gifts.includes(giftNameVal)) {
         continue;
       }
 
       // Фильтр по моделям
-      const modelVal = (attrs.model || '').toLowerCase();
+      const modelVal = (attrs.model || '').toLowerCase().trim();
       if (user.filters.models.length && !user.filters.models.includes(modelVal)) {
         continue;
       }
 
       // Фильтр по фонам
-      const backdropVal = (attrs.backdrop || '').toLowerCase();
+      const backdropVal = (attrs.backdrop || '').toLowerCase().trim();
       if (user.filters.backdrops.length && !user.filters.backdrops.includes(backdropVal)) {
         continue;
       }
