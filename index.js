@@ -3,11 +3,8 @@ const TelegramBot = require('node-telegram-bot-api');
 const token = process.env.TELEGRAM_TOKEN;
 const MODE = process.env.MODE || 'real'; // 'test' или 'real'
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5000);
-// сколько страниц Portal запрашивать (умножается на limit из URL)
+// сколько страниц Portal запрашивать (умножается на limit)
 const PORTAL_PAGES = Number(process.env.PORTAL_PAGES || 3);
-// сколько превью с картинками показывать максимум (пока картинки не используем, но оставим запас)
-const MAX_GIFT_PREVIEWS = Number(process.env.MAX_GIFT_PREVIEWS || 12);
-const MAX_MODEL_PREVIEWS = Number(process.env.MAX_MODEL_PREVIEWS || 12);
 
 if (!token) {
   console.error('Ошибка: TELEGRAM_TOKEN не задан. Добавь токен бота в переменные окружения Railway.');
@@ -48,8 +45,8 @@ function getOrCreateUser(userId) {
   if (!users.has(userId)) {
     users.set(userId, {
       maxPriceTon: null,
-      enabled: true, // мониторинг включён
-      state: null,   // состояние ввода (только для цены)
+      enabled: true,
+      state: null,
       filters: {
         gifts: [],      // подарки (Fresh Socks, Victory Medal, ...)
         models: [],     // модели (Night Bat, Genius, ...)
@@ -296,7 +293,7 @@ bot.onText(/^\/listmodels\b/, async (msg) => {
 });
 
 // =====================
-// Callback-кнопки (inline меню фильтров и выборы)
+// Callback-кнопки (фильтры и выборы)
 // =====================
 
 bot.on('callback_query', async (query) => {
@@ -546,11 +543,10 @@ bot.on('message', (msg) => {
   if (!msg.text) return;
 
   const text = msg.text.trim();
-  if (text.startsWith('/')) return; // команды уже обработаны выше
+  if (text.startsWith('/')) return;
 
   const user = getOrCreateUser(userId);
 
-  // ввод цены
   if (user.state === 'awaiting_max_price') {
     const value = parseFloat(text.replace(',', '.'));
     if (Number.isNaN(value) || value <= 0) {
@@ -568,7 +564,6 @@ bot.on('message', (msg) => {
     return;
   }
 
-  // кнопки
   if (text === '💰 Установить цену') {
     user.state = 'awaiting_max_price';
     bot.sendMessage(chatId, 'Введи максимальную цену в TON, например: 4.5', {
@@ -618,7 +613,6 @@ bot.on('message', (msg) => {
     return;
   }
 
-  // всё остальное
   bot.sendMessage(
     chatId,
     'Используй кнопки снизу или команды /help и /status.',
@@ -627,7 +621,7 @@ bot.on('message', (msg) => {
 });
 
 // =====================
-// TEST-режим (случайные данные)
+// TEST-режим
 // =====================
 
 function fetchTestGifts() {
@@ -650,10 +644,10 @@ function fetchTestGifts() {
 }
 
 // =====================
-// REAL-режим: Portal (как portalsmp.search)
+// REAL-режим: Portal (JS-версия portalsmp.search)
 // =====================
 
-const API_URL = 'https://portals-market.com/api/';
+const API_URL = 'https://portal-market.com/api/'; // ВАЖНО: без "s"
 const SORTS = {
   latest: '&sort_by=listed_at+desc',
   price_asc: '&sort_by=price+asc',
@@ -665,7 +659,6 @@ const SORTS = {
 };
 
 function cap(text) {
-  // повторяем логику Python cap(): каждое слово -> с большой буквы
   return String(text).replace(/\w+(?:'\w+)?/g, (word) => {
     return word.charAt(0).toUpperCase() + word.slice(1);
   });
@@ -684,15 +677,14 @@ function buildPortalHeaders(auth) {
     Authorization: auth,
     Accept: 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
-    Origin: 'https://portals-market.com',
-    Referer: 'https://portals-market.com/',
+    Origin: 'https://portal-market.com',
+    Referer: 'https://portal-market.com/',
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
   };
   return headers;
 }
 
-// JS-версия portalsmp.search()
 async function portalSearch({
   sort = 'price_asc',
   offset = 0,
@@ -860,7 +852,6 @@ async function portalSearch({
 async function fetchGiftsForListing() {
   if (MODE === 'test') return fetchTestGifts();
 
-  // берём несколько страниц дешёвых лотов, чтобы увидеть побольше подарков и моделей
   const all = [];
   for (let page = 0; page < PORTAL_PAGES; page++) {
     const pageGifts = await portalSearch({
@@ -876,7 +867,7 @@ async function fetchGiftsForListing() {
   return all;
 }
 
-// Для основного мониторинга — per-user запрос с его фильтрами
+// Для основного мониторинга — пер-пользовательский запрос с фильтрами
 async function fetchGiftsForUser(user) {
   if (MODE === 'test') return fetchTestGifts();
 
@@ -899,14 +890,6 @@ async function fetchGiftsForUser(user) {
 }
 
 // =====================
-// Общая точка получения подарков (для /listgifts и т.п.)
-// =====================
-
-async function fetchGifts() {
-  return await fetchGiftsForListing();
-}
-
-// =====================
 // Мониторинг
 // =====================
 
@@ -926,7 +909,6 @@ async function checkMarketsForAllUsers() {
     }
     if (!gifts || !gifts.length) continue;
 
-    // На всякий случай сортируем по цене
     gifts.sort((a, b) => a.priceTon - b.priceTon);
 
     const chatId = userId;
