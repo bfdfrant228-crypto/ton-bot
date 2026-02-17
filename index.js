@@ -11,7 +11,7 @@ if (!token) {
   process.exit(1);
 }
 
-console.log('Bot version 2026-02-17-portal-mrkt-rarity2');
+console.log('Bot version 2026-02-18-sellprice');
 console.log('Режим работы бота MODE =', MODE);
 
 // Создаём Telegram-бота
@@ -70,6 +70,11 @@ function formatMarkets(markets) {
   return markets.join(', ');
 }
 
+// Нормализатор имён коллекций для сопоставления со slug (LunarSnake -> Lunar Snake)
+function normalizeCollectionKey(name) {
+  return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
 // =====================
 // Команды
 // =====================
@@ -85,7 +90,8 @@ bot.onText(/^\/start\b/, (msg) => {
     '🔍 Запустить поиск — включить мониторинг\n' +
     '⏹ Остановить поиск — выключить мониторинг\n' +
     '💰 Установить цену — задать максимум в TON\n' +
-    '🎛 Фильтры — выбрать подарки/модели/фоны/маркеты';
+    '🎛 Фильтры — выбрать подарки/модели/фоны/маркеты\n\n' +
+    'Также можно прислать ссылку вида https://t.me/nft/..., и я посчитаю примерную цену продажи.';
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -97,13 +103,15 @@ bot.onText(/^\/help\b/, (msg) => {
     'Кнопки:\n' +
     '🔍 Запустить поиск — начать слать найденные гифты\n' +
     '⏹ Остановить поиск — временно остановить\n' +
-    '💰 Установить цену — максимум в TON\n' +
+    '💰 Установить цену — максимум в TON для уведомлений\n' +
     '🎛 Фильтры — подарки / модели / фоны / маркеты (есть поиск по названию)\n\n' +
     'Команды:\n' +
-    '/setmaxprice 0.5 — задать цену\n' +
+    '/setmaxprice 0.5 — задать цену для уведомлений\n' +
     '/status — показать настройки\n' +
     '/listgifts — список подарков из Portal\n' +
-    '/listmodels — модели/фоны для выбранного подарка (с редкостью)';
+    '/listmodels — модели/фоны для выбранного подарка (с редкостью)\n' +
+    '/sellprice — оценка цены продажи по текущим фильтрам (Portal + MRKT).\n\n' +
+    'Можно также просто прислать ссылку на гифт (https://t.me/nft/...), и я оценю цену по рынку.';
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -173,6 +181,22 @@ bot.onText(/^\/status\b/, (msg) => {
   text += `\nРежим: ${MODE === 'test' ? 'ТЕСТОВЫЙ (случайные цены)' : 'РЕАЛЬНЫЕ ЦЕНЫ (Portal + MRKT)'}.\n`;
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
+});
+
+// /sellprice — оценка цены продажи по текущим фильтрам
+bot.onText(/^\/sellprice\b/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const user = getOrCreateUser(userId);
+
+  try {
+    await sendSellPriceForUser(chatId, user, { source: 'command' });
+  } catch (e) {
+    console.error('/sellprice error:', e);
+    bot.sendMessage(chatId, 'Не удалось получить цены продажи. Попробуй позже.', {
+      reply_markup: MAIN_KEYBOARD,
+    });
+  }
 });
 
 // =====================
@@ -295,7 +319,7 @@ async function portalCollections(limit = 200) {
 
 // Получить фильтры (модели/фоны) для конкретной коллекции по short_name
 // Поддерживаем два формата:
-// 1) Новый: { collections: { shortName: { models: [...], backdrops: [...] } } }
+// 1) Новый: { collections: { cookieheart: { models: [...], backdrops: [...] } } }
 // 2) Старый: { floor_prices: { shortName: { models: [...], backdrops: [...] } } }
 async function portalCollectionFilters(shortName) {
   const authData = process.env.PORTAL_AUTH;
@@ -364,33 +388,6 @@ async function portalCollectionFilters(shortName) {
 
   console.error('Portal collection filters: неожиданный формат ответа.');
   return null;
-}
-
-// Старый простой хелпер (на всякий случай)
-function extractTraitNames(block) {
-  const names = new Set();
-  if (!block) return [];
-
-  if (Array.isArray(block)) {
-    for (const item of block) {
-      if (!item) continue;
-      if (typeof item === 'string') {
-        names.add(item);
-      } else if (item.name) {
-        names.add(item.name);
-      } else if (item.model) {
-        names.add(item.model);
-      } else if (item.value) {
-        names.add(item.value);
-      }
-    }
-  } else if (typeof block === 'object') {
-    for (const key of Object.keys(block)) {
-      names.add(key);
-    }
-  }
-
-  return Array.from(names).sort();
 }
 
 // Вытаскиваем имя + редкость (для моделей/фонов) из Portal-фильтров
@@ -860,9 +857,9 @@ bot.on('callback_query', async (query) => {
       let text = 'Текущие фильтры:\n';
       text += `• Мониторинг: ${u.enabled ? 'включён' : 'выключен'}\n`;
       if (u.maxPriceTon) {
-        text += `• Макс. цена: ${u.maxPriceTon.toFixed(3)} TON\n`;
+        text += `• Макс. цена (для уведомлений): ${u.maxPriceTon.toFixed(3)} TON\n`;
       } else {
-        text += '• Макс. цена: не задана\n';
+        text += '• Макс. цена (для уведомлений): не задана\n';
       }
       text += `• Маркеты: ${formatMarkets(u.filters.markets)}\n`;
       if (u.filters.gifts.length) {
@@ -922,7 +919,7 @@ bot.on('callback_query', async (query) => {
 });
 
 // =====================
-// Обработка обычных сообщений (кнопки + ввод цены + поиск по строке)
+// Обработка обычных сообщений (кнопки + ввод цены + поиск по строке + ссылки t.me/nft)
 // =====================
 
 bot.on('message', async (msg) => {
@@ -935,7 +932,7 @@ bot.on('message', async (msg) => {
 
   const user = getOrCreateUser(userId);
 
-  // ввод цены
+  // 1) состояния ввода (цена / поиск)
   if (user.state === 'awaiting_max_price') {
     const value = parseFloat(text.replace(',', '.'));
     if (Number.isNaN(value) || value <= 0) {
@@ -953,7 +950,6 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // поиск подарка по части названия
   if (user.state === 'awaiting_gift_search') {
     user.state = null;
     const q = text.toLowerCase().trim();
@@ -985,7 +981,6 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // поиск модели по части названия
   if (user.state === 'awaiting_model_search') {
     user.state = null;
     if (!user.filters.gifts.length) {
@@ -1068,7 +1063,6 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // поиск фона по части названия
   if (user.state === 'awaiting_backdrop_search') {
     user.state = null;
     if (!user.filters.gifts.length) {
@@ -1151,7 +1145,24 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // обычные кнопки
+  // 2) распознавание ссылки t.me/nft/... для оценки sell price
+  const nftMatch = text.match(/https?:\/\/t\.me\/nft\/([^\s]+)/i);
+  if (nftMatch) {
+    const slug = nftMatch[1];
+    try {
+      await handleNftLinkSellPrice(chatId, user, slug);
+    } catch (e) {
+      console.error('handleNftLinkSellPrice error:', e);
+      bot.sendMessage(
+        chatId,
+        'Не удалось распознать этот подарок или получить цены продажи.\nПопробуй выбрать подарок через "🎛 Фильтры" и затем /sellprice.',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+    }
+    return;
+  }
+
+  // 3) обычные кнопки
   if (text === '💰 Установить цену') {
     user.state = 'awaiting_max_price';
     bot.sendMessage(chatId, 'Введи максимальную цену в TON, например: 4.5', {
@@ -1211,7 +1222,7 @@ bot.on('message', async (msg) => {
 
   bot.sendMessage(
     chatId,
-    'Используй кнопки снизу или команды /help и /status.',
+    'Используй кнопки снизу или команды /help и /status.\nМожно также прислать ссылку на гифт (https://t.me/nft/...), чтобы оценить цену продажи.',
     { reply_markup: MAIN_KEYBOARD }
   );
 });
@@ -1543,7 +1554,169 @@ async function fetchMrktGiftsForUser(user) {
 }
 
 // =====================
-// Общая функция: откуда брать подарки для пользователя
+// Вспомогательные для sellprice (floors)
+// =====================
+
+// Флор Portal по текущим фильтрам пользователя
+async function getPortalFloorForUserFilters(user) {
+  const markets = user.filters.markets || ['Portal', 'MRKT'];
+  if (!markets.includes('Portal')) return null;
+
+  const gifts = await portalSearch({
+    sort: 'price_asc',
+    offset: 0,
+    limit: 50,
+    giftNames: user.filters.gifts.map((x) => x.trim()),
+    models: user.filters.models.map((x) => x.trim()),
+    backdrops: user.filters.backdrops.map((x) => x.trim()),
+    minPrice: 0,
+    maxPrice: 1_000_000, // почти без ограничений
+  });
+
+  if (!gifts || !gifts.length) return null;
+  // gifts уже отсортированы по цене
+  return gifts[0].priceTon;
+}
+
+// Флор MRKT по текущим фильтрам пользователя (игнорируя maxPriceTon)
+async function getMrktFloorForUserFilters(user) {
+  const markets = user.filters.markets || ['Portal', 'MRKT'];
+  if (!markets.includes('MRKT')) return null;
+
+  const originalMax = user.maxPriceTon;
+  user.maxPriceTon = null; // временно игнорируем ограничение по цене
+  try {
+    const gifts = await fetchMrktGiftsForUser(user);
+    if (!gifts || !gifts.length) return null;
+    return gifts[0].priceTon; // уже отсортированы по цене
+  } finally {
+    user.maxPriceTon = originalMax;
+  }
+}
+
+// Общая функция: отправить пользователю оценку sell price по текущим фильтрам
+async function sendSellPriceForUser(chatId, user, { source }) {
+  if (!user.filters.gifts.length) {
+    await bot.sendMessage(
+      chatId,
+      'Сначала выбери подарок (через "🎛 Фильтры" → "🎁 Выбрать подарок" или пришли ссылку https://t.me/nft/...).',
+      { reply_markup: MAIN_KEYBOARD }
+    );
+    return;
+  }
+
+  const giftLower = user.filters.gifts[0];
+  const { byLowerName } = await portalCollections(200);
+  const col = byLowerName.get(giftLower);
+
+  const giftName = col ? col.name : giftLower;
+  const modelName = user.filters.models.length ? user.filters.models[0] : null;
+  const backdropName = user.filters.backdrops.length ? user.filters.backdrops[0] : null;
+
+  const markets = user.filters.markets || ['Portal', 'MRKT'];
+
+  let portalFloor = null;
+  let mrktFloor = null;
+
+  try {
+    portalFloor = await getPortalFloorForUserFilters(user);
+  } catch (e) {
+    console.error('getPortalFloorForUserFilters error:', e);
+  }
+
+  try {
+    mrktFloor = await getMrktFloorForUserFilters(user);
+  } catch (e) {
+    console.error('getMrktFloorForUserFilters error:', e);
+  }
+
+  let text = 'Оценка цен продажи:\n\n';
+  text += `Подарок: ${giftName}\n`;
+  text += `Модель: ${modelName || 'любая'}\n`;
+  text += `Фон: ${backdropName || 'любой'}\n\n`;
+
+  if (markets.includes('Portal')) {
+    if (portalFloor != null) {
+      text += `Portal: ~${portalFloor.toFixed(3)} TON (минимальный активный лот)\n`;
+    } else {
+      text += 'Portal: нет активных лотов по этим фильтрам\n';
+    }
+  }
+
+  if (markets.includes('MRKT')) {
+    if (mrktFloor != null) {
+      text += `MRKT: ~${mrktFloor.toFixed(3)} TON (минимальный активный лот)\n`;
+    } else {
+      text += 'MRKT: нет активных лотов по этим фильтрам\n';
+    }
+  }
+
+  // Простейший ориентир
+  const floors = [portalFloor, mrktFloor].filter((x) => x != null);
+  if (floors.length) {
+    const minFloor = Math.min(...floors);
+    text += `\nЕсли хочешь продать быстро — ставь цену около ${minFloor.toFixed(
+      3
+    )} TON (или немного ниже).`;
+  } else {
+    text += '\nСейчас по этим фильтрам нет активных лотов — ориентироваться не на что.';
+  }
+
+  await bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
+}
+
+// Обработка ссылки t.me/nft/<slug>: выставить фильтр по подарку и посчитать sell price
+async function handleNftLinkSellPrice(chatId, user, slug) {
+  // slug типа: LunarSnake-166366, SnowMittens-15723, PrettyPosy-40935
+  let baseSlug = slug;
+  const parts = slug.split('-');
+  const last = parts[parts.length - 1];
+  if (/^\d+$/.test(last)) {
+    parts.pop();
+    baseSlug = parts.join('-'); // LunarSnake, SnowMittens, PrettyPosy и т.п.
+  }
+
+  const slugNorm = normalizeCollectionKey(baseSlug); // lunarsnake, snowmittens,...
+
+  const { byLowerName } = await portalCollections(200);
+  const values = Array.from(byLowerName.values());
+
+  let matched = null;
+  for (const col of values) {
+    const colNorm = normalizeCollectionKey(col.name);
+    if (colNorm === slugNorm) {
+      matched = col;
+      break;
+    }
+  }
+
+  if (!matched) {
+    await bot.sendMessage(
+      chatId,
+      'Не смог распознать подарок по этой ссылке.\nПопробуй выбрать его вручную через "🎛 Фильтры" → "🎁 Выбрать подарок".',
+      { reply_markup: MAIN_KEYBOARD }
+    );
+    return;
+  }
+
+  // выставляем фильтр по подарку, очищаем модель/фон
+  const giftLower = matched.name.toLowerCase().trim();
+  user.filters.gifts = [giftLower];
+  user.filters.models = [];
+  user.filters.backdrops = [];
+  clearUserSentDeals(chatId);
+
+  await bot.sendMessage(
+    chatId,
+    `Распознал подарок по ссылке как: ${matched.name}.\nСчитаю цены продажи по Portal + MRKT...`,
+    { reply_markup: MAIN_KEYBOARD }
+  );
+
+  await sendSellPriceForUser(chatId, user, { source: 'link' });
+}
+
+// =====================
+// Общая функция: откуда брать подарки для мониторинга
 // =====================
 
 async function fetchAllGiftsForUser(user) {
