@@ -14,7 +14,7 @@ if (!token) {
   process.exit(1);
 }
 
-console.log('Bot version 2026-02-18-sellprice-stable');
+console.log('Bot version 2026-02-18-sellprice-stable-v2');
 console.log('Режим работы бота MODE =', MODE);
 
 // Создаём Telegram-бота
@@ -56,10 +56,10 @@ function getOrCreateUser(userId) {
       enabled: true,
       state: null, // awaiting_max_price / awaiting_*_search
       filters: {
-        gifts: [],      // подарки (Fresh Socks, Victory Medal, ...)
-        models: [],     // модели (Night Bat, Genius, ...)
-        backdrops: [],  // фоны (Black, Dark Green, ...)
-        markets: ['Portal', 'MRKT'], // какие маркеты использовать
+        gifts: [],
+        models: [],
+        backdrops: [],
+        markets: ['Portal', 'MRKT'],
       },
     });
   }
@@ -76,6 +76,23 @@ function normalizeCollectionKey(name) {
   return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
+function buildInlineButtons(prefix, names) {
+  const buttons = [];
+  let row = [];
+  for (const name of names) {
+    row.push({
+      text: name,
+      callback_data: `${prefix}${name}`,
+    });
+    if (row.length === 2) {
+      buttons.push(row);
+      row = [];
+    }
+  }
+  if (row.length) buttons.push(row);
+  return buttons;
+}
+
 // =====================
 // Команды
 // =====================
@@ -90,7 +107,7 @@ bot.onText(/^\/start\b/, (msg) => {
     'Кнопки снизу:\n' +
     '🔍 Запустить поиск — включить мониторинг\n' +
     '⏹ Остановить поиск — выключить мониторинг\n' +
-    '💰 Установить цену — задать максимум в TON для уведомлений\n' +
+    '💰 Установить цену — задать максимум в TON для уведомлений (нажми и потом просто введи число)\n' +
     '💸 Цена подарка — оценить рыночную цену продажи (Portal + MRKT)\n' +
     '🎛 Фильтры — выбрать подарки/модели/фоны/маркеты\n\n' +
     'Можно также прислать ссылку вида https://t.me/nft/..., и я посчитаю примерную цену продажи по коллекции.';
@@ -105,11 +122,11 @@ bot.onText(/^\/help\b/, (msg) => {
     'Кнопки:\n' +
     '🔍 Запустить поиск — начать слать найденные гифты\n' +
     '⏹ Остановить поиск — временно остановить\n' +
-    '💰 Установить цену — максимум в TON для уведомлений\n' +
+    '💰 Установить цену — нажми и просто введи число (макс. цена для уведомлений)\n' +
     '💸 Цена подарка — оценка цены продажи по текущим фильтрам (Portal + MRKT)\n' +
-    '🎛 Фильтры — подарки / модели / фоны / маркеты (есть поиск по названию)\n\n' +
+    '🎛 Фильтры — подарки / модели / фоны / маркеты\n\n' +
     'Команды:\n' +
-    '/setmaxprice 0.5 — задать цену для уведомлений\n' +
+    '/setmaxprice 0.5 — задать цену для уведомлений вручную\n' +
     '/status — показать настройки\n' +
     '/listgifts — список подарков из Portal\n' +
     '/listmodels — модели/фоны для выбранного подарка (с редкостью)\n' +
@@ -186,7 +203,7 @@ bot.onText(/^\/status\b/, (msg) => {
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
 
-// /sellprice — оценка цены продажи по текущим фильтрам
+// /sellprice
 bot.onText(/^\/sellprice\b/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -311,6 +328,7 @@ async function portalCollections(limit = 200) {
   return collectionsCache;
 }
 
+// filters: новый/старый формат
 async function portalCollectionFilters(shortName) {
   const authData = process.env.PORTAL_AUTH;
   if (!authData) {
@@ -537,7 +555,7 @@ bot.onText(/^\/listmodels\b/, async (msg) => {
 });
 
 // =====================
-// Callback-кнопки (фильтры и т.п.)
+// Callback-кнопки (фильтры, выбор маркетов)
 // =====================
 
 bot.on('callback_query', async (query) => {
@@ -587,7 +605,6 @@ bot.on('callback_query', async (query) => {
         reply_markup: MAIN_KEYBOARD,
       });
     }
-    // остальные callback'и (поиск, модели, фоны и т.п.) можно вернуть позже, если нужно
   } catch (e) {
     console.error('callback_query error:', e);
   }
@@ -596,7 +613,7 @@ bot.on('callback_query', async (query) => {
 });
 
 // =====================
-// Обработка сообщений (без команд)
+// Общий on('message') (кнопки + state + ссылка t.me/nft)
 // =====================
 
 bot.on('message', async (msg) => {
@@ -607,9 +624,28 @@ bot.on('message', async (msg) => {
   if (text.startsWith('/')) return;
 
   const user = getOrCreateUser(userId);
+  const trimmed = text.trim();
 
-  // ссылка t.me/nft/... → оценка цены по коллекции
-  const nftMatch = text.trim().match(/https?:\/\/t\.me\/nft\/([^\s]+)/i);
+  // 1) state: ожидание цены после "💰 Установить цену"
+  if (user.state === 'awaiting_max_price') {
+    const value = parseFloat(trimmed.replace(',', '.'));
+    if (Number.isNaN(value) || value <= 0) {
+      bot.sendMessage(chatId, 'Некорректная цена. Введи положительное число, например: 0.3');
+      return;
+    }
+    user.maxPriceTon = value;
+    user.state = null;
+    clearUserSentDeals(userId);
+    bot.sendMessage(
+      chatId,
+      `Максимальная цена установлена: ${value.toFixed(3)} TON.`,
+      { reply_markup: MAIN_KEYBOARD }
+    );
+    return;
+  }
+
+  // 2) ссылка t.me/nft/... → оценка sellprice по коллекции
+  const nftMatch = trimmed.match(/https?:\/\/t\.me\/nft\/([^\s]+)/i);
   if (nftMatch) {
     const slug = nftMatch[1];
     try {
@@ -625,14 +661,18 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  if (text === '💰 Установить цену') {
-    bot.sendMessage(chatId, 'Введи максимальную цену в TON через команду, например:\n/setmaxprice 4.5', {
-      reply_markup: MAIN_KEYBOARD,
-    });
+  // 3) кнопки
+  if (trimmed === '💰 Установить цену') {
+    user.state = 'awaiting_max_price';
+    bot.sendMessage(
+      chatId,
+      'Введи максимальную цену в TON.\nНапример: 4.5',
+      { reply_markup: MAIN_KEYBOARD }
+    );
     return;
   }
 
-  if (text === '💸 Цена подарка') {
+  if (trimmed === '💸 Цена подарка') {
     try {
       await sendSellPriceForUser(chatId, user);
     } catch (e) {
@@ -646,7 +686,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  if (text === '🔍 Запустить поиск') {
+  if (trimmed === '🔍 Запустить поиск') {
     user.enabled = true;
     bot.sendMessage(chatId, 'Мониторинг включён. Бот будет отправлять подходящие гифты.', {
       reply_markup: MAIN_KEYBOARD,
@@ -654,7 +694,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  if (text === '⏹ Остановить поиск') {
+  if (trimmed === '⏹ Остановить поиск') {
     user.enabled = false;
     bot.sendMessage(chatId, 'Мониторинг остановлен.', {
       reply_markup: MAIN_KEYBOARD,
@@ -662,7 +702,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  if (text === '🎛 Фильтры') {
+  if (trimmed === '🎛 Фильтры') {
     const inlineKeyboard = {
       inline_keyboard: [
         [{ text: '🎁 Выбрать подарок', callback_data: 'filter_gift' }],
@@ -1126,7 +1166,6 @@ async function sendSellPriceForUser(chatId, user) {
   await bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 }
 
-// обработка ссылки t.me/nft/<slug>
 async function handleNftLinkSellPrice(chatId, user, slug) {
   let baseSlug = slug;
   const parts = slug.split('-');
