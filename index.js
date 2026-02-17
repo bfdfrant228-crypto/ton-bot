@@ -11,7 +11,7 @@ if (!token) {
   process.exit(1);
 }
 
-console.log('Bot version 2026-02-17-portal-mrkt-rarity');
+console.log('Bot version 2026-02-17-portal-mrkt-rarity2');
 console.log('Режим работы бота MODE =', MODE);
 
 // Создаём Telegram-бота
@@ -103,7 +103,7 @@ bot.onText(/^\/help\b/, (msg) => {
     '/setmaxprice 0.5 — задать цену\n' +
     '/status — показать настройки\n' +
     '/listgifts — список подарков из Portal\n' +
-    '/listmodels — модели/фоны для выбранного подарка';
+    '/listmodels — модели/фоны для выбранного подарка (с редкостью)';
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -294,6 +294,9 @@ async function portalCollections(limit = 200) {
 }
 
 // Получить фильтры (модели/фоны) для конкретной коллекции по short_name
+// Поддерживаем два формата:
+// 1) Новый: { collections: { shortName: { models: [...], backdrops: [...] } } }
+// 2) Старый: { floor_prices: { shortName: { models: [...], backdrops: [...] } } }
 async function portalCollectionFilters(shortName) {
   const authData = process.env.PORTAL_AUTH;
   if (!authData) {
@@ -325,20 +328,45 @@ async function portalCollectionFilters(shortName) {
     console.error('Portal collection filters JSON parse error:', e);
     return null;
   });
-  if (!data || !data.floor_prices) return null;
+  if (!data) return null;
 
-  let key = shortName;
-  if (!data.floor_prices[key]) {
-    const keys = Object.keys(data.floor_prices);
-    const found = keys.find((k) => k.toLowerCase() === shortName.toLowerCase());
-    if (!found) return null;
-    key = found;
+  // Новый формат: { collections: { cookieheart: { models:[...], backdrops:[...] } } }
+  if (data.collections && typeof data.collections === 'object') {
+    const keys = Object.keys(data.collections);
+    let key = keys.find((k) => k.toLowerCase() === shortName.toLowerCase()) || shortName;
+    const colBlock = data.collections[key];
+    if (!colBlock) {
+      console.warn('Portal collection filters: не нашёл блок для', shortName);
+      return null;
+    }
+    return {
+      models: colBlock.models || [],
+      backdrops: colBlock.backdrops || [],
+    };
   }
 
-  return data.floor_prices[key];
+  // Старый формат: { floor_prices: { shortName: { models:[...], backdrops:[...] } } }
+  if (data.floor_prices && typeof data.floor_prices === 'object') {
+    let key = shortName;
+    if (!data.floor_prices[key]) {
+      const keys = Object.keys(data.floor_prices);
+      const found = keys.find((k) => k.toLowerCase() === shortName.toLowerCase());
+      if (!found) return null;
+      key = found;
+    }
+    const block = data.floor_prices[key];
+    if (!block) return null;
+    return {
+      models: block.models || [],
+      backdrops: block.backdrops || [],
+    };
+  }
+
+  console.error('Portal collection filters: неожиданный формат ответа.');
+  return null;
 }
 
-// Старый хелпер, если где-то ещё нужен просто список имён
+// Старый простой хелпер (на всякий случай)
 function extractTraitNames(block) {
   const names = new Set();
   if (!block) return [];
@@ -365,7 +393,7 @@ function extractTraitNames(block) {
   return Array.from(names).sort();
 }
 
-// НОВЫЙ: вытащить имя + редкость (персона модели/фона)
+// Вытаскиваем имя + редкость (для моделей/фонов) из Portal-фильтров
 function extractTraitsWithRarity(block) {
   const map = new Map(); // lowerName -> { name, rarityPerMille, rarityName }
 
@@ -382,8 +410,8 @@ function extractTraitsWithRarity(block) {
         name = item;
       } else {
         name = item.name || item.model || item.value || null;
-        if (item.rarityPermille != null) rarityPerMille = Number(item.rarityPermille);
-        else if (item.rarity_per_mille != null) rarityPerMille = Number(item.rarity_per_mille);
+        if (item.rarity_per_mille != null) rarityPerMille = Number(item.rarity_per_mille);
+        else if (item.rarityPermille != null) rarityPerMille = Number(item.rarityPermille);
         rarityName = item.rarityName || item.rarity_name || null;
       }
 
@@ -399,8 +427,8 @@ function extractTraitsWithRarity(block) {
       let rarityPerMille = null;
       let rarityName = null;
       if (val && typeof val === 'object') {
-        if (val.rarityPermille != null) rarityPerMille = Number(val.rarityPermille);
-        else if (val.rarity_per_mille != null) rarityPerMille = Number(val.rarity_per_mille);
+        if (val.rarity_per_mille != null) rarityPerMille = Number(val.rarity_per_mille);
+        else if (val.rarityPermille != null) rarityPerMille = Number(val.rarityPermille);
         rarityName = val.rarityName || val.rarity_name || null;
       }
       const lower = name.toLowerCase().trim();
@@ -415,7 +443,7 @@ function extractTraitsWithRarity(block) {
     const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
     const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
     if (ra === rb) return a.name.localeCompare(b.name);
-    return ra - rb; // чем меньше perMille — тем реже, тем выше
+    return ra - rb; // чем меньше per_mille — тем реже, тем выше
   });
 
   return arr;
@@ -423,11 +451,10 @@ function extractTraitsWithRarity(block) {
 
 function formatRarityLabel(trait) {
   if (!trait) return '';
-  if (trait.rarityName) return trait.rarityName; // Legendary / Epic / Common / ...
+  if (trait.rarityName) return trait.rarityName; // Legendary / Epic / Common / Uncommon, если Portal это отдаёт
   if (trait.rarityPerMille != null) {
     const p = Number(trait.rarityPerMille);
     if (!Number.isFinite(p)) return '';
-    // Интерпретируем как проценты (примерно как в Телеграме)
     const rounded = Number(p.toFixed(1));
     if (Number.isInteger(rounded)) return `${rounded}%`;
     return `${rounded}%`;
@@ -1000,12 +1027,14 @@ bot.on('message', async (msg) => {
     }
 
     const modelTraits = extractTraitsWithRarity(filters.models);
-    const matched = modelTraits.filter((m) => m.name.toLowerCase().includes(q)).sort((a, b) => {
-      const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
-      const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
-      if (ra === rb) return a.name.localeCompare(b.name);
-      return ra - rb;
-    });
+    const matched = modelTraits
+      .filter((m) => m.name.toLowerCase().includes(q))
+      .sort((a, b) => {
+        const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
+        const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
+        if (ra === rb) return a.name.localeCompare(b.name);
+        return ra - rb;
+      });
 
     if (!matched.length) {
       bot.sendMessage(
@@ -1081,12 +1110,14 @@ bot.on('message', async (msg) => {
     }
 
     const backdropTraits = extractTraitsWithRarity(filters.backdrops);
-    const matched = backdropTraits.filter((b) => b.name.toLowerCase().includes(q)).sort((a, b) => {
-      const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
-      const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
-      if (ra === rb) return a.name.localeCompare(b.name);
-      return ra - rb;
-    });
+    const matched = backdropTraits
+      .filter((b) => b.name.toLowerCase().includes(q))
+      .sort((a, b) => {
+        const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
+        const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
+        if (ra === rb) return a.name.localeCompare(b.name);
+        return ra - rb;
+      });
 
     if (!matched.length) {
       bot.sendMessage(
@@ -1378,7 +1409,7 @@ async function portalSearch({
 }
 
 // =====================
-// MRKT: /gifts/saling (получаем конкретные лоты)
+// MRKT: /gifts/saling (конкретные лоты + ссылки t.me/nft и t.me/mrkt/app)
 // =====================
 
 async function fetchMrktGiftsForUser(user) {
@@ -1393,11 +1424,10 @@ async function fetchMrktGiftsForUser(user) {
   const modelFilter = user.filters.models.map((x) => cap(x.trim()));
   const backdropFilter = user.filters.backdrops.map((x) => cap(x.trim()));
 
-  // Тело запроса как в DevTools
   const body = {
     count: 20,
     cursor: '',
-    collectionNames: collFilter, // [] = все коллекции
+    collectionNames: collFilter,
     modelNames: modelFilter,
     backdropNames: backdropFilter,
     symbolNames: [],
@@ -1459,7 +1489,6 @@ async function fetchMrktGiftsForUser(user) {
   for (const g of rawGifts) {
     if (!g) continue;
 
-    // Цена в NanoTON (salePrice / salePriceWithoutFee)
     let priceNano = null;
     if (g.salePrice != null) priceNano = g.salePrice;
     else if (g.salePriceWithoutFee != null) priceNano = g.salePriceWithoutFee;
@@ -1478,14 +1507,11 @@ async function fetchMrktGiftsForUser(user) {
     const symbol = g.symbolName || null;
     const backdrop = g.backdropName || null;
 
-    // ССЫЛКА НА ГИФТ В TELEGRAM: t.me/nft/<slug>
-    // В JSON: name: "LunarSnake-166366" -> slug
     let urlTelegram = 'https://t.me/mrkt';
     if (g.name && String(g.name).includes('-')) {
       urlTelegram = `https://t.me/nft/${g.name}`;
     }
 
-    // ССЫЛКА НА ГИФТ В MRKT: t.me/mrkt/app?startapp=<id_без_дефисов>
     let urlMarket = 'https://t.me/mrkt';
     if (g.id) {
       const appId = String(g.id).replace(/-/g, '');
@@ -1516,7 +1542,10 @@ async function fetchMrktGiftsForUser(user) {
   return gifts;
 }
 
-// Для пользователя — поиск по его фильтрам (Portal + MRKT, с учётом выбранных маркетов)
+// =====================
+// Общая функция: откуда брать подарки для пользователя
+// =====================
+
 async function fetchAllGiftsForUser(user) {
   if (MODE === 'test') return fetchTestGifts();
 
@@ -1588,13 +1617,11 @@ async function checkMarketsForAllUsers() {
     for (const gift of gifts) {
       if (!gift.priceTon || gift.priceTon > user.maxPriceTon) continue;
 
-      // фильтр по маркету
       if (gift.market === 'Portal' && !wantPortal) continue;
       if (gift.market === 'MRKT' && !wantMrkt) continue;
 
       const attrs = gift.attrs || {};
 
-      // Жёсткий фильтр по подарку/модели/фону для ВСЕХ маркетов (Portal и MRKT)
       const giftNameVal = (gift.baseName || gift.name || '').toLowerCase().trim();
       if (user.filters.gifts.length && !user.filters.gifts.includes(giftNameVal)) {
         continue;
