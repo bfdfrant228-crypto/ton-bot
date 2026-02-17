@@ -11,7 +11,7 @@ if (!token) {
   process.exit(1);
 }
 
-console.log('Bot version 2026-02-17-portal-mrkt-models');
+console.log('Bot version 2026-02-17-portal-mrkt-rarity');
 console.log('Режим работы бота MODE =', MODE);
 
 // Создаём Telegram-бота
@@ -338,6 +338,7 @@ async function portalCollectionFilters(shortName) {
   return data.floor_prices[key];
 }
 
+// Старый хелпер, если где-то ещё нужен просто список имён
 function extractTraitNames(block) {
   const names = new Set();
   if (!block) return [];
@@ -362,6 +363,76 @@ function extractTraitNames(block) {
   }
 
   return Array.from(names).sort();
+}
+
+// НОВЫЙ: вытащить имя + редкость (персона модели/фона)
+function extractTraitsWithRarity(block) {
+  const map = new Map(); // lowerName -> { name, rarityPerMille, rarityName }
+
+  if (!block) return [];
+
+  if (Array.isArray(block)) {
+    for (const item of block) {
+      if (!item) continue;
+      let name = null;
+      let rarityPerMille = null;
+      let rarityName = null;
+
+      if (typeof item === 'string') {
+        name = item;
+      } else {
+        name = item.name || item.model || item.value || null;
+        if (item.rarityPermille != null) rarityPerMille = Number(item.rarityPermille);
+        else if (item.rarity_per_mille != null) rarityPerMille = Number(item.rarity_per_mille);
+        rarityName = item.rarityName || item.rarity_name || null;
+      }
+
+      if (!name) continue;
+      const lower = name.toLowerCase().trim();
+      if (!map.has(lower)) {
+        map.set(lower, { name, rarityPerMille, rarityName });
+      }
+    }
+  } else if (typeof block === 'object') {
+    for (const [key, val] of Object.entries(block)) {
+      const name = key;
+      let rarityPerMille = null;
+      let rarityName = null;
+      if (val && typeof val === 'object') {
+        if (val.rarityPermille != null) rarityPerMille = Number(val.rarityPermille);
+        else if (val.rarity_per_mille != null) rarityPerMille = Number(val.rarity_per_mille);
+        rarityName = val.rarityName || val.rarity_name || null;
+      }
+      const lower = name.toLowerCase().trim();
+      if (!map.has(lower)) {
+        map.set(lower, { name, rarityPerMille, rarityName });
+      }
+    }
+  }
+
+  const arr = Array.from(map.values());
+  arr.sort((a, b) => {
+    const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
+    const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
+    if (ra === rb) return a.name.localeCompare(b.name);
+    return ra - rb; // чем меньше perMille — тем реже, тем выше
+  });
+
+  return arr;
+}
+
+function formatRarityLabel(trait) {
+  if (!trait) return '';
+  if (trait.rarityName) return trait.rarityName; // Legendary / Epic / Common / ...
+  if (trait.rarityPerMille != null) {
+    const p = Number(trait.rarityPerMille);
+    if (!Number.isFinite(p)) return '';
+    // Интерпретируем как проценты (примерно как в Телеграме)
+    const rounded = Number(p.toFixed(1));
+    if (Number.isInteger(rounded)) return `${rounded}%`;
+    return `${rounded}%`;
+  }
+  return '';
 }
 
 // =====================
@@ -443,19 +514,29 @@ bot.onText(/^\/listmodels\b/, async (msg) => {
     return;
   }
 
-  const models = extractTraitNames(filters.models);
-  const backdrops = extractTraitNames(filters.backdrops);
+  const modelTraits = extractTraitsWithRarity(filters.models);
+  const backdropTraits = extractTraitsWithRarity(filters.backdrops);
 
-  let text = `Подарок: ${col.name}\n\nМодели:\n`;
-  if (models.length) {
-    text += models.map((m) => `- ${m}`).join('\n');
+  let text = `Подарок: ${col.name}\n\nМодели (по редкости):\n`;
+  if (modelTraits.length) {
+    text += modelTraits
+      .map((m) => {
+        const r = formatRarityLabel(m);
+        return r ? `- ${m.name} (${r})` : `- ${m.name}`;
+      })
+      .join('\n');
   } else {
     text += '(нет данных)\n';
   }
 
   text += '\n\nФоны:\n';
-  if (backdrops.length) {
-    text += backdrops.map((b) => `- ${b}`).join('\n');
+  if (backdropTraits.length) {
+    text += backdropTraits
+      .map((b) => {
+        const r = formatRarityLabel(b);
+        return r ? `- ${b.name} (${r})` : `- ${b.name}`;
+      })
+      .join('\n');
   } else {
     text += '(нет данных)\n';
   }
@@ -520,15 +601,30 @@ bot.on('callback_query', async (query) => {
               { reply_markup: MAIN_KEYBOARD }
             );
           } else {
-            const models = extractTraitNames(filters.models);
-            if (!models.length) {
+            const modelTraits = extractTraitsWithRarity(filters.models);
+            if (!modelTraits.length) {
               await bot.sendMessage(
                 chatId,
                 'Модели для этого подарка не найдены (по данным Portal).',
                 { reply_markup: MAIN_KEYBOARD }
               );
             } else {
-              const inline_keyboard = buildInlineButtons('set_model:', models);
+              const inline_keyboard = [];
+              let row = [];
+              for (const m of modelTraits) {
+                const r = formatRarityLabel(m);
+                const label = r ? `${m.name} (${r})` : m.name;
+                row.push({
+                  text: label,
+                  callback_data: `set_model:${m.name}`,
+                });
+                if (row.length === 2) {
+                  inline_keyboard.push(row);
+                  row = [];
+                }
+              }
+              if (row.length) inline_keyboard.push(row);
+
               await bot.sendMessage(chatId, 'Выбери модель:', {
                 reply_markup: { inline_keyboard },
               });
@@ -577,15 +673,30 @@ bot.on('callback_query', async (query) => {
               { reply_markup: MAIN_KEYBOARD }
             );
           } else {
-            const backdrops = extractTraitNames(filters.backdrops);
-            if (!backdrops.length) {
+            const backdropTraits = extractTraitsWithRarity(filters.backdrops);
+            if (!backdropTraits.length) {
               await bot.sendMessage(
                 chatId,
                 'Фоны для этого подарка не найдены (по данным Portal).',
                 { reply_markup: MAIN_KEYBOARD }
               );
             } else {
-              const inline_keyboard = buildInlineButtons('set_backdrop:', backdrops);
+              const inline_keyboard = [];
+              let row = [];
+              for (const b of backdropTraits) {
+                const r = formatRarityLabel(b);
+                const label = r ? `${b.name} (${r})` : b.name;
+                row.push({
+                  text: label,
+                  callback_data: `set_backdrop:${b.name}`,
+                });
+                if (row.length === 2) {
+                  inline_keyboard.push(row);
+                  row = [];
+                }
+              }
+              if (row.length) inline_keyboard.push(row);
+
               await bot.sendMessage(chatId, 'Выбери фон:', {
                 reply_markup: { inline_keyboard },
               });
@@ -684,19 +795,29 @@ bot.on('callback_query', async (query) => {
               { reply_markup: MAIN_KEYBOARD }
             );
           } else {
-            const models = extractTraitNames(filters2.models);
-            const backdrops = extractTraitNames(filters2.backdrops);
+            const modelTraits = extractTraitsWithRarity(filters2.models);
+            const backdropTraits = extractTraitsWithRarity(filters2.backdrops);
 
-            let text = `Подарок: ${col.name}\n\nМодели:\n`;
-            if (models.length) {
-              text += models.map((m) => `- ${m}`).join('\n');
+            let text = `Подарок: ${col.name}\n\nМодели (по редкости):\n`;
+            if (modelTraits.length) {
+              text += modelTraits
+                .map((m) => {
+                  const r = formatRarityLabel(m);
+                  return r ? `- ${m.name} (${r})` : `- ${m.name}`;
+                })
+                .join('\n');
             } else {
               text += '(нет данных)\n';
             }
 
             text += '\n\nФоны:\n';
-            if (backdrops.length) {
-              text += backdrops.map((b) => `- ${b}`).join('\n');
+            if (backdropTraits.length) {
+              text += backdropTraits
+                .map((b) => {
+                  const r = formatRarityLabel(b);
+                  return r ? `- ${b.name} (${r})` : `- ${b.name}`;
+                })
+                .join('\n');
             } else {
               text += '(нет данных)\n';
             }
@@ -878,8 +999,13 @@ bot.on('message', async (msg) => {
       return;
     }
 
-    const models = extractTraitNames(filters.models);
-    const matched = models.filter((m) => m.toLowerCase().includes(q)).sort();
+    const modelTraits = extractTraitsWithRarity(filters.models);
+    const matched = modelTraits.filter((m) => m.name.toLowerCase().includes(q)).sort((a, b) => {
+      const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
+      const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
+      if (ra === rb) return a.name.localeCompare(b.name);
+      return ra - rb;
+    });
 
     if (!matched.length) {
       bot.sendMessage(
@@ -891,7 +1017,22 @@ bot.on('message', async (msg) => {
     }
 
     const limited = matched.slice(0, MAX_SEARCH_RESULTS);
-    const inline_keyboard = buildInlineButtons('set_model:', limited);
+    const inline_keyboard = [];
+    let row = [];
+    for (const m of limited) {
+      const r = formatRarityLabel(m);
+      const label = r ? `${m.name} (${r})` : m.name;
+      row.push({
+        text: label,
+        callback_data: `set_model:${m.name}`,
+      });
+      if (row.length === 2) {
+        inline_keyboard.push(row);
+        row = [];
+      }
+    }
+    if (row.length) inline_keyboard.push(row);
+
     await bot.sendMessage(chatId, 'Нашёл такие модели, выбери:', {
       reply_markup: { inline_keyboard },
     });
@@ -939,8 +1080,13 @@ bot.on('message', async (msg) => {
       return;
     }
 
-    const backdrops = extractTraitNames(filters.backdrops);
-    const matched = backdrops.filter((b) => b.toLowerCase().includes(q)).sort();
+    const backdropTraits = extractTraitsWithRarity(filters.backdrops);
+    const matched = backdropTraits.filter((b) => b.name.toLowerCase().includes(q)).sort((a, b) => {
+      const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
+      const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
+      if (ra === rb) return a.name.localeCompare(b.name);
+      return ra - rb;
+    });
 
     if (!matched.length) {
       bot.sendMessage(
@@ -952,7 +1098,22 @@ bot.on('message', async (msg) => {
     }
 
     const limited = matched.slice(0, MAX_SEARCH_RESULTS);
-    const inline_keyboard = buildInlineButtons('set_backdrop:', limited);
+    const inline_keyboard = [];
+    let row = [];
+    for (const b of limited) {
+      const r = formatRarityLabel(b);
+      const label = r ? `${b.name} (${r})` : b.name;
+      row.push({
+        text: label,
+        callback_data: `set_backdrop:${b.name}`,
+      });
+      if (row.length === 2) {
+        inline_keyboard.push(row);
+        row = [];
+      }
+    }
+    if (row.length) inline_keyboard.push(row);
+
     await bot.sendMessage(chatId, 'Нашёл такие фоны, выбери:', {
       reply_markup: { inline_keyboard },
     });
@@ -1217,7 +1378,7 @@ async function portalSearch({
 }
 
 // =====================
-// MRKT: /gifts/models (floorPriceNanoTons)
+// MRKT: /gifts/saling (получаем конкретные лоты)
 // =====================
 
 async function fetchMrktGiftsForUser(user) {
@@ -1227,53 +1388,45 @@ async function fetchMrktGiftsForUser(user) {
     return [];
   }
 
-  // Список коллекций:
-  // 1) MRKT_COLLECTIONS из env
-  // 2) плюс выбранный фильтр подарка (если есть)
-  let collections = [];
-  const rawEnv = process.env.MRKT_COLLECTIONS || '';
-  if (rawEnv) {
-    collections.push(
-      ...rawEnv
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean)
-    );
-  }
+  // Фильтры пользователя: подарки / модели / фоны
+  const collFilter = user.filters.gifts.map((x) => cap(x.trim()));
+  const modelFilter = user.filters.models.map((x) => cap(x.trim()));
+  const backdropFilter = user.filters.backdrops.map((x) => cap(x.trim()));
 
-  if (user.filters.gifts.length) {
-    for (const g of user.filters.gifts) {
-      const name = cap(g.trim());
-      if (name && !collections.includes(name)) {
-        collections.push(name);
-      }
-    }
-  }
-
-  collections = Array.from(new Set(collections));
-  if (!collections.length) {
-    console.warn('MRKT: пустой список collections (MRKT_COLLECTIONS + фильтры), MRKT пропущен.');
-    return [];
-  }
-
-  const body = { collections };
-
-  console.log('MRKT /gifts/models body:', JSON.stringify(body));
-
-  const headers = {
-    'Content-Type': 'application/json',
-    Accept: 'application/json',
-    Authorization: token,
-    Cookie: `access_token=${token}`,
-    Origin: 'https://cdn.tgmrkt.io',
-    Referer: 'https://cdn.tgmrkt.io/',
+  // Тело запроса как в DevTools
+  const body = {
+    count: 20,
+    cursor: '',
+    collectionNames: collFilter, // [] = все коллекции
+    modelNames: modelFilter,
+    backdropNames: backdropFilter,
+    symbolNames: [],
+    ordering: 'None',
+    lowToHigh: false,
+    maxPrice: null,
+    minPrice: null,
+    giftType: null,
+    isCrafted: null,
+    isNew: null,
+    isPremarket: null,
+    isTransferable: null,
+    luckyBuy: null,
+    removeSelfSales: null,
+    craftable: null,
+    tgCanBeCraftedFrom: null,
   };
+
+  console.log('MRKT /gifts/saling body:', JSON.stringify(body));
 
   let res;
   try {
-    res = await fetch(`${MRKT_API_URL}/gifts/models`, {
+    res = await fetch(`${MRKT_API_URL}/gifts/saling`, {
       method: 'POST',
-      headers,
+      headers: {
+        Authorization: token,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
       body: JSON.stringify(body),
     });
   } catch (e) {
@@ -1281,7 +1434,7 @@ async function fetchMrktGiftsForUser(user) {
     return [];
   }
 
-  console.log('MRKT /gifts/models status:', res.status);
+  console.log('MRKT /gifts/saling status:', res.status);
 
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
@@ -1293,48 +1446,67 @@ async function fetchMrktGiftsForUser(user) {
     console.error('MRKT JSON parse error:', e);
     return null;
   });
-  if (!data || !Array.isArray(data)) {
-    console.error('MRKT: неожиданный формат ответа, ожидается массив.');
+  if (!data || !Array.isArray(data.gifts)) {
+    console.error('MRKT: неожиданный формат ответа, ожидается {gifts:[...]}');
     return [];
   }
 
-  console.log('MRKT models length:', data.length);
+  const rawGifts = data.gifts;
+  console.log('MRKT gifts length:', rawGifts.length);
 
   const gifts = [];
 
-  for (const item of data) {
-    if (!item) continue;
+  for (const g of rawGifts) {
+    if (!g) continue;
 
-    const nano = item.floorPriceNanoTons;
-    const nanoNum = Number(nano);
-    if (!nanoNum || Number.isNaN(nanoNum)) continue;
+    // Цена в NanoTON (salePrice / salePriceWithoutFee)
+    let priceNano = null;
+    if (g.salePrice != null) priceNano = g.salePrice;
+    else if (g.salePriceWithoutFee != null) priceNano = g.salePriceWithoutFee;
+    if (priceNano == null) continue;
 
-    const priceTon = nanoNum / 1e9;
+    const priceTon = Number(priceNano) / 1e9;
+    if (!priceTon || Number.isNaN(priceTon)) continue;
     if (user.maxPriceTon && priceTon > user.maxPriceTon) continue;
 
-    const baseName = (item.collectionTitle || item.collectionName || '').trim();
-    const modelName = (item.modelTitle || item.modelName || '').trim();
+    const baseName = (g.collectionTitle || g.collectionName || g.title || 'MRKT Gift').trim();
+    const number = g.number ?? null;
+    let displayName = baseName;
+    if (number) displayName += ` #${number}`;
 
-    const baseLower = baseName.toLowerCase();
-    const modelLower = modelName.toLowerCase();
+    const model = g.modelTitle || g.modelName || null;
+    const symbol = g.symbolName || null;
+    const backdrop = g.backdropName || null;
 
-    if (user.filters.gifts.length && !user.filters.gifts.includes(baseLower)) continue;
-    if (user.filters.models.length && !user.filters.models.includes(modelLower)) continue;
+    // ССЫЛКА НА ГИФТ В TELEGRAM: t.me/nft/<slug>
+    // В JSON: name: "LunarSnake-166366" -> slug
+    let urlTelegram = 'https://t.me/mrkt';
+    if (g.name && String(g.name).includes('-')) {
+      urlTelegram = `https://t.me/nft/${g.name}`;
+    }
 
-    const id = `mrkt_${baseName}_${modelName}`;
+    // ССЫЛКА НА ГИФТ В MRKT: t.me/mrkt/app?startapp=<id_без_дефисов>
+    let urlMarket = 'https://t.me/mrkt';
+    if (g.id) {
+      const appId = String(g.id).replace(/-/g, '');
+      urlMarket = `https://t.me/mrkt/app?startapp=${appId}`;
+    }
+
+    const giftId = g.id || `${baseName}_${model || ''}_${number || ''}_${priceTon}`;
 
     gifts.push({
-      id,
+      id: `mrkt_${giftId}`,
       market: 'MRKT',
-      name: `${baseName} — ${modelName}`,
+      name: displayName,
       baseName,
       priceTon,
-      urlTelegram: 'https://t.me/mrkt',
-      urlMarket: 'https://t.me/mrkt',
+      urlTelegram,
+      urlMarket,
       attrs: {
         collection: baseName,
-        model: modelName,
-        backdrop: null,
+        model,
+        symbol,
+        backdrop,
       },
     });
   }
