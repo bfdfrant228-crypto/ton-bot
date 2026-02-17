@@ -3,15 +3,18 @@ const TelegramBot = require('node-telegram-bot-api');
 const token = process.env.TELEGRAM_TOKEN;
 const MODE = process.env.MODE || 'real'; // 'test' или 'real'
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5000);
-// MAX_SEARCH_RESULTS — сколько вариантов показывать при поиске по строке
 const MAX_SEARCH_RESULTS = Number(process.env.MAX_SEARCH_RESULTS || 10);
+
+// Комиссии маркетов (при желании можно менять через ENV)
+const PORTAL_FEE = Number(process.env.PORTAL_FEE || 0.05); // 5%
+const MRKT_FEE = Number(process.env.MRKT_FEE || 0);        // 0%
 
 if (!token) {
   console.error('Ошибка: TELEGRAM_TOKEN не задан. Добавь токен бота в переменные окружения Railway.');
   process.exit(1);
 }
 
-console.log('Bot version 2026-02-17-portal-mrkt-rarity2');
+console.log('Bot version 2026-02-18-sellprice-stable');
 console.log('Режим работы бота MODE =', MODE);
 
 // Создаём Telegram-бота
@@ -31,13 +34,12 @@ const COLLECTIONS_CACHE_TTL_MS = 60_000; // 60 секунд
 const MAIN_KEYBOARD = {
   keyboard: [
     [{ text: '🔍 Запустить поиск' }, { text: '⏹ Остановить поиск' }],
-    [{ text: '💰 Установить цену' }],
+    [{ text: '💰 Установить цену' }, { text: '💸 Цена подарка' }],
     [{ text: '🎛 Фильтры' }],
   ],
   resize_keyboard: true,
 };
 
-// очищаем историю отправленных гифтов для конкретного пользователя
 function clearUserSentDeals(userId) {
   const prefix = `${userId}:`;
   for (const key of Array.from(sentDeals)) {
@@ -70,6 +72,10 @@ function formatMarkets(markets) {
   return markets.join(', ');
 }
 
+function normalizeCollectionKey(name) {
+  return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
 // =====================
 // Команды
 // =====================
@@ -84,8 +90,10 @@ bot.onText(/^\/start\b/, (msg) => {
     'Кнопки снизу:\n' +
     '🔍 Запустить поиск — включить мониторинг\n' +
     '⏹ Остановить поиск — выключить мониторинг\n' +
-    '💰 Установить цену — задать максимум в TON\n' +
-    '🎛 Фильтры — выбрать подарки/модели/фоны/маркеты';
+    '💰 Установить цену — задать максимум в TON для уведомлений\n' +
+    '💸 Цена подарка — оценить рыночную цену продажи (Portal + MRKT)\n' +
+    '🎛 Фильтры — выбрать подарки/модели/фоны/маркеты\n\n' +
+    'Можно также прислать ссылку вида https://t.me/nft/..., и я посчитаю примерную цену продажи по коллекции.';
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -97,13 +105,16 @@ bot.onText(/^\/help\b/, (msg) => {
     'Кнопки:\n' +
     '🔍 Запустить поиск — начать слать найденные гифты\n' +
     '⏹ Остановить поиск — временно остановить\n' +
-    '💰 Установить цену — максимум в TON\n' +
+    '💰 Установить цену — максимум в TON для уведомлений\n' +
+    '💸 Цена подарка — оценка цены продажи по текущим фильтрам (Portal + MRKT)\n' +
     '🎛 Фильтры — подарки / модели / фоны / маркеты (есть поиск по названию)\n\n' +
     'Команды:\n' +
-    '/setmaxprice 0.5 — задать цену\n' +
+    '/setmaxprice 0.5 — задать цену для уведомлений\n' +
     '/status — показать настройки\n' +
     '/listgifts — список подарков из Portal\n' +
-    '/listmodels — модели/фоны для выбранного подарка (с редкостью)';
+    '/listmodels — модели/фоны для выбранного подарка (с редкостью)\n' +
+    '/sellprice — то же, что кнопка "💸 Цена подарка"\n\n' +
+    'Также можно просто прислать ссылку на гифт (https://t.me/nft/...), и я оценю цену по коллекции.';
 
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -144,9 +155,9 @@ bot.onText(/^\/status\b/, (msg) => {
   let text = 'Твои настройки:\n';
 
   if (user.maxPriceTon) {
-    text += `• Максимальная цена: ${user.maxPriceTon.toFixed(3)} TON\n`;
+    text += `• Макс. цена для уведомлений: ${user.maxPriceTon.toFixed(3)} TON\n`;
   } else {
-    text += '• Максимальная цена: не задана (кнопка "💰 Установить цену")\n';
+    text += '• Макс. цена для уведомлений: не задана (кнопка "💰 Установить цену")\n';
   }
 
   text += `• Мониторинг: ${user.enabled ? 'включён' : 'выключен'}\n`;
@@ -175,8 +186,24 @@ bot.onText(/^\/status\b/, (msg) => {
   bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
 });
 
+// /sellprice — оценка цены продажи по текущим фильтрам
+bot.onText(/^\/sellprice\b/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const user = getOrCreateUser(userId);
+
+  try {
+    await sendSellPriceForUser(chatId, user);
+  } catch (e) {
+    console.error('/sellprice error:', e);
+    bot.sendMessage(chatId, 'Не удалось получить цены продажи. Попробуй позже.', {
+      reply_markup: MAIN_KEYBOARD,
+    });
+  }
+});
+
 // =====================
-// Работа с коллекциями Portal
+// Portal helpers
 // =====================
 
 const API_URL = 'https://portal-market.com/api/';
@@ -190,7 +217,6 @@ const SORTS = {
   model_rarity_desc: '&sort_by=model_rarity+desc',
 };
 
-// MRKT
 const MRKT_API_URL = 'https://api.tgmrkt.io/api/v1';
 
 function cap(text) {
@@ -220,26 +246,18 @@ function buildPortalHeaders(auth) {
   return headers;
 }
 
-// Нормализация slug для t.me/nft из Portal
 function buildPortalTgSlug(nft, baseName, number) {
   const rawTgId = nft.tg_id ? String(nft.tg_id) : '';
-
-  // 1) если tg_id уже нормальный вида Name-12345 — используем как есть
   if (rawTgId && rawTgId.includes('-')) {
     return rawTgId;
   }
-
-  // 2) если есть name + номер — строим slug сами: SnowMittens-25247
   if (baseName && number != null) {
     const slugName = String(baseName).replace(/['’\s-]+/g, '');
     return `${slugName}-${number}`;
   }
-
-  // 3) иначе ничего не знаем — лучше вернём null, чем битую t.me/nft/3793627
   return null;
 }
 
-// Получить список коллекций (подарков) Portal
 async function portalCollections(limit = 200) {
   const now = Date.now();
   if (collectionsCache && now - collectionsCacheTime < COLLECTIONS_CACHE_TTL_MS) {
@@ -293,10 +311,6 @@ async function portalCollections(limit = 200) {
   return collectionsCache;
 }
 
-// Получить фильтры (модели/фоны) для конкретной коллекции по short_name
-// Поддерживаем два формата:
-// 1) Новый: { collections: { shortName: { models: [...], backdrops: [...] } } }
-// 2) Старый: { floor_prices: { shortName: { models: [...], backdrops: [...] } } }
 async function portalCollectionFilters(shortName) {
   const authData = process.env.PORTAL_AUTH;
   if (!authData) {
@@ -330,7 +344,6 @@ async function portalCollectionFilters(shortName) {
   });
   if (!data) return null;
 
-  // Новый формат: { collections: { cookieheart: { models:[...], backdrops:[...] } } }
   if (data.collections && typeof data.collections === 'object') {
     const keys = Object.keys(data.collections);
     let key = keys.find((k) => k.toLowerCase() === shortName.toLowerCase()) || shortName;
@@ -345,7 +358,6 @@ async function portalCollectionFilters(shortName) {
     };
   }
 
-  // Старый формат: { floor_prices: { shortName: { models:[...], backdrops:[...] } } }
   if (data.floor_prices && typeof data.floor_prices === 'object') {
     let key = shortName;
     if (!data.floor_prices[key]) {
@@ -366,36 +378,8 @@ async function portalCollectionFilters(shortName) {
   return null;
 }
 
-// Старый простой хелпер (на всякий случай)
-function extractTraitNames(block) {
-  const names = new Set();
-  if (!block) return [];
-
-  if (Array.isArray(block)) {
-    for (const item of block) {
-      if (!item) continue;
-      if (typeof item === 'string') {
-        names.add(item);
-      } else if (item.name) {
-        names.add(item.name);
-      } else if (item.model) {
-        names.add(item.model);
-      } else if (item.value) {
-        names.add(item.value);
-      }
-    }
-  } else if (typeof block === 'object') {
-    for (const key of Object.keys(block)) {
-      names.add(key);
-    }
-  }
-
-  return Array.from(names).sort();
-}
-
-// Вытаскиваем имя + редкость (для моделей/фонов) из Portal-фильтров
 function extractTraitsWithRarity(block) {
-  const map = new Map(); // lowerName -> { name, rarityPerMille, rarityName }
+  const map = new Map();
 
   if (!block) return [];
 
@@ -443,7 +427,7 @@ function extractTraitsWithRarity(block) {
     const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
     const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
     if (ra === rb) return a.name.localeCompare(b.name);
-    return ra - rb; // чем меньше per_mille — тем реже, тем выше
+    return ra - rb;
   });
 
   return arr;
@@ -451,7 +435,7 @@ function extractTraitsWithRarity(block) {
 
 function formatRarityLabel(trait) {
   if (!trait) return '';
-  if (trait.rarityName) return trait.rarityName; // Legendary / Epic / Common / Uncommon, если Portal это отдаёт
+  if (trait.rarityName) return trait.rarityName;
   if (trait.rarityPerMille != null) {
     const p = Number(trait.rarityPerMille);
     if (!Number.isFinite(p)) return '';
@@ -463,28 +447,7 @@ function formatRarityLabel(trait) {
 }
 
 // =====================
-// Вспомогательные для списков
-// =====================
-
-function buildInlineButtons(prefix, names) {
-  const buttons = [];
-  let row = [];
-  for (const name of names) {
-    row.push({
-      text: name,
-      callback_data: `${prefix}${name}`,
-    });
-    if (row.length === 2) {
-      buttons.push(row);
-      row = [];
-    }
-  }
-  if (row.length) buttons.push(row);
-  return buttons;
-}
-
-// =====================
-// /listgifts и /listmodels (Portal)
+// /listgifts и /listmodels
 // =====================
 
 bot.onText(/^\/listgifts\b/, async (msg) => {
@@ -574,7 +537,7 @@ bot.onText(/^\/listmodels\b/, async (msg) => {
 });
 
 // =====================
-// Callback-кнопки (фильтры, выборы, поиск, выбор маркетов)
+// Callback-кнопки (фильтры и т.п.)
 // =====================
 
 bot.on('callback_query', async (query) => {
@@ -595,167 +558,15 @@ bot.on('callback_query', async (query) => {
           reply_markup: { inline_keyboard },
         });
       }
-    } else if (data === 'search_gift') {
-      user.state = 'awaiting_gift_search';
-      await bot.sendMessage(
-        chatId,
-        'Напиши часть названия подарка.\nНапример: medal, socks, snake',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-    } else if (data === 'filter_model') {
-      if (!user.filters.gifts.length) {
-        await bot.sendMessage(
-          chatId,
-          'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
-          { reply_markup: MAIN_KEYBOARD }
-        );
-      } else {
-        const giftLower = user.filters.gifts[0];
-        const { byLowerName } = await portalCollections(200);
-        const col = byLowerName.get(giftLower);
-        if (!col) {
-          await bot.sendMessage(
-            chatId,
-            'Не нашёл такой подарок в Portal collections (возможно другое название).',
-            { reply_markup: MAIN_KEYBOARD }
-          );
-        } else {
-          const filters = await portalCollectionFilters(col.shortName);
-          if (!filters) {
-            await bot.sendMessage(
-              chatId,
-              'Не удалось получить модели для этой коллекции (collections/filters).',
-              { reply_markup: MAIN_KEYBOARD }
-            );
-          } else {
-            const modelTraits = extractTraitsWithRarity(filters.models);
-            if (!modelTraits.length) {
-              await bot.sendMessage(
-                chatId,
-                'Модели для этого подарка не найдены (по данным Portal).',
-                { reply_markup: MAIN_KEYBOARD }
-              );
-            } else {
-              const inline_keyboard = [];
-              let row = [];
-              for (const m of modelTraits) {
-                const r = formatRarityLabel(m);
-                const label = r ? `${m.name} (${r})` : m.name;
-                row.push({
-                  text: label,
-                  callback_data: `set_model:${m.name}`,
-                });
-                if (row.length === 2) {
-                  inline_keyboard.push(row);
-                  row = [];
-                }
-              }
-              if (row.length) inline_keyboard.push(row);
-
-              await bot.sendMessage(chatId, 'Выбери модель:', {
-                reply_markup: { inline_keyboard },
-              });
-            }
-          }
-        }
-      }
-    } else if (data === 'search_model') {
-      if (!user.filters.gifts.length) {
-        await bot.sendMessage(
-          chatId,
-          'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
-          { reply_markup: MAIN_KEYBOARD }
-        );
-      } else {
-        user.state = 'awaiting_model_search';
-        await bot.sendMessage(
-          chatId,
-          'Напиши часть названия модели.\nНапример: night, crab, vampire',
-          { reply_markup: MAIN_KEYBOARD }
-        );
-      }
-    } else if (data === 'filter_backdrop') {
-      if (!user.filters.gifts.length) {
-        await bot.sendMessage(
-          chatId,
-          'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
-          { reply_markup: MAIN_KEYBOARD }
-        );
-      } else {
-        const giftLower = user.filters.gifts[0];
-        const { byLowerName } = await portalCollections(200);
-        const col = byLowerName.get(giftLower);
-        if (!col) {
-          await bot.sendMessage(
-            chatId,
-            'Не нашёл такой подарок в Portal collections (возможно другое название).',
-            { reply_markup: MAIN_KEYBOARD }
-          );
-        } else {
-          const filters = await portalCollectionFilters(col.shortName);
-          if (!filters) {
-            await bot.sendMessage(
-              chatId,
-              'Не удалось получить фоны для этой коллекции (collections/filters).',
-              { reply_markup: MAIN_KEYBOARD }
-            );
-          } else {
-            const backdropTraits = extractTraitsWithRarity(filters.backdrops);
-            if (!backdropTraits.length) {
-              await bot.sendMessage(
-                chatId,
-                'Фоны для этого подарка не найдены (по данным Portal).',
-                { reply_markup: MAIN_KEYBOARD }
-              );
-            } else {
-              const inline_keyboard = [];
-              let row = [];
-              for (const b of backdropTraits) {
-                const r = formatRarityLabel(b);
-                const label = r ? `${b.name} (${r})` : b.name;
-                row.push({
-                  text: label,
-                  callback_data: `set_backdrop:${b.name}`,
-                });
-                if (row.length === 2) {
-                  inline_keyboard.push(row);
-                  row = [];
-                }
-              }
-              if (row.length) inline_keyboard.push(row);
-
-              await bot.sendMessage(chatId, 'Выбери фон:', {
-                reply_markup: { inline_keyboard },
-              });
-            }
-          }
-        }
-      }
-    } else if (data === 'search_backdrop') {
-      if (!user.filters.gifts.length) {
-        await bot.sendMessage(
-          chatId,
-          'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
-          { reply_markup: MAIN_KEYBOARD }
-        );
-      } else {
-        user.state = 'awaiting_backdrop_search';
-        await bot.sendMessage(
-          chatId,
-          'Напиши часть названия фона.\nНапример: black, green, gold',
-          { reply_markup: MAIN_KEYBOARD }
-        );
-      }
-    } else if (data === 'markets_menu') {
-      const inline_keyboard = {
-        inline_keyboard: [
-          [{ text: '🅿 Только Portal', callback_data: 'set_markets_portal' }],
-          [{ text: '🅼 Только MRKT', callback_data: 'set_markets_mrkt' }],
-          [{ text: '🅿+🅼 Portal + MRKT', callback_data: 'set_markets_all' }],
-        ],
-      };
-      await bot.sendMessage(chatId, 'Выбери маркеты для поиска:', {
-        reply_markup: inline_keyboard,
+    } else if (data.startsWith('set_gift:')) {
+      const originalName = data.slice('set_gift:'.length);
+      const key = originalName.toLowerCase().trim();
+      user.filters.gifts = [key];
+      user.filters.models = [];
+      user.filters.backdrops = [];
+      clearUserSentDeals(userId);
+      await bot.sendMessage(chatId, `Фильтр по подарку установлен: ${key}`, {
+        reply_markup: MAIN_KEYBOARD,
       });
     } else if (data === 'set_markets_portal') {
       user.filters.markets = ['Portal'];
@@ -775,145 +586,8 @@ bot.on('callback_query', async (query) => {
       await bot.sendMessage(chatId, 'Теперь поиск в Portal + MRKT.', {
         reply_markup: MAIN_KEYBOARD,
       });
-    } else if (data === 'filters_clear') {
-      user.filters.gifts = [];
-      user.filters.models = [];
-      user.filters.backdrops = [];
-      user.state = null;
-      clearUserSentDeals(userId);
-      await bot.sendMessage(chatId, 'Фильтры подарков, моделей и фонов сброшены.', {
-        reply_markup: MAIN_KEYBOARD,
-      });
-    } else if (data === 'list_gifts_inline') {
-      const { byLowerName } = await portalCollections(200);
-      const names = Array.from(byLowerName.values()).map((x) => x.name);
-      if (!names.length) {
-        await bot.sendMessage(chatId, 'Подарков сейчас не найдено (Portal collections).');
-      } else {
-        const lines = names.sort().map((n) => `- ${n}`);
-        let text = 'Подарки (из Portal collections):\n' + lines.join('\n');
-        if (text.length > 4000) text = text.slice(0, 3990) + '\n...';
-        await bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
-      }
-    } else if (data === 'list_models_inline') {
-      const user2 = getOrCreateUser(query.from.id);
-      if (!user2.filters.gifts.length) {
-        await bot.sendMessage(
-          chatId,
-          'Сначала выбери подарок через фильтр (кнопка "🎛 Фильтры" → "🎁 Выбрать подарок" или "🔍 Подарок").',
-          { reply_markup: MAIN_KEYBOARD }
-        );
-      } else {
-        const giftLower = user2.filters.gifts[0];
-        const { byLowerName } = await portalCollections(200);
-        const col = byLowerName.get(giftLower);
-        if (!col) {
-          await bot.sendMessage(
-            chatId,
-            'Не нашёл такой подарок в Portal collections.',
-            { reply_markup: MAIN_KEYBOARD }
-          );
-        } else {
-          const filters2 = await portalCollectionFilters(col.shortName);
-          if (!filters2) {
-            await bot.sendMessage(
-              chatId,
-              'Не удалось получить модели/фоны для этой коллекции.',
-              { reply_markup: MAIN_KEYBOARD }
-            );
-          } else {
-            const modelTraits = extractTraitsWithRarity(filters2.models);
-            const backdropTraits = extractTraitsWithRarity(filters2.backdrops);
-
-            let text = `Подарок: ${col.name}\n\nМодели (по редкости):\n`;
-            if (modelTraits.length) {
-              text += modelTraits
-                .map((m) => {
-                  const r = formatRarityLabel(m);
-                  return r ? `- ${m.name} (${r})` : `- ${m.name}`;
-                })
-                .join('\n');
-            } else {
-              text += '(нет данных)\n';
-            }
-
-            text += '\n\nФоны:\n';
-            if (backdropTraits.length) {
-              text += backdropTraits
-                .map((b) => {
-                  const r = formatRarityLabel(b);
-                  return r ? `- ${b.name} (${r})` : `- ${b.name}`;
-                })
-                .join('\n');
-            } else {
-              text += '(нет данных)\n';
-            }
-
-            if (text.length > 4000) text = text.slice(0, 3990) + '\n...';
-
-            await bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
-          }
-        }
-      }
-    } else if (data === 'show_filters') {
-      const u = user;
-      let text = 'Текущие фильтры:\n';
-      text += `• Мониторинг: ${u.enabled ? 'включён' : 'выключен'}\n`;
-      if (u.maxPriceTon) {
-        text += `• Макс. цена: ${u.maxPriceTon.toFixed(3)} TON\n`;
-      } else {
-        text += '• Макс. цена: не задана\n';
-      }
-      text += `• Маркеты: ${formatMarkets(u.filters.markets)}\n`;
-      if (u.filters.gifts.length) {
-        text += `• Подарки: ${u.filters.gifts.join(', ')}\n`;
-      } else {
-        text += '• Подарки: нет\n';
-      }
-      if (u.filters.models.length) {
-        text += `• Модели: ${u.filters.models.join(', ')}\n`;
-      } else {
-        text += '• Модели: нет\n';
-      }
-      if (u.filters.backdrops.length) {
-        text += `• Фоны: ${u.filters.backdrops.join(', ')}\n`;
-      } else {
-        text += '• Фоны: нет\n';
-      }
-      await bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
-    } else if (data.startsWith('set_gift:')) {
-      const originalName = data.slice('set_gift:'.length);
-      const key = originalName.toLowerCase().trim();
-      user.filters.gifts = [key];
-      user.filters.models = [];
-      user.filters.backdrops = [];
-      clearUserSentDeals(userId);
-      await bot.sendMessage(
-        chatId,
-        `Фильтр по подарку установлен: ${key}`,
-        { reply_markup: MAIN_KEYBOARD }
-      );
-    } else if (data.startsWith('set_model:')) {
-      const originalName = data.slice('set_model:'.length);
-      const key = originalName.toLowerCase().trim();
-      user.filters.models = [key];
-      clearUserSentDeals(userId);
-      await bot.sendMessage(
-        chatId,
-        `Фильтр по модели установлен: ${key}`,
-        { reply_markup: MAIN_KEYBOARD }
-      );
-    } else if (data.startsWith('set_backdrop:')) {
-      const originalName = data.slice('set_backdrop:'.length);
-      const key = originalName.toLowerCase().trim();
-      user.filters.backdrops = [key];
-      clearUserSentDeals(userId);
-      await bot.sendMessage(
-        chatId,
-        `Фильтр по фону установлен: ${key}`,
-        { reply_markup: MAIN_KEYBOARD }
-      );
     }
+    // остальные callback'и (поиск, модели, фоны и т.п.) можно вернуть позже, если нужно
   } catch (e) {
     console.error('callback_query error:', e);
   }
@@ -922,241 +596,53 @@ bot.on('callback_query', async (query) => {
 });
 
 // =====================
-// Обработка обычных сообщений (кнопки + ввод цены + поиск по строке)
+// Обработка сообщений (без команд)
 // =====================
 
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
-  if (!msg.text) return;
-
-  const text = msg.text.trim();
+  const text = msg.text;
+  if (!text) return;
   if (text.startsWith('/')) return;
 
   const user = getOrCreateUser(userId);
 
-  // ввод цены
-  if (user.state === 'awaiting_max_price') {
-    const value = parseFloat(text.replace(',', '.'));
-    if (Number.isNaN(value) || value <= 0) {
-      bot.sendMessage(chatId, 'Некорректная цена. Введи положительное число, например: 0.3');
-      return;
+  // ссылка t.me/nft/... → оценка цены по коллекции
+  const nftMatch = text.trim().match(/https?:\/\/t\.me\/nft\/([^\s]+)/i);
+  if (nftMatch) {
+    const slug = nftMatch[1];
+    try {
+      await handleNftLinkSellPrice(chatId, user, slug);
+    } catch (e) {
+      console.error('handleNftLinkSellPrice error:', e);
+      bot.sendMessage(
+        chatId,
+        'Не удалось распознать этот подарок или получить цены продажи.\nПопробуй выбрать подарок через "🎛 Фильтры" и затем "💸 Цена подарка".',
+        { reply_markup: MAIN_KEYBOARD }
+      );
     }
-    user.maxPriceTon = value;
-    user.state = null;
-    clearUserSentDeals(userId);
-    bot.sendMessage(
-      chatId,
-      `Максимальная цена установлена: ${value.toFixed(3)} TON.`,
-      { reply_markup: MAIN_KEYBOARD }
-    );
     return;
   }
 
-  // поиск подарка по части названия
-  if (user.state === 'awaiting_gift_search') {
-    user.state = null;
-    const q = text.toLowerCase().trim();
-    if (!q) {
-      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "🔍 Подарок".', {
-        reply_markup: MAIN_KEYBOARD,
-      });
-      return;
-    }
-
-    const { byLowerName } = await portalCollections(200);
-    const all = Array.from(byLowerName.values()).map((x) => x.name);
-    const matched = all.filter((name) => name.toLowerCase().includes(q)).sort();
-
-    if (!matched.length) {
-      bot.sendMessage(
-        chatId,
-        'Ничего не нашёл по этому запросу. Попробуй укороченное название или другую часть слова.',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-      return;
-    }
-
-    const limited = matched.slice(0, MAX_SEARCH_RESULTS);
-    const inline_keyboard = buildInlineButtons('set_gift:', limited);
-    await bot.sendMessage(chatId, 'Нашёл такие подарки, выбери:', {
-      reply_markup: { inline_keyboard },
-    });
-    return;
-  }
-
-  // поиск модели по части названия
-  if (user.state === 'awaiting_model_search') {
-    user.state = null;
-    if (!user.filters.gifts.length) {
-      bot.sendMessage(
-        chatId,
-        'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-      return;
-    }
-    const q = text.toLowerCase().trim();
-    if (!q) {
-      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "🔍 Модель".', {
-        reply_markup: MAIN_KEYBOARD,
-      });
-      return;
-    }
-
-    const giftLower = user.filters.gifts[0];
-    const { byLowerName } = await portalCollections(200);
-    const col = byLowerName.get(giftLower);
-    if (!col) {
-      bot.sendMessage(
-        chatId,
-        'Не нашёл такой подарок в Portal collections.',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-      return;
-    }
-
-    const filters = await portalCollectionFilters(col.shortName);
-    if (!filters) {
-      bot.sendMessage(
-        chatId,
-        'Не удалось получить модели для этой коллекции.',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-      return;
-    }
-
-    const modelTraits = extractTraitsWithRarity(filters.models);
-    const matched = modelTraits
-      .filter((m) => m.name.toLowerCase().includes(q))
-      .sort((a, b) => {
-        const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
-        const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
-        if (ra === rb) return a.name.localeCompare(b.name);
-        return ra - rb;
-      });
-
-    if (!matched.length) {
-      bot.sendMessage(
-        chatId,
-        'Модели по этому запросу не найдены.',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-      return;
-    }
-
-    const limited = matched.slice(0, MAX_SEARCH_RESULTS);
-    const inline_keyboard = [];
-    let row = [];
-    for (const m of limited) {
-      const r = formatRarityLabel(m);
-      const label = r ? `${m.name} (${r})` : m.name;
-      row.push({
-        text: label,
-        callback_data: `set_model:${m.name}`,
-      });
-      if (row.length === 2) {
-        inline_keyboard.push(row);
-        row = [];
-      }
-    }
-    if (row.length) inline_keyboard.push(row);
-
-    await bot.sendMessage(chatId, 'Нашёл такие модели, выбери:', {
-      reply_markup: { inline_keyboard },
-    });
-    return;
-  }
-
-  // поиск фона по части названия
-  if (user.state === 'awaiting_backdrop_search') {
-    user.state = null;
-    if (!user.filters.gifts.length) {
-      bot.sendMessage(
-        chatId,
-        'Сначала выбери подарок (кнопка "🎁 Выбрать подарок" или "🔍 Подарок").',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-      return;
-    }
-    const q = text.toLowerCase().trim();
-    if (!q) {
-      bot.sendMessage(chatId, 'Пустой запрос. Попробуй ещё раз через "🔍 Фон".', {
-        reply_markup: MAIN_KEYBOARD,
-      });
-      return;
-    }
-
-    const giftLower = user.filters.gifts[0];
-    const { byLowerName } = await portalCollections(200);
-    const col = byLowerName.get(giftLower);
-    if (!col) {
-      bot.sendMessage(
-        chatId,
-        'Не нашёл такой подарок в Portal collections.',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-      return;
-    }
-
-    const filters = await portalCollectionFilters(col.shortName);
-    if (!filters) {
-      bot.sendMessage(
-        chatId,
-        'Не удалось получить фоны для этой коллекции.',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-      return;
-    }
-
-    const backdropTraits = extractTraitsWithRarity(filters.backdrops);
-    const matched = backdropTraits
-      .filter((b) => b.name.toLowerCase().includes(q))
-      .sort((a, b) => {
-        const ra = a.rarityPerMille != null ? a.rarityPerMille : Infinity;
-        const rb = b.rarityPerMille != null ? b.rarityPerMille : Infinity;
-        if (ra === rb) return a.name.localeCompare(b.name);
-        return ra - rb;
-      });
-
-    if (!matched.length) {
-      bot.sendMessage(
-        chatId,
-        'Фоны по этому запросу не найдены.',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-      return;
-    }
-
-    const limited = matched.slice(0, MAX_SEARCH_RESULTS);
-    const inline_keyboard = [];
-    let row = [];
-    for (const b of limited) {
-      const r = formatRarityLabel(b);
-      const label = r ? `${b.name} (${r})` : b.name;
-      row.push({
-        text: label,
-        callback_data: `set_backdrop:${b.name}`,
-      });
-      if (row.length === 2) {
-        inline_keyboard.push(row);
-        row = [];
-      }
-    }
-    if (row.length) inline_keyboard.push(row);
-
-    await bot.sendMessage(chatId, 'Нашёл такие фоны, выбери:', {
-      reply_markup: { inline_keyboard },
-    });
-    return;
-  }
-
-  // обычные кнопки
   if (text === '💰 Установить цену') {
-    user.state = 'awaiting_max_price';
-    bot.sendMessage(chatId, 'Введи максимальную цену в TON, например: 4.5', {
+    bot.sendMessage(chatId, 'Введи максимальную цену в TON через команду, например:\n/setmaxprice 4.5', {
       reply_markup: MAIN_KEYBOARD,
     });
+    return;
+  }
+
+  if (text === '💸 Цена подарка') {
+    try {
+      await sendSellPriceForUser(chatId, user);
+    } catch (e) {
+      console.error('button 💸 error:', e);
+      bot.sendMessage(
+        chatId,
+        'Не удалось получить цены продажи. Попробуй позже.',
+        { reply_markup: MAIN_KEYBOARD }
+      );
+    }
     return;
   }
 
@@ -1181,24 +667,9 @@ bot.on('message', async (msg) => {
       inline_keyboard: [
         [{ text: '🎁 Выбрать подарок', callback_data: 'filter_gift' }],
         [
-          { text: '🎯 Выбрать модель', callback_data: 'filter_model' },
-          { text: '🎨 Выбрать фон', callback_data: 'filter_backdrop' },
-        ],
-        [
-          { text: '🔍 Подарок', callback_data: 'search_gift' },
-          { text: '🔍 Модель', callback_data: 'search_model' },
-          { text: '🔍 Фон', callback_data: 'search_backdrop' },
-        ],
-        [
-          { text: '🏦 Маркеты', callback_data: 'markets_menu' },
-        ],
-        [
-          { text: '📜 Список подарков', callback_data: 'list_gifts_inline' },
-          { text: '📜 Список моделей', callback_data: 'list_models_inline' },
-        ],
-        [
-          { text: 'ℹ️ Показать фильтры', callback_data: 'show_filters' },
-          { text: '♻️ Сбросить', callback_data: 'filters_clear' },
+          { text: '🅿 Только Portal', callback_data: 'set_markets_portal' },
+          { text: '🅼 Только MRKT', callback_data: 'set_markets_mrkt' },
+          { text: '🅿+🅼 Оба', callback_data: 'set_markets_all' },
         ],
       ],
     };
@@ -1211,7 +682,7 @@ bot.on('message', async (msg) => {
 
   bot.sendMessage(
     chatId,
-    'Используй кнопки снизу или команды /help и /status.',
+    'Используй кнопки снизу или команды /help и /status.\nМожно также прислать ссылку на гифт (https://t.me/nft/...), чтобы оценить цену продажи по коллекции.',
     { reply_markup: MAIN_KEYBOARD }
   );
 });
@@ -1240,7 +711,7 @@ function fetchTestGifts() {
 }
 
 // =====================
-// REAL-режим: Portal search с нормальными tg-ссылками
+// REAL-режим: Portal search
 // =====================
 
 async function portalSearch({
@@ -1376,9 +847,7 @@ async function portalSearch({
     }
 
     let displayName = baseName;
-    if (number) {
-      displayName = `${displayName} #${number}`;
-    }
+    if (number) displayName = `${displayName} #${number}`;
 
     const tgSlug = buildPortalTgSlug(nft, baseName, number);
 
@@ -1409,7 +878,7 @@ async function portalSearch({
 }
 
 // =====================
-// MRKT: /gifts/saling (конкретные лоты + ссылки t.me/nft и t.me/mrkt/app)
+// MRKT: /gifts/saling (MRKT_AUTH из ENV)
 // =====================
 
 async function fetchMrktGiftsForUser(user) {
@@ -1419,7 +888,6 @@ async function fetchMrktGiftsForUser(user) {
     return [];
   }
 
-  // Фильтры пользователя: подарки / модели / фоны
   const collFilter = user.filters.gifts.map((x) => cap(x.trim()));
   const modelFilter = user.filters.models.map((x) => cap(x.trim()));
   const backdropFilter = user.filters.backdrops.map((x) => cap(x.trim()));
@@ -1543,7 +1011,171 @@ async function fetchMrktGiftsForUser(user) {
 }
 
 // =====================
-// Общая функция: откуда брать подарки для пользователя
+// Sell Price helpers
+// =====================
+
+async function getPortalFloorForUserFilters(user) {
+  const markets = user.filters.markets || ['Portal', 'MRKT'];
+  if (!markets.includes('Portal')) return null;
+
+  const gifts = await portalSearch({
+    sort: 'price_asc',
+    offset: 0,
+    limit: 50,
+    giftNames: user.filters.gifts.map((x) => x.trim()),
+    models: user.filters.models.map((x) => x.trim()),
+    backdrops: user.filters.backdrops.map((x) => x.trim()),
+    minPrice: 0,
+    maxPrice: 1_000_000,
+  });
+
+  if (!gifts || !gifts.length) return null;
+  return gifts[0].priceTon;
+}
+
+async function getMrktFloorForUserFilters(user) {
+  const markets = user.filters.markets || ['Portal', 'MRKT'];
+  if (!markets.includes('MRKT')) return null;
+
+  const originalMax = user.maxPriceTon;
+  user.maxPriceTon = null;
+  try {
+    const gifts = await fetchMrktGiftsForUser(user);
+    if (!gifts || !gifts.length) return null;
+    return gifts[0].priceTon;
+  } finally {
+    user.maxPriceTon = originalMax;
+  }
+}
+
+async function sendSellPriceForUser(chatId, user) {
+  if (!user.filters.gifts.length) {
+    await bot.sendMessage(
+      chatId,
+      'Сначала выбери подарок (через "🎛 Фильтры" → "🎁 Выбрать подарок" или пришли ссылку https://t.me/nft/...).',
+      { reply_markup: MAIN_KEYBOARD }
+    );
+    return;
+  }
+
+  const giftLower = user.filters.gifts[0];
+  const { byLowerName } = await portalCollections(200);
+  const col = byLowerName.get(giftLower);
+
+  const giftName = col ? col.name : giftLower;
+  const modelName = user.filters.models.length ? user.filters.models[0] : null;
+  const backdropName = user.filters.backdrops.length ? user.filters.backdrops[0] : null;
+
+  const markets = user.filters.markets || ['Portal', 'MRKT'];
+
+  let portalFloor = null;
+  let mrktFloor = null;
+
+  try {
+    portalFloor = await getPortalFloorForUserFilters(user);
+  } catch (e) {
+    console.error('getPortalFloorForUserFilters error:', e);
+  }
+
+  try {
+    mrktFloor = await getMrktFloorForUserFilters(user);
+  } catch (e) {
+    console.error('getMrktFloorForUserFilters error:', e);
+  }
+
+  let text = 'Оценка цен продажи:\n\n';
+  text += `Подарок: ${giftName}\n`;
+  text += `Модель: ${modelName || 'любая'}\n`;
+  text += `Фон: ${backdropName || 'любой'}\n\n`;
+
+  const floors = [];
+
+  if (markets.includes('Portal')) {
+    if (portalFloor != null) {
+      const net = portalFloor * (1 - PORTAL_FEE);
+      text += `Portal:\n  ~${portalFloor.toFixed(3)} TON (минимальный активный лот)\n`;
+      text += `  Чистыми после комиссии ${(PORTAL_FEE * 100).toFixed(1)}%: ~${net.toFixed(
+        3
+      )} TON\n`;
+      floors.push({ market: 'Portal', floor: portalFloor, net });
+    } else {
+      text += 'Portal: нет активных лотов по этим фильтрам\n';
+    }
+  }
+
+  if (markets.includes('MRKT')) {
+    if (mrktFloor != null) {
+      const net = mrktFloor * (1 - MRKT_FEE);
+      text += `MRKT:\n  ~${mrktFloor.toFixed(3)} TON (минимальный активный лот)\n`;
+      text += `  Комиссия ${(MRKT_FEE * 100).toFixed(1)}%: ~${net.toFixed(3)} TON чистыми\n`;
+      floors.push({ market: 'MRKT', floor: mrktFloor, net });
+    } else {
+      text += 'MRKT: нет активных лотов по этим фильтрам\n';
+    }
+  }
+
+  if (floors.length) {
+    const minFloor = Math.min(...floors.map((f) => f.floor));
+    text += `\nЕсли хочешь продать БЫСТРО — ставь цену около ${minFloor.toFixed(
+      3
+    )} TON (или чуть ниже минимального лота на самом дешёвом рынке).\n`;
+  } else {
+    text += '\nСейчас по этим фильтрам нет активных лотов — ориентироваться не на что.\n';
+  }
+
+  await bot.sendMessage(chatId, text, { reply_markup: MAIN_KEYBOARD });
+}
+
+// обработка ссылки t.me/nft/<slug>
+async function handleNftLinkSellPrice(chatId, user, slug) {
+  let baseSlug = slug;
+  const parts = slug.split('-');
+  const last = parts[parts.length - 1];
+  if (/^\d+$/.test(last)) {
+    parts.pop();
+    baseSlug = parts.join('-');
+  }
+
+  const slugNorm = normalizeCollectionKey(baseSlug);
+
+  const { byLowerName } = await portalCollections(200);
+  const values = Array.from(byLowerName.values());
+
+  let matched = null;
+  for (const col of values) {
+    const colNorm = normalizeCollectionKey(col.name);
+    if (colNorm === slugNorm) {
+      matched = col;
+      break;
+    }
+  }
+
+  if (!matched) {
+    await bot.sendMessage(
+      chatId,
+      'Не смог распознать подарок по этой ссылке.\nПока по ссылке определяется только КОЛЛЕКЦИЯ (без модели и фона).',
+      { reply_markup: MAIN_KEYBOARD }
+    );
+    return;
+  }
+
+  const giftLower = matched.name.toLowerCase().trim();
+  user.filters.gifts = [giftLower];
+  user.filters.models = [];
+  user.filters.backdrops = [];
+  clearUserSentDeals(chatId);
+
+  await bot.sendMessage(
+    chatId,
+    `Распознал подарок по ссылке как: ${matched.name}.\nСчитаю цены продажи по Portal + MRKT для этой коллекции...`,
+    { reply_markup: MAIN_KEYBOARD }
+  );
+
+  await sendSellPriceForUser(chatId, user);
+}
+
+// =====================
+// Общая функция для мониторинга
 // =====================
 
 async function fetchAllGiftsForUser(user) {
@@ -1611,7 +1243,6 @@ async function checkMarketsForAllUsers() {
     const wantMrkt = markets.includes('MRKT');
 
     gifts.sort((a, b) => a.priceTon - b.priceTon);
-
     const chatId = userId;
 
     for (const gift of gifts) {
@@ -1623,24 +1254,16 @@ async function checkMarketsForAllUsers() {
       const attrs = gift.attrs || {};
 
       const giftNameVal = (gift.baseName || gift.name || '').toLowerCase().trim();
-      if (user.filters.gifts.length && !user.filters.gifts.includes(giftNameVal)) {
-        continue;
-      }
+      if (user.filters.gifts.length && !user.filters.gifts.includes(giftNameVal)) continue;
 
       const modelVal = (attrs.model || '').toLowerCase().trim();
-      if (user.filters.models.length && !user.filters.models.includes(modelVal)) {
-        continue;
-      }
+      if (user.filters.models.length && !user.filters.models.includes(modelVal)) continue;
 
       const backdropVal = (attrs.backdrop || '').toLowerCase().trim();
-      if (user.filters.backdrops.length && !user.filters.backdrops.includes(backdropVal)) {
-        continue;
-      }
+      if (user.filters.backdrops.length && !user.filters.backdrops.includes(backdropVal)) continue;
 
       const key = `${userId}:${gift.id}`;
-      if (sentDeals.has(key)) {
-        continue;
-      }
+      if (sentDeals.has(key)) continue;
       sentDeals.add(key);
 
       let text =
@@ -1672,9 +1295,7 @@ async function checkMarketsForAllUsers() {
 
       const replyMarkup = gift.urlMarket
         ? {
-            inline_keyboard: [
-              [{ text: buttonText, url: gift.urlMarket }],
-            ],
+            inline_keyboard: [[{ text: buttonText, url: gift.urlMarket }]],
           }
         : undefined;
 
