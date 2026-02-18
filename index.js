@@ -11,10 +11,10 @@ const SENT_TTL_MS = Number(process.env.SENT_TTL_MS || 24 * 60 * 60 * 1000); // 2
 // Portal
 const PORTAL_FEE = Number(process.env.PORTAL_FEE || 0.05);
 const PORTAL_HISTORY_LIMIT = Number(process.env.PORTAL_HISTORY_LIMIT || 100);
-const PORTAL_HISTORY_PAGES = Number(process.env.PORTAL_HISTORY_PAGES || 10); // сколько страниц истории листать назад
+const PORTAL_HISTORY_PAGES = Number(process.env.PORTAL_HISTORY_PAGES || 10);
 const PORTAL_HISTORY_PAGE_DELAY_MS = Number(process.env.PORTAL_HISTORY_PAGE_DELAY_MS || 350);
 
-// deep-link на конкретный лот Portal (можно переопределить в Railway)
+// Deep-link на конкретный лот Portal
 const PORTAL_LOT_URL_TEMPLATE =
   process.env.PORTAL_LOT_URL_TEMPLATE ||
   'https://t.me/portals_market_bot/market?startapp=gift_{id}';
@@ -51,12 +51,10 @@ if (!token) {
   process.exit(1);
 }
 
-console.log('Bot version 2026-02-18-ui-rarity-history-notify-v2');
+console.log('Bot version 2026-02-18-ui-preview-percent-v1');
 console.log('MODE =', MODE);
 console.log('CHECK_INTERVAL_MS =', CHECK_INTERVAL_MS);
 console.log('PORTAL_PREMARKET_STATUS =', PORTAL_PREMARKET_STATUS);
-console.log('PORTAL_HISTORY_PAGES =', PORTAL_HISTORY_PAGES);
-console.log('PORTAL_LOT_URL_TEMPLATE =', PORTAL_LOT_URL_TEMPLATE);
 
 const bot = new TelegramBot(token, { polling: true });
 
@@ -152,12 +150,12 @@ function formatMarkets(markets) {
   return markets.join(', ');
 }
 
-function buildInlineButtons(prefix, names) {
+function buildInlineButtons(prefix, names, cols = 2) {
   const buttons = [];
   let row = [];
   for (const name of names) {
     row.push({ text: name, callback_data: `${prefix}${name}` });
-    if (row.length === 2) {
+    if (row.length === cols) {
       buttons.push(row);
       row = [];
     }
@@ -194,24 +192,25 @@ function buildPortalLotUrl(nftId) {
   return PORTAL_LOT_URL_TEMPLATE.replace('{id}', encodeURIComponent(String(nftId)));
 }
 
-// ============ rarity: FIX (чтобы НЕ было алфавита) ============
+function shortenLabel(s, max = 26) {
+  const str = String(s || '');
+  if (str.length <= max) return str;
+  return str.slice(0, max - 1) + '…';
+}
+
+// ============ rarity: показываем % (не ‰) ============
 function parseRarityNumber(v) {
   if (v == null) return null;
-
   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-
   if (typeof v === 'string') {
-    // поддержка "2.4%", "1.5‰", " 2 "
     const cleaned = v.trim().replace('%', '').replace('‰', '');
     const num = n(cleaned);
     return Number.isFinite(num) ? num : null;
   }
-
   return null;
 }
 
-// Ищем число редкости максимально агрессивно (на случай любых форматов)
-function extractRarityPermille(obj) {
+function extractRarityValue(obj) {
   if (obj == null) return null;
 
   const directNum = parseRarityNumber(obj);
@@ -219,7 +218,6 @@ function extractRarityPermille(obj) {
 
   if (typeof obj !== 'object') return null;
 
-  // самые частые ключи
   const direct =
     obj.rarityPermille ??
     obj.rarity_per_mille ??
@@ -229,20 +227,18 @@ function extractRarityPermille(obj) {
     obj.rarityPercent ??
     null;
 
-  const v = extractRarityPermille(direct);
+  const v = extractRarityValue(direct);
   if (v != null) return v;
 
-  // если ключи “плавающие” — ищем любой ключ содержащий rarity
   for (const [k, val] of Object.entries(obj)) {
     if (String(k).toLowerCase().includes('rarity')) {
-      const x = extractRarityPermille(val);
+      const x = extractRarityValue(val);
       if (x != null) return x;
     }
   }
 
-  // рекурсивно по значениям
   for (const val of Object.values(obj)) {
-    const inner = extractRarityPermille(val);
+    const inner = extractRarityValue(val);
     if (inner != null) return inner;
   }
 
@@ -250,7 +246,7 @@ function extractRarityPermille(obj) {
 }
 
 function extractTraitsWithRarity(block) {
-  const map = new Map(); // lower -> { name, rarityPermille }
+  const map = new Map(); // lower -> { name, rarity }
   if (!block) return [];
 
   if (Array.isArray(block)) {
@@ -261,7 +257,7 @@ function extractTraitsWithRarity(block) {
         const name = item.trim();
         if (!name) continue;
         const key = name.toLowerCase();
-        if (!map.has(key)) map.set(key, { name, rarityPermille: null });
+        if (!map.has(key)) map.set(key, { name, rarity: null });
         continue;
       }
 
@@ -269,12 +265,12 @@ function extractTraitsWithRarity(block) {
       if (!name) continue;
 
       const key = name.toLowerCase();
-      const rarityPermille = extractRarityPermille(item);
+      const rarity = extractRarityValue(item);
 
-      if (!map.has(key)) map.set(key, { name, rarityPermille });
+      if (!map.has(key)) map.set(key, { name, rarity });
       else {
         const prev = map.get(key);
-        if (prev && prev.rarityPermille == null && rarityPermille != null) prev.rarityPermille = rarityPermille;
+        if (prev && prev.rarity == null && rarity != null) prev.rarity = rarity;
       }
     }
   } else if (typeof block === 'object') {
@@ -282,21 +278,22 @@ function extractTraitsWithRarity(block) {
       const name = String(k).trim();
       if (!name) continue;
       const key = name.toLowerCase();
-      const rarityPermille = extractRarityPermille(v);
-      if (!map.has(key)) map.set(key, { name, rarityPermille });
+      const rarity = extractRarityValue(v);
+
+      if (!map.has(key)) map.set(key, { name, rarity });
       else {
         const prev = map.get(key);
-        if (prev && prev.rarityPermille == null && rarityPermille != null) prev.rarityPermille = rarityPermille;
+        if (prev && prev.rarity == null && rarity != null) prev.rarity = rarity;
       }
     }
   }
 
   const arr = Array.from(map.values());
 
-  // сортировка по редкости (меньше = реже) -> затем по имени
+  // сортировка по rarity (меньше = реже), потом по имени
   arr.sort((a, b) => {
-    const ra = a.rarityPermille == null ? Infinity : a.rarityPermille;
-    const rb = b.rarityPermille == null ? Infinity : b.rarityPermille;
+    const ra = a.rarity == null ? Infinity : a.rarity;
+    const rb = b.rarity == null ? Infinity : b.rarity;
     if (ra !== rb) return ra - rb;
     return a.name.localeCompare(b.name);
   });
@@ -304,9 +301,19 @@ function extractTraitsWithRarity(block) {
   return arr;
 }
 
-function rarityLabel(t) {
-  if (!t || t.rarityPermille == null) return '';
-  return `${t.rarityPermille}‰`;
+function rarityLabel(trait) {
+  if (!trait || trait.rarity == null) return '';
+  // показываем как % (как ты просишь)
+  // число оставляем как есть (в Portal UI у тебя оно так и выглядит)
+  const v = Number(trait.rarity);
+  if (!Number.isFinite(v)) return '';
+  return `${v}%`;
+}
+
+function traitButtonText(trait) {
+  const r = rarityLabel(trait);
+  const nameShort = shortenLabel(trait.name, 24);
+  return r ? `${nameShort} (${r})` : nameShort;
 }
 
 // ============ Portal: collections + filters ============
@@ -323,8 +330,8 @@ async function portalCollections(limit = 300) {
   }
 
   const url = `${API_URL}collections?limit=${limit}`;
-
   let res;
+
   try {
     res = await fetch(url, { method: 'GET', headers: portalHeaders() });
   } catch (e) {
@@ -513,10 +520,8 @@ async function portalSearch({ collectionId, collectionName, models = [], backdro
   return { ok: true, reason: 'OK', gifts };
 }
 
-// ============ Portal history median (pagination for old sales) ============
+// ============ Portal history median (pagination) ============
 async function portalFetchActionsPage({ offset, limit, collectionId, model, backdrop }) {
-  // Попробуем добавить фильтры в query (если поддерживаются). Если не поддерживаются — сервер обычно просто игнорит.
-  // Если вдруг даст 422 — мы обработаем это выше уровнем.
   let url = `${API_URL}market/actions/?offset=${offset}&limit=${limit}&action_types=buy`;
 
   if (collectionId) url += `&collection_ids=${encodeURIComponent(collectionId)}`;
@@ -537,7 +542,6 @@ async function portalHistoryMedian({ collectionId, model, backdrop }) {
 
   const prices = [];
   let page = 0;
-  let lastError = null;
 
   while (page < PORTAL_HISTORY_PAGES) {
     const offset = page * PORTAL_HISTORY_LIMIT;
@@ -553,45 +557,23 @@ async function portalHistoryMedian({ collectionId, model, backdrop }) {
       });
     } catch (e) {
       console.error('Portal history fetch error', e);
-      lastError = 'FETCH_ERROR';
       break;
     }
 
     if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      console.error('Portal history HTTP error', res.status, txt.slice(0, 300));
-
-      if (res.status === 401 || res.status === 403) {
-        lastError = 'AUTH_EXPIRED';
-        break;
-      }
-      if (res.status === 429) {
-        lastError = 'RATE_LIMIT';
-        break;
-      }
+      // если 422 из-за query-фильтров — пробуем без них
       if (res.status === 422) {
-        // возможно, Portal не поддерживает query-фильтры в actions.
-        // в этом случае попробуем без query-фильтров (только action_types) на этой же странице.
-        try {
-          const url = `${API_URL}market/actions/?offset=${offset}&limit=${PORTAL_HISTORY_LIMIT}&action_types=buy`;
-          res = await fetch(url, { method: 'GET', headers: portalHeaders() });
-          if (!res.ok) {
-            lastError = `HTTP_${res.status}`;
-            break;
-          }
-        } catch (e) {
-          lastError = 'FETCH_ERROR';
-          break;
-        }
+        const url = `${API_URL}market/actions/?offset=${offset}&limit=${PORTAL_HISTORY_LIMIT}&action_types=buy`;
+        res = await fetch(url, { method: 'GET', headers: portalHeaders() });
+        if (!res.ok) break;
       } else {
-        lastError = `HTTP_${res.status}`;
         break;
       }
     }
 
     const data = await res.json().catch(() => null);
     const actions = Array.isArray(data?.actions) ? data.actions : [];
-    if (!actions.length) break; // дальше пусто — смысла листать нет
+    if (!actions.length) break;
 
     for (const act of actions) {
       const t = String(act?.type || act?.action_type || act?.actionType || '').toLowerCase();
@@ -621,7 +603,6 @@ async function portalHistoryMedian({ collectionId, model, backdrop }) {
       prices.push(priceTon);
     }
 
-    // Если уже нашли достаточно продаж — можно остановиться раньше
     if (prices.length >= 15) break;
 
     page++;
@@ -641,11 +622,9 @@ async function portalHistoryMedian({ collectionId, model, backdrop }) {
     reason: 'OK',
     median,
     count: prices.length,
-    note: prices.length ? `pages_scanned=${Math.min(page + 1, PORTAL_HISTORY_PAGES)}` : `no_matches (pages_scanned=${Math.min(page + 1, PORTAL_HISTORY_PAGES)})`,
+    note: `pages_scanned=${Math.min(page + 1, PORTAL_HISTORY_PAGES)}`,
     time: now,
-    lastError,
   };
-
   historyCache.set(key, out);
   return out;
 }
@@ -769,12 +748,7 @@ async function sendSellPriceForUser(chatId, userId, user) {
       limit: 50,
     });
 
-    if (!r.ok) {
-      if (r.reason === 'NO_AUTH') text += 'Portal: отключен (нет PORTAL_AUTH)\n';
-      else if (r.reason === 'AUTH_EXPIRED') text += 'Portal: авторизация протухла (обнови PORTAL_AUTH)\n';
-      else if (r.reason === 'RATE_LIMIT') text += 'Portal: лимит запросов (429), подожди\n';
-      else text += 'Portal: ошибка запроса\n';
-    } else {
+    if (r.ok) {
       const strict = r.gifts.filter((g) => {
         if (modelLower && norm(g.attrs?.model) !== modelLower) return false;
         if (backdropLower && norm(g.attrs?.backdrop) !== backdropLower) return false;
@@ -790,7 +764,6 @@ async function sendSellPriceForUser(chatId, userId, user) {
       } else {
         text += 'Portal: активных лотов по этим фильтрам нет\n';
 
-        // fallback history (листает старые страницы)
         if (collectionId) {
           const h = await portalHistoryMedian({
             collectionId,
@@ -807,6 +780,8 @@ async function sendSellPriceForUser(chatId, userId, user) {
           text += 'Portal (история продаж): не могу посчитать (нет collection_id)\n';
         }
       }
+    } else {
+      text += `Portal: ошибка (${r.reason})\n`;
     }
   }
 
@@ -814,17 +789,15 @@ async function sendSellPriceForUser(chatId, userId, user) {
   if (user.filters.markets.includes('MRKT')) {
     const r = await mrktSearchLots(user);
 
-    if (!r.ok) {
-      if (r.reason === 'NO_AUTH') text += '\nMRKT: отключен (нет MRKT_AUTH)\n';
-      else if (r.reason === 'AUTH_EXPIRED') text += '\nMRKT: токен протух (MRKT_AUTH)\n';
-      else text += '\nMRKT: ошибка запроса\n';
-    } else if (!r.gifts.length) {
-      text += '\nMRKT: активных лотов по этим фильтрам нет\n';
-    } else {
+    if (r.ok && r.gifts.length) {
       const best = r.gifts[0];
       const net = best.priceTon * (1 - MRKT_FEE);
       text += `\nMRKT:\n  ~${best.priceTon.toFixed(3)} TON (минимальный активный лот)\n`;
       text += `  Комиссия ${(MRKT_FEE * 100).toFixed(1)}%: ~${net.toFixed(3)} TON чистыми\n`;
+    } else if (!r.ok) {
+      text += `\nMRKT: ошибка (${r.reason})\n`;
+    } else {
+      text += '\nMRKT: активных лотов по этим фильтрам нет\n';
     }
   }
 
@@ -834,26 +807,9 @@ async function sendSellPriceForUser(chatId, userId, user) {
 // ============ Commands ============
 bot.onText(/^\/start\b/, (msg) => {
   getOrCreateUser(msg.from.id);
-
-  const text =
-    'Бот запущен (Portal + MRKT).\n\n' +
-    '🔍 Запустить поиск — мониторинг\n' +
-    '💰 Установить цену — лимит для уведомлений\n' +
-    '💸 Цена подарка — Portal floor + MRKT floor + Portal история (если лотов нет)\n' +
-    '🎛 Фильтры — выбор/поиск подарка, модели, фона\n';
-
-  bot.sendMessage(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
-});
-
-bot.onText(/^\/help\b/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    'Команды:\n' +
-      '/setmaxprice 80\n' +
-      '/sellprice\n' +
-      '/status\n' +
-      '/listgifts\n' +
-      '/listmodels\n',
+    'Бот запущен (Portal + MRKT).',
     { reply_markup: MAIN_KEYBOARD }
   );
 });
@@ -872,7 +828,6 @@ bot.onText(/^\/status\b/, async (msg) => {
   text += `• Модель: ${user.filters.models[0] || 'любая'}\n`;
   text += `• Фон: ${user.filters.backdrops[0] || 'любой'}\n\n`;
   text += `API:\n• Portal auth: ${portalAuth}\n• MRKT auth: ${mrktAuth}\n`;
-  text += `• Portal premarket_status: ${PORTAL_PREMARKET_STATUS}\n`;
 
   bot.sendMessage(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -895,23 +850,6 @@ bot.onText(/^\/setmaxprice\b(?:\s+(.+))?/, (msg, match) => {
 bot.onText(/^\/sellprice\b/, async (msg) => {
   const user = getOrCreateUser(msg.from.id);
   await sendSellPriceForUser(msg.chat.id, msg.from.id, user);
-});
-
-bot.onText(/^\/listgifts\b/, async (msg) => {
-  const { byLowerName } = await portalCollections(400);
-  const names = Array.from(byLowerName.values()).map((x) => x.name).sort();
-
-  if (!names.length) {
-    return bot.sendMessage(
-      msg.chat.id,
-      'Не удалось получить список подарков (Portal). Проверь PORTAL_AUTH.',
-      { reply_markup: MAIN_KEYBOARD }
-    );
-  }
-
-  let text = 'Подарки (Portal collections):\n' + names.map((n) => `- ${n}`).join('\n');
-  text = safeSliceText(text);
-  bot.sendMessage(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
 });
 
 bot.onText(/^\/listmodels\b/, async (msg) => {
@@ -954,8 +892,7 @@ bot.onText(/^\/listmodels\b/, async (msg) => {
       }).join('\n')
     : '(нет данных)';
 
-  text = safeSliceText(text);
-  bot.sendMessage(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+  bot.sendMessage(msg.chat.id, safeSliceText(text), { reply_markup: MAIN_KEYBOARD });
 });
 
 // ============ Callback menu ============
@@ -974,7 +911,7 @@ bot.on('callback_query', async (query) => {
         await bot.sendMessage(chatId, 'Portal недоступен. Проверь PORTAL_AUTH.', { reply_markup: MAIN_KEYBOARD });
       } else {
         await bot.sendMessage(chatId, 'Выбери подарок (первые 60):', {
-          reply_markup: { inline_keyboard: buildInlineButtons('set_gift:', names.slice(0, 60)) },
+          reply_markup: { inline_keyboard: buildInlineButtons('set_gift:', names.slice(0, 60), 2) },
         });
       }
     } else if (data === 'search_gift') {
@@ -995,25 +932,12 @@ bot.on('callback_query', async (query) => {
         } else {
           const traits = extractTraitsWithRarity(f.models).slice(0, 80);
 
-          // кнопки с редкостью в тексте, но callback только имя
-          const inline_keyboard = [];
-          let row = [];
-          for (const t of traits) {
-            const r = rarityLabel(t);
-            row.push({
-              text: r ? `${t.name} (${r})` : t.name,
-              callback_data: `set_model:${t.name}`,
-            });
-            if (row.length === 2) {
-              inline_keyboard.push(row);
-              row = [];
-            }
-          }
-          if (row.length) inline_keyboard.push(row);
+          // 1 колонка, чтобы названия лучше влезали
+          const inline_keyboard = traits.map((t) => [
+            { text: traitButtonText(t), callback_data: `set_model:${t.name}` },
+          ]);
 
-          await bot.sendMessage(chatId, 'Выбери модель:', {
-            reply_markup: { inline_keyboard },
-          });
+          await bot.sendMessage(chatId, 'Выбери модель:', { reply_markup: { inline_keyboard } });
         }
       }
     } else if (data === 'search_model') {
@@ -1038,24 +962,11 @@ bot.on('callback_query', async (query) => {
         } else {
           const traits = extractTraitsWithRarity(f.backdrops).slice(0, 80);
 
-          const inline_keyboard = [];
-          let row = [];
-          for (const t of traits) {
-            const r = rarityLabel(t);
-            row.push({
-              text: r ? `${t.name} (${r})` : t.name,
-              callback_data: `set_backdrop:${t.name}`,
-            });
-            if (row.length === 2) {
-              inline_keyboard.push(row);
-              row = [];
-            }
-          }
-          if (row.length) inline_keyboard.push(row);
+          const inline_keyboard = traits.map((t) => [
+            { text: traitButtonText(t), callback_data: `set_backdrop:${t.name}` },
+          ]);
 
-          await bot.sendMessage(chatId, 'Выбери фон:', {
-            reply_markup: { inline_keyboard },
-          });
+          await bot.sendMessage(chatId, 'Выбери фон:', { reply_markup: { inline_keyboard } });
         }
       }
     } else if (data === 'search_backdrop') {
@@ -1123,7 +1034,7 @@ bot.on('callback_query', async (query) => {
   bot.answerCallbackQuery(query.id).catch(() => {});
 });
 
-// ============ Message handler (states + buttons) ============
+// ============ Message handler (states + buttons + Filters menu) ============
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -1159,7 +1070,7 @@ bot.on('message', async (msg) => {
 
     const limited = matched.slice(0, MAX_SEARCH_RESULTS);
     return bot.sendMessage(chatId, 'Нашёл подарки, выбери:', {
-      reply_markup: { inline_keyboard: buildInlineButtons('set_gift:', limited) },
+      reply_markup: { inline_keyboard: buildInlineButtons('set_gift:', limited, 2) },
     });
   }
 
@@ -1186,7 +1097,7 @@ bot.on('message', async (msg) => {
       return bot.sendMessage(chatId, 'Модель не найдена. Попробуй другой запрос.', { reply_markup: MAIN_KEYBOARD });
     }
 
-    const inline_keyboard = buildInlineButtons('set_model:', matched.map((m) => m.name));
+    const inline_keyboard = matched.map((m) => [{ text: traitButtonText(m), callback_data: `set_model:${m.name}` }]);
     return bot.sendMessage(chatId, 'Выбери модель:', { reply_markup: { inline_keyboard } });
   }
 
@@ -1213,7 +1124,7 @@ bot.on('message', async (msg) => {
       return bot.sendMessage(chatId, 'Фон не найден. Попробуй другой запрос.', { reply_markup: MAIN_KEYBOARD });
     }
 
-    const inline_keyboard = buildInlineButtons('set_backdrop:', matched.map((b) => b.name));
+    const inline_keyboard = matched.map((b) => [{ text: traitButtonText(b), callback_data: `set_backdrop:${b.name}` }]);
     return bot.sendMessage(chatId, 'Выбери фон:', { reply_markup: { inline_keyboard } });
   }
 
@@ -1280,38 +1191,29 @@ bot.on('message', async (msg) => {
   bot.sendMessage(chatId, 'Используй кнопки снизу или /help.', { reply_markup: MAIN_KEYBOARD });
 });
 
-// ============ Monitoring: plain text + one Portal button ============
-function tgSlugFromUrl(url) {
-  const m = String(url || '').match(/^https?:\/\/t\.me\/nft\/(.+)$/i);
-  return m ? m[1] : null;
-}
-
+// ============ Monitoring: формат как раньше + preview + кнопка “Открыть Portal” ============
 async function sendDeal(userId, gift) {
   const lines = [];
-
-  // стиль ближе к твоему примеру
-  lines.push(`${gift.baseName || gift.name}(${gift.baseName || gift.name})`);
   lines.push(`Price: ${gift.priceTon.toFixed(3)} TON`);
-
-  if (gift.attrs?.model) lines.push(`- Model: ${gift.attrs.model}`);
-  if (gift.attrs?.backdrop) lines.push(`- Backdrop: ${gift.attrs.backdrop}`);
-
+  lines.push(`Gift: ${gift.name}`);
+  if (gift.attrs?.model) lines.push(`Model: ${gift.attrs.model}`);
+  if (gift.attrs?.symbol) lines.push(`Symbol: ${gift.attrs.symbol}`);
+  if (gift.attrs?.backdrop) lines.push(`Backdrop: ${gift.attrs.backdrop}`);
   lines.push(`Market: ${gift.market}`);
 
-  const slug = tgSlugFromUrl(gift.urlTelegram);
-  if (slug) lines.push(slug);
-
+  // ВАЖНО: ссылка ПОСЛЕДНЕЙ строкой — так Telegram чаще показывает превью
   if (gift.urlTelegram) lines.push(gift.urlTelegram);
 
   const text = lines.join('\n');
 
-  // одна кнопка — в маркет (для Portal ведёт на конкретный лот)
+  // 1 кнопка: открыть маркет (для Portal — конкретный лот)
+  const btnText = gift.market === 'Portal' ? 'Открыть Portal' : `Открыть ${gift.market}`;
   const reply_markup = gift.urlMarket
-    ? { inline_keyboard: [[{ text: gift.market === 'Portal' ? 'Portal' : gift.market, url: gift.urlMarket }]] }
+    ? { inline_keyboard: [[{ text: btnText, url: gift.urlMarket }]] }
     : undefined;
 
   await bot.sendMessage(userId, text, {
-    disable_web_page_preview: true,
+    disable_web_page_preview: false, // включаем превью-картинку
     reply_markup,
   });
 }
