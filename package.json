@@ -6,7 +6,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "redis": "^4.7.0"
     "node-telegram-bot-api": "^0.61.0"
   }
 }
