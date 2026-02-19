@@ -34,7 +34,7 @@ const MAX_SEARCH_RESULTS = Number(process.env.MAX_SEARCH_RESULTS || 10);
 // Redis
 const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL || null;
 
-// Optional: куда слать уведомление про протухший MRKT_AUTH
+// Optional: куда слать уведомление про протухший MRKT_AUTH (если не задано — всем пользователям в users Map)
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? Number(process.env.ADMIN_CHAT_ID) : null;
 
 // Portal
@@ -49,7 +49,7 @@ let portalNextAllowedAt = 0;
 const PORTAL_LIMIT = Number(process.env.PORTAL_LIMIT || 50);
 const PORTAL_PAGES = Number(process.env.PORTAL_PAGES || 4);
 
-// История: делаем глубже + таймбюджет, но СТРОГО по фильтрам
+// ↑ история глубже, но без “умных” выкидываний/фоллбеков — строго по выбранным фильтрам
 const PORTAL_HISTORY_LIMIT = Number(process.env.PORTAL_HISTORY_LIMIT || 200);
 const PORTAL_HISTORY_PAGES = Number(process.env.PORTAL_HISTORY_PAGES || 120);
 const PORTAL_HISTORY_PAGE_DELAY_MS = Number(process.env.PORTAL_HISTORY_PAGE_DELAY_MS || 220);
@@ -99,7 +99,7 @@ const MRKT_FEED_NOTIFY_TYPES = new Set(
 // MRKT auth notify throttling
 const MRKT_AUTH_NOTIFY_COOLDOWN_MS = Number(process.env.MRKT_AUTH_NOTIFY_COOLDOWN_MS || 60 * 60 * 1000); // 1h
 
-console.log('Bot version 2026-02-19-previewlink-strict-history-deeper-v3');
+console.log('Bot version 2026-02-19-preview-on-link-bottom-portalhistory-serverfilter-v4');
 console.log('MODE =', MODE);
 console.log('CHECK_INTERVAL_MS =', CHECK_INTERVAL_MS);
 console.log('SUBS_CHECK_INTERVAL_MS =', SUBS_CHECK_INTERVAL_MS);
@@ -143,7 +143,7 @@ const COLLECTIONS_CACHE_TTL_MS = 10 * 60_000;
 const filtersCache = new Map(); // shortName -> { time, data:{models, backdrops} }
 const FILTERS_CACHE_TTL_MS = 5 * 60_000;
 
-const historyCache = new Map(); // key -> { time, ok, median, count, pagesScanned }
+const historyCache = new Map(); // key -> { time, ok, ... }
 const HISTORY_CACHE_TTL_MS = 60_000;
 
 // MRKT auth status
@@ -283,7 +283,7 @@ async function sendMessageSafe(chatId, text, opts) {
 function mrktAuthHeader() {
   const t = process.env.MRKT_AUTH;
   if (!t) return null;
-  return t; // token (без Bearer)
+  return t; // у тебя это просто token (без Bearer)
 }
 
 async function notifyMrktAuthExpired(statusCode) {
@@ -297,6 +297,7 @@ async function notifyMrktAuthExpired(statusCode) {
     `Нужно обновить переменную MRKT_AUTH в Railway.\n` +
     `Пока токен не обновишь — MRKT запросы будут пропускаться.`;
 
+  // 1) если задан ADMIN_CHAT_ID — пишем только туда
   if (ADMIN_CHAT_ID && Number.isFinite(ADMIN_CHAT_ID)) {
     try {
       await sendMessageSafe(ADMIN_CHAT_ID, text, { disable_web_page_preview: true });
@@ -304,6 +305,7 @@ async function notifyMrktAuthExpired(statusCode) {
     } catch {}
   }
 
+  // 2) иначе пишем всем пользователям, кто есть в памяти
   for (const [uid] of users.entries()) {
     try {
       await sendMessageSafe(uid, text, { disable_web_page_preview: true });
@@ -352,6 +354,13 @@ function getOrCreateUser(userId) {
       minPriceTon: 0,
       maxPriceTon: null,
 
+      // states:
+      // awaiting_max
+      // awaiting_min
+      // awaiting_gift_search
+      // awaiting_model_search
+      // awaiting_backdrop_search
+      // awaiting_sub_max:<subId>
       state: null,
 
       filters: { gifts: [], models: [], backdrops: [], markets: ['Portal', 'MRKT'] },
@@ -378,6 +387,7 @@ function exportState() {
 
 function renumberSubs(user) {
   const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
+  // просто 1..N в текущем порядке
   subs.forEach((s, idx) => {
     if (s) s.num = idx + 1;
   });
@@ -714,7 +724,8 @@ async function portalSearchByFilters({ giftLower, modelLower, backdropLower, min
 }
 
 // =====================
-// Portal history (STRICT) — медиана по строго выбранным фильтрам
+// Portal history (STRICT) — пытаемся серверной фильтрацией по модели/фону
+// (это именно то, что нужно, чтобы совпало с тем, что ты видел 18 числа)
 // =====================
 function extractActionNft(act) {
   return (
@@ -748,10 +759,10 @@ function extractAttrs(nft) {
   return { model, backdrop };
 }
 
-async function portalHistoryEstimateStrict({ collectionId, modelLower, backdropLower }) {
-  if (!process.env.PORTAL_AUTH) return { ok: false, median: null, count: 0, pagesScanned: 0, reason: 'NO_AUTH' };
+async function portalHistoryEstimate({ collectionId, modelLower, backdropLower }) {
+  if (!process.env.PORTAL_AUTH) return { ok: false, median: null, count: 0, pages_scanned: 0 };
 
-  const key = `portal|strict|${collectionId || ''}|${modelLower || ''}|${backdropLower || ''}|target=${PORTAL_HISTORY_TARGET_SALES}|pages=${PORTAL_HISTORY_PAGES}|limit=${PORTAL_HISTORY_LIMIT}`;
+  const key = `portal|hist|${collectionId || ''}|${modelLower || ''}|${backdropLower || ''}|target=${PORTAL_HISTORY_TARGET_SALES}`;
   const now = nowMs();
   const cached = historyCache.get(key);
   if (cached && now - cached.time < HISTORY_CACHE_TTL_MS) return cached;
@@ -765,37 +776,58 @@ async function portalHistoryEstimateStrict({ collectionId, modelLower, backdropL
 
     const offset = page * PORTAL_HISTORY_LIMIT;
 
-    let url = `${API_URL}market/actions/?offset=${offset}&limit=${PORTAL_HISTORY_LIMIT}&action_types=buy&sort_by=created_at+desc`;
+    // Пытаемся фильтровать на сервере
+    let url =
+      `${API_URL}market/actions/?offset=${offset}&limit=${PORTAL_HISTORY_LIMIT}` +
+      `&action_types=buy&sort_by=created_at+desc`;
+
     if (collectionId) url += `&collection_ids=${encodeURIComponent(collectionId)}`;
+    if (modelLower) url += `&filter_by_models=${quotePlus(capWords(modelLower))}`;
+    if (backdropLower) url += `&filter_by_backdrops=${quotePlus(capWords(backdropLower))}`;
 
     let res = await throttledPortalFetch(url, { method: 'GET', headers: portalHeaders() }).catch(() => null);
+
+    // Если сервер не принимает filter_by_* — откатываемся и фильтруем локально
+    let serverFiltered = true;
     if (res && !res.ok && res.status === 422) {
-      url = `${API_URL}market/actions/?offset=${offset}&limit=${PORTAL_HISTORY_LIMIT}&action_types=buy`;
+      serverFiltered = false;
+      url =
+        `${API_URL}market/actions/?offset=${offset}&limit=${PORTAL_HISTORY_LIMIT}` +
+        `&action_types=buy&sort_by=created_at+desc`;
+      if (collectionId) url += `&collection_ids=${encodeURIComponent(collectionId)}`;
       res = await throttledPortalFetch(url, { method: 'GET', headers: portalHeaders() }).catch(() => null);
     }
 
     if (!res || !res.ok) break;
 
     const data = await res.json().catch(() => null);
-    const actions = Array.isArray(data?.actions) ? data.actions : Array.isArray(data) ? data : [];
+    const actions =
+      Array.isArray(data?.actions) ? data.actions :
+      Array.isArray(data?.items) ? data.items :
+      Array.isArray(data) ? data :
+      [];
+
     if (!actions.length) break;
 
     for (const act of actions) {
-      const nft = extractActionNft(act);
-      if (!nft) continue;
-
-      const actCollectionId =
-        nft.collection_id || nft.collectionId || nft.collection?.id || nft.collection?.collection_id || null;
-      if (collectionId && actCollectionId && actCollectionId !== collectionId) continue;
-
-      const { model, backdrop } = extractAttrs(nft);
-
-      if (modelLower && !sameTrait(model, modelLower)) continue;
-      if (backdropLower && !sameTrait(backdrop, backdropLower)) continue;
-
-      const amount = act.amount ?? act.price ?? act.ton_amount ?? act.tonAmount ?? act.value ?? null;
+      const amount = act?.amount ?? act?.price ?? act?.ton_amount ?? act?.tonAmount ?? act?.value ?? null;
       const priceTon = n(amount);
       if (!Number.isFinite(priceTon) || priceTon <= 0) continue;
+
+      if (!serverFiltered) {
+        const nft = extractActionNft(act);
+        if (!nft) continue;
+
+        if (collectionId) {
+          const actCollectionId =
+            nft?.collection_id || nft?.collectionId || nft?.collection?.id || nft?.collection?.collection_id || null;
+          if (actCollectionId && actCollectionId !== collectionId) continue;
+        }
+
+        const { model, backdrop } = extractAttrs(nft);
+        if (modelLower && !sameTrait(model, modelLower)) continue;
+        if (backdropLower && !sameTrait(backdrop, backdropLower)) continue;
+      }
 
       prices.push(priceTon);
       if (prices.length >= PORTAL_HISTORY_TARGET_SALES) break;
@@ -811,10 +843,9 @@ async function portalHistoryEstimateStrict({ collectionId, modelLower, backdropL
     ok: true,
     median: median(prices),
     count: prices.length,
-    pagesScanned: page,
+    pages_scanned: page,
     time: now,
   };
-
   historyCache.set(key, out);
   return out;
 }
@@ -978,17 +1009,17 @@ async function mrktFeedFetch({ collectionName, modelName, backdropName, cursor, 
   return { ok: true, reason: 'OK', items, cursor: nextCursor };
 }
 
-// История продаж MRKT (STRICT) — медиана только по sale и только по выбранным фильтрам
-async function mrktHistorySalesEstimateStrict({ giftLower, modelLower, backdropLower }) {
+// История продаж MRKT (STRICT): медиана, строго по фильтрам, смотрим далеко
+async function mrktHistorySalesEstimate({ giftLower, modelLower, backdropLower }) {
   const auth = mrktAuthHeader();
-  if (!auth) return { ok: false, reason: 'NO_AUTH', median: null, count: 0, pagesScanned: 0 };
-  if (!giftLower) return { ok: false, reason: 'NO_GIFT', median: null, count: 0, pagesScanned: 0 };
+  if (!auth) return { ok: false, reason: 'NO_AUTH', median: null, count: 0, pages_scanned: 0 };
+  if (!giftLower) return { ok: false, reason: 'NO_GIFT', median: null, count: 0, pages_scanned: 0 };
 
   const collectionName = collectionsCache.byLowerName.get(giftLower)?.name || capWords(giftLower);
   const modelName = modelLower ? capWords(modelLower) : null;
   const backdropName = backdropLower ? capWords(backdropLower) : null;
 
-  const key = `mrkt|strict|${collectionName}|${modelName || ''}|${backdropName || ''}|target=${MRKT_HISTORY_TARGET_SALES}|pages=${MRKT_HISTORY_MAX_PAGES}|count=${MRKT_FEED_COUNT}`;
+  const key = `mrkt|hist|${collectionName}|${modelName || ''}|${backdropName || ''}|target=${MRKT_HISTORY_TARGET_SALES}`;
   const now = nowMs();
   const cached = historyCache.get(key);
   if (cached && now - cached.time < HISTORY_CACHE_TTL_MS) return cached;
@@ -1001,7 +1032,8 @@ async function mrktHistorySalesEstimateStrict({ giftLower, modelLower, backdropL
   while (pages < MRKT_HISTORY_MAX_PAGES && prices.length < MRKT_HISTORY_TARGET_SALES) {
     if (nowMs() - started > MRKT_HISTORY_TIME_BUDGET_MS) break;
 
-    const r = await mrktFeedFetch({
+    // Пробуем types=['sale'], если вдруг API не фильтрует — ниже есть fallback
+    let r = await mrktFeedFetch({
       collectionName,
       modelName,
       backdropName,
@@ -1012,18 +1044,38 @@ async function mrktHistorySalesEstimateStrict({ giftLower, modelLower, backdropL
     });
 
     if (!r.ok) {
-      const outErr = { ok: false, reason: r.reason, median: null, count: prices.length, pagesScanned: pages, time: now };
+      const outErr = { ok: false, reason: r.reason, median: null, count: prices.length, pages_scanned: pages, time: now };
       historyCache.set(key, outErr);
       return outErr;
     }
 
-    if (!r.items.length) break;
+    // fallback: если почему-то вернулось пусто — пробуем без type-фильтра и фильтруем локально по item.type
+    if (!r.items.length) {
+      r = await mrktFeedFetch({
+        collectionName,
+        modelName,
+        backdropName,
+        cursor,
+        count: MRKT_FEED_COUNT,
+        ordering: 'Latest',
+        types: [],
+      });
+      if (!r.ok) {
+        const outErr = { ok: false, reason: r.reason, median: null, count: prices.length, pages_scanned: pages, time: now };
+        historyCache.set(key, outErr);
+        return outErr;
+      }
+      if (!r.items.length) break;
+    }
 
     for (const item of r.items) {
+      const type = String(item?.type || '').toLowerCase();
+      if (type && type !== 'sale') continue;
+
       const g = item?.gift || null;
       if (!g) continue;
 
-      // строгая проверка, чтобы точно совпадало с твоими фильтрами
+      // строгая проверка “ещё раз”, чтобы точно совпадало
       if (modelLower) {
         const m = g.modelTitle || g.modelName || null;
         if (!sameTrait(m, modelLower)) continue;
@@ -1055,7 +1107,7 @@ async function mrktHistorySalesEstimateStrict({ giftLower, modelLower, backdropL
     reason: 'OK',
     median: median(prices),
     count: prices.length,
-    pagesScanned: pages,
+    pages_scanned: pages,
     time: now,
   };
 
@@ -1064,14 +1116,10 @@ async function mrktHistorySalesEstimateStrict({ giftLower, modelLower, backdropL
 }
 
 // =====================
-// Notifications (preview ON)
+// Notifications
 // =====================
 async function sendDeal(userId, gift) {
-  // Чтобы Telegram показал карточку как при вставке ссылки —
-  // ссылка должна быть в тексте, и preview должен быть включён.
   const lines = [];
-
-  if (gift.urlTelegram) lines.push(gift.urlTelegram); // ПЕРВАЯ СТРОКА -> превью
   lines.push(`Price: ${gift.priceTon.toFixed(3)} TON`);
   lines.push(`Gift: ${gift.name}`);
   if (gift.attrs?.model) lines.push(`Model: ${gift.attrs.model}`);
@@ -1079,19 +1127,19 @@ async function sendDeal(userId, gift) {
   if (gift.attrs?.backdrop) lines.push(`Backdrop: ${gift.attrs.backdrop}`);
   lines.push(`Market: ${gift.market}`);
 
+  // ссылка ВНИЗУ, но превью включено
+  if (gift.urlTelegram) lines.push(gift.urlTelegram);
+
   const btnText = gift.market === 'Portal' ? 'Открыть Portal' : 'Открыть MRKT';
   const reply_markup = gift.urlMarket
     ? { inline_keyboard: [[{ text: btnText, url: gift.urlMarket }]] }
     : undefined;
 
-  await sendMessageSafe(userId, lines.join('\n'), {
-    disable_web_page_preview: false, // ВКЛЮЧАЕМ превью
-    reply_markup,
-  });
+  await sendMessageSafe(userId, lines.join('\n'), { disable_web_page_preview: false, reply_markup });
 }
 
 // =====================
-// Sellprice (STRICT): history only when no lots (как у тебя было)
+// Sellprice (CLEAN): history only when no lots
 // =====================
 async function sendSellPriceForUser(chatId, user) {
   if (!user.filters.gifts.length) {
@@ -1122,14 +1170,9 @@ async function sendSellPriceForUser(chatId, user) {
       text += `Portal: активных лотов по этим фильтрам нет\n`;
 
       if (r.collectionId) {
-        const h = await portalHistoryEstimateStrict({
-          collectionId: r.collectionId,
-          modelLower,
-          backdropLower,
-        });
-
+        const h = await portalHistoryEstimate({ collectionId: r.collectionId, modelLower, backdropLower });
         if (h.ok && h.median != null) {
-          text += `Portal (история продаж):\n  ~${h.median.toFixed(3)} TON (медиана, выборка: ${h.count}; pages_scanned=${h.pagesScanned})\n`;
+          text += `Portal (история продаж):\n  ~${h.median.toFixed(3)} TON (медиана, выборка: ${h.count}; pages_scanned=${h.pages_scanned})\n`;
         } else {
           text += `Portal (история продаж): нет данных (строго по фильтрам)\n`;
         }
@@ -1153,9 +1196,9 @@ async function sendSellPriceForUser(chatId, user) {
     } else if (r.ok) {
       text += `\nMRKT: активных лотов по этим фильтрам нет\n`;
 
-      const hs = await mrktHistorySalesEstimateStrict({ giftLower, modelLower, backdropLower });
+      const hs = await mrktHistorySalesEstimate({ giftLower, modelLower, backdropLower });
       if (hs.ok && hs.median != null) {
-        text += `MRKT (история продаж):\n  ~${hs.median.toFixed(3)} TON (медиана, выборка: ${hs.count}; pages_scanned=${hs.pagesScanned})\n`;
+        text += `MRKT (история продаж):\n  ~${hs.median.toFixed(3)} TON (медиана, выборка: ${hs.count}; pages_scanned=${hs.pages_scanned})\n`;
       } else {
         text += `MRKT (история продаж): нет данных (строго по фильтрам)\n`;
       }
@@ -1229,7 +1272,7 @@ function makeSubFromCurrentFilters(user) {
 
   const sub = {
     id: `sub_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
-    num: user.subscriptions.length + 1,
+    num: user.subscriptions.length + 1, // всегда подряд
     enabled: true,
     maxPriceTon: user.maxPriceTon ?? null,
     filters: {
@@ -1246,22 +1289,21 @@ function makeSubFromCurrentFilters(user) {
 async function notifySubFloor(userId, sub, market, prevFloor, newFloor, lot) {
   const gift = collectionsCache.byLowerName.get(sub.filters.gift)?.name || capWords(sub.filters.gift);
 
-  // тоже делаем превью: ссылка первой строкой
-  let text = '';
-  if (lot?.urlTelegram) text += `${lot.urlTelegram}\n`;
-
+  let text = `${gift}\n`;
   if (prevFloor == null) {
-    text += `${gift}\nНовый флор: ${newFloor.toFixed(3)} TON\n`;
+    text += `Новый флор: ${newFloor.toFixed(3)} TON\n`;
   } else {
     const pct = percentChange(prevFloor, newFloor);
     const pctTxt = pct == null ? '' : ` (${pct.toFixed(1)}%)`;
-    text += `${gift}\nФлор изменился: ${Number(prevFloor).toFixed(3)} -> ${newFloor.toFixed(3)} TON${pctTxt}\n`;
+    text += `Флор изменился: ${Number(prevFloor).toFixed(3)} -> ${newFloor.toFixed(3)} TON${pctTxt}\n`;
   }
-
   if (sub.filters.model) text += `Model: ${capWords(sub.filters.model)}\n`;
   if (sub.filters.backdrop) text += `Backdrop: ${capWords(sub.filters.backdrop)}\n`;
   text += `Market: ${market}\n`;
   if (sub.maxPriceTon != null) text += `Max: ${Number(sub.maxPriceTon).toFixed(3)} TON\n`;
+
+  // ссылка вниз (и превью включено)
+  if (lot?.urlTelegram) text += lot.urlTelegram;
 
   const reply_markup = lot?.urlMarket
     ? { inline_keyboard: [[{ text: 'Открыть', url: lot.urlMarket }]] }
@@ -1284,15 +1326,17 @@ async function notifySubMrktEvent(userId, sub, item) {
   const amountNano = item.amount ?? gift.salePrice ?? null;
   const amountTon = Number(amountNano) / 1e9;
 
-  const urlTelegram = name ? `https://t.me/nft/${name}` : 'https://t.me/mrkt';
-  const urlMarket = gift.id ? mrktLotUrlFromId(gift.id) : 'https://t.me/mrkt';
-
-  let text = `${urlTelegram}\n`;
-  text += `MRKT событие: ${type}\n`;
+  let text = `MRKT событие: ${type}\n`;
   text += `${title}${number != null ? ` #${number}` : ''}\n`;
   if (gift.modelTitle || gift.modelName) text += `Model: ${(gift.modelTitle || gift.modelName)}\n`;
   if (gift.backdropName) text += `Backdrop: ${gift.backdropName}\n`;
   if (Number.isFinite(amountTon) && amountTon > 0) text += `Amount: ${amountTon.toFixed(3)} TON\n`;
+
+  const urlTelegram = name ? `https://t.me/nft/${name}` : 'https://t.me/mrkt';
+  const urlMarket = gift.id ? mrktLotUrlFromId(gift.id) : 'https://t.me/mrkt';
+
+  // ссылка вниз
+  text += urlTelegram;
 
   const reply_markup = urlMarket
     ? { inline_keyboard: [[{ text: 'Открыть MRKT', url: urlMarket }]] }
@@ -1350,7 +1394,7 @@ async function processMrktFeedForSub(userId, sub, stateKey, budgetEvents) {
     cursor: '',
     count: MRKT_FEED_COUNT,
     ordering: 'Latest',
-    types: [],
+    types: [], // события все
   });
 
   if (!r.ok) return 0;
@@ -1359,6 +1403,7 @@ async function processMrktFeedForSub(userId, sub, stateKey, budgetEvents) {
   const latestId = r.items[0]?.id || null;
   if (!latestId) return 0;
 
+  // 1-й запуск: не спамим старьём
   if (!st.feedLastId) {
     subStates.set(stateKey, { ...st, feedLastId: latestId });
     return 0;
@@ -1376,7 +1421,7 @@ async function processMrktFeedForSub(userId, sub, stateKey, budgetEvents) {
     return 0;
   }
 
-  newItems.reverse();
+  newItems.reverse(); // старые -> новые
 
   let sent = 0;
   for (const it of newItems) {
@@ -1420,6 +1465,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
           const stateKey = `${userId}:${sub.id}:${market}`;
           const prevState = subStates.get(stateKey) || { floor: null, emptyStreak: 0, lastNotifiedFloor: null, feedLastId: null };
 
+          // floor
           const r = await getFloorForSub(market, sub);
           if (!r.ok) continue;
 
@@ -1457,6 +1503,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
             subStates.set(stateKey, { ...prevState, floor: newFloor, emptyStreak });
           }
 
+          // MRKT feed events
           if (market === 'MRKT' && globalFeedBudget > 0) {
             const sent = await processMrktFeedForSub(userId, sub, stateKey, globalFeedBudget);
             globalFeedBudget -= sent;
