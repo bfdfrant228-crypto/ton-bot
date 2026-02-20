@@ -38,7 +38,7 @@ const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL || null
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? Number(process.env.ADMIN_CHAT_ID) : null;
 
 // =====================
-// Portal
+// Portal (direct) — will be blocked by CF on Railway
 // =====================
 const API_URL = 'https://portal-market.com/api/';
 const SORT_PRICE_ASC = '&sort_by=price+asc';
@@ -50,14 +50,6 @@ let portalNextAllowedAt = 0;
 const PORTAL_LIMIT = Number(process.env.PORTAL_LIMIT || 50);
 const PORTAL_PAGES = Number(process.env.PORTAL_PAGES || 4);
 
-// Portal history (deep + server filters)
-const PORTAL_HISTORY_LIMIT = Number(process.env.PORTAL_HISTORY_LIMIT || 200);
-const PORTAL_HISTORY_PAGES = Number(process.env.PORTAL_HISTORY_PAGES || 120);
-const PORTAL_HISTORY_PAGE_DELAY_MS = Number(process.env.PORTAL_HISTORY_PAGE_DELAY_MS || 220);
-const PORTAL_HISTORY_TARGET_SALES = Number(process.env.PORTAL_HISTORY_TARGET_SALES || 60);
-const PORTAL_HISTORY_TIME_BUDGET_MS = Number(process.env.PORTAL_HISTORY_TIME_BUDGET_MS || 20000);
-
-// Portal lot deep-link
 const PORTAL_LOT_URL_TEMPLATE =
   process.env.PORTAL_LOT_URL_TEMPLATE || 'https://t.me/portals?startapp=gift_{id}';
 
@@ -90,40 +82,35 @@ const MRKT_FEED_NOTIFY_TYPES = new Set(
     .filter(Boolean)
 );
 
-// MRKT auth notify throttling
-const MRKT_AUTH_NOTIFY_COOLDOWN_MS = Number(process.env.MRKT_AUTH_NOTIFY_COOLDOWN_MS || 60 * 60 * 1000); // 1h
+const MRKT_AUTH_NOTIFY_COOLDOWN_MS = Number(process.env.MRKT_AUTH_NOTIFY_COOLDOWN_MS || 60 * 60 * 1000);
 
 // =====================
-// TONNEL (NEW)
+// Satellite (NEW) — this is what реально работает на Railway
+// =====================
+const SATELLITE_ENABLED = String(process.env.SATELLITE_ENABLED || '1') !== '0';
+const SATELLITE_BASE = process.env.SATELLITE_BASE || 'https://gift-satellite.dev';
+const SATELLITE_THROTTLE_MS = Number(process.env.SATELLITE_THROTTLE_MS || 120);
+let satelliteNextAllowedAt = 0;
+
+// =====================
+// Tonnel (via Satellite)
 // =====================
 const TONNEL_ENABLED = String(process.env.TONNEL_ENABLED || '1') !== '0';
-const TONNEL_USER_AUTH = process.env.TONNEL_USER_AUTH || null; // из pageGifts user_auth
-const TONNEL_AUTHDATA = process.env.TONNEL_AUTHDATA || TONNEL_USER_AUTH; // saleHistory authData (обычно подходит то же)
+
+// optional: direct Tonnel (currently blocked by CF, keep only for status)
+const TONNEL_DIRECT_ENABLED = String(process.env.TONNEL_DIRECT_ENABLED || '0') === '1';
+const TONNEL_USER_AUTH = process.env.TONNEL_USER_AUTH || null;
 const TONNEL_ORIGIN = process.env.TONNEL_ORIGIN || 'https://market.tonnel.network';
 const TONNEL_REFERER = process.env.TONNEL_REFERER || 'https://market.tonnel.network/';
 const TONNEL_UA =
   process.env.TONNEL_UA ||
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
 
-const TONNEL_LIMIT = Number(process.env.TONNEL_LIMIT || 30); // max 30
-const TONNEL_PAGES = Number(process.env.TONNEL_PAGES || 4);
-
-const TONNEL_HISTORY_LIMIT = Number(process.env.TONNEL_HISTORY_LIMIT || 50); // как в payload
-const TONNEL_HISTORY_PAGES = Number(process.env.TONNEL_HISTORY_PAGES || 60);
-const TONNEL_HISTORY_TARGET_SALES = Number(process.env.TONNEL_HISTORY_TARGET_SALES || 60);
-const TONNEL_HISTORY_TIME_BUDGET_MS = Number(process.env.TONNEL_HISTORY_TIME_BUDGET_MS || 20000);
-
-const TONNEL_THROTTLE_MS = Number(process.env.TONNEL_THROTTLE_MS || 180);
-let tonnelNextAllowedAt = 0;
-
-console.log('Bot version 2026-02-20-tonnel-added-portal-cf-fallback-catalog-v1');
+console.log('Bot version 2026-02-20-satellite-tonnel-portal-floors-v1');
 console.log('MODE =', MODE);
 console.log('REDIS_URL =', REDIS_URL ? 'set' : 'not set');
-console.log('ADMIN_CHAT_ID =', ADMIN_CHAT_ID || 'not set');
-console.log('PORTAL_PREMARKET_STATUS =', PORTAL_PREMARKET_STATUS);
-console.log('PORTAL_LOT_URL_TEMPLATE =', PORTAL_LOT_URL_TEMPLATE);
-console.log('MRKT_FEED_NOTIFY_TYPES =', Array.from(MRKT_FEED_NOTIFY_TYPES).join(', '));
-console.log('TONNEL_ENABLED =', TONNEL_ENABLED, 'TONNEL_USER_AUTH =', TONNEL_USER_AUTH ? 'set' : 'not set');
+console.log('SATELLITE_ENABLED =', SATELLITE_ENABLED, 'SATELLITE_BASE =', SATELLITE_BASE);
+console.log('TONNEL_ENABLED =', TONNEL_ENABLED, 'TONNEL_DIRECT_ENABLED =', TONNEL_DIRECT_ENABLED);
 
 const bot = new TelegramBot(token, { polling: true });
 
@@ -143,10 +130,8 @@ const MAIN_KEYBOARD = {
 // =====================
 // State
 // =====================
-const users = new Map(); // userId -> userState
-const sentDeals = new Map(); // key -> ts
-
-// `${userId}:${subId}:${market}` -> { floor, emptyStreak, lastNotifiedFloor, feedLastId }
+const users = new Map();
+const sentDeals = new Map();
 const subStates = new Map();
 
 let isChecking = false;
@@ -156,13 +141,12 @@ let isSubsChecking = false;
 let collectionsCache = { time: 0, byLowerName: new Map() };
 const COLLECTIONS_CACHE_TTL_MS = 10 * 60_000;
 
-const filtersCache = new Map(); // shortName -> { time, data:{models, backdrops} }
+const filtersCache = new Map();
 const FILTERS_CACHE_TTL_MS = 5 * 60_000;
 
 const historyCache = new Map();
 const HISTORY_CACHE_TTL_MS = 60_000;
 
-// MRKT auth status
 const mrktAuthState = {
   ok: null,
   lastOkAt: 0,
@@ -171,85 +155,71 @@ const mrktAuthState = {
   lastNotifiedAt: 0,
 };
 
-// Portal last probe
-const portalState = {
-  lastStatus: null,
-  lastOk: null,
-  lastBodyStart: '',
-  lastAt: 0,
-};
-
-// Tonnel last probe
-const tonnelState = {
-  lastStatus: null,
-  lastOk: null,
-  lastBodyStart: '',
-  lastAt: 0,
-};
+const portalState = { lastStatus: null, lastOk: null, lastBodyStart: '', lastAt: 0 };
+const tonnelDirectState = { lastStatus: null, lastOk: null, lastBodyStart: '', lastAt: 0 };
+const satelliteState = { lastStatus: null, lastOk: null, lastBodyStart: '', lastAt: 0 };
 
 // =====================
-// Catalog (for UI when Portal is blocked)
+// Catalog (works when Portal is down)
 // =====================
 const catalog = {
-  gifts: new Map(), // giftLower -> displayName
-  modelsByGift: new Map(), // giftLower -> Map(modelLower -> displayName)
-  backdropsByGift: new Map(), // giftLower -> Map(backdropLower -> displayName)
+  gifts: new Map(), // giftLower -> display
+  modelsByGift: new Map(), // giftLower -> Map(modelLower -> display)
+  backdropsByGift: new Map(), // giftLower -> Map(backdropLower -> display)
 };
 
-function catalogPutGift(giftName) {
-  if (!giftName) return;
-  const dl = String(giftName).toLowerCase().trim();
-  if (!dl) return;
-  if (!catalog.gifts.has(dl)) catalog.gifts.set(dl, giftName);
+function normGiftKey(name) {
+  return String(name || '').toLowerCase().trim().replace(/\s+/g, ' ');
 }
-function catalogPutModel(giftLower, model) {
-  if (!giftLower || !model) return;
-  const gl = String(giftLower).toLowerCase().trim();
-  const ml = normTraitName(model);
-  if (!gl || !ml) return;
+function normTraitName(s) {
+  return String(s || '')
+    .toLowerCase()
+    .trim()
+    .replace(/\s*\([^)]*%[^)]*\)\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function capWords(str) {
+  return String(str || '').replace(/\w+(?:'\w+)?/g, (w) => (w ? w[0].toUpperCase() + w.slice(1) : w));
+}
 
+function catalogPutGift(displayName) {
+  const k = normGiftKey(displayName);
+  if (!k) return;
+  if (!catalog.gifts.has(k)) catalog.gifts.set(k, String(displayName));
+}
+function catalogPutModel(giftLower, modelDisplay) {
+  const gl = normGiftKey(giftLower);
+  const ml = normTraitName(modelDisplay);
+  if (!gl || !ml) return;
   if (!catalog.modelsByGift.has(gl)) catalog.modelsByGift.set(gl, new Map());
   const m = catalog.modelsByGift.get(gl);
-  if (!m.has(ml)) m.set(ml, String(model));
+  if (!m.has(ml)) m.set(ml, String(modelDisplay));
 }
-function catalogPutBackdrop(giftLower, backdrop) {
-  if (!giftLower || !backdrop) return;
-  const gl = String(giftLower).toLowerCase().trim();
-  const bl = normTraitName(backdrop);
+function catalogPutBackdrop(giftLower, backdropDisplay) {
+  const gl = normGiftKey(giftLower);
+  const bl = normTraitName(backdropDisplay);
   if (!gl || !bl) return;
-
   if (!catalog.backdropsByGift.has(gl)) catalog.backdropsByGift.set(gl, new Map());
   const m = catalog.backdropsByGift.get(gl);
-  if (!m.has(bl)) m.set(bl, String(backdrop));
+  if (!m.has(bl)) m.set(bl, String(backdropDisplay));
 }
-
-function catalogRegisterGiftObj(obj) {
-  // obj: { giftName, model, backdrop }
-  if (!obj) return;
-  const giftName = obj.giftName || obj.collection || obj.baseName || obj.name || null;
+function catalogRegisterGiftObj({ giftName, model, backdrop }) {
   if (!giftName) return;
   catalogPutGift(giftName);
-  const giftLower = String(giftName).toLowerCase().trim();
-
-  if (obj.model) catalogPutModel(giftLower, obj.model);
-  if (obj.backdrop) catalogPutBackdrop(giftLower, obj.backdrop);
+  const gl = normGiftKey(giftName);
+  if (model) catalogPutModel(gl, model);
+  if (backdrop) catalogPutBackdrop(gl, backdrop);
 }
 
 function catalogExport() {
   const gifts = Array.from(catalog.gifts.entries());
   const modelsByGift = {};
   const backdropsByGift = {};
-
-  for (const [g, map] of catalog.modelsByGift.entries()) {
-    modelsByGift[g] = Array.from(map.entries()); // [ [lower, display], ... ]
-  }
-  for (const [g, map] of catalog.backdropsByGift.entries()) {
-    backdropsByGift[g] = Array.from(map.entries());
-  }
-
+  for (const [g, map] of catalog.modelsByGift.entries()) modelsByGift[g] = Array.from(map.entries());
+  for (const [g, map] of catalog.backdropsByGift.entries()) backdropsByGift[g] = Array.from(map.entries());
   return { gifts, modelsByGift, backdropsByGift };
 }
-
 function catalogImport(data) {
   try {
     if (!data || typeof data !== 'object') return;
@@ -262,9 +232,7 @@ function catalogImport(data) {
       for (const [g, arr] of Object.entries(data.modelsByGift)) {
         if (!Array.isArray(arr)) continue;
         const map = new Map();
-        for (const [k, v] of arr) {
-          if (k && v) map.set(String(k), String(v));
-        }
+        for (const [k, v] of arr) if (k && v) map.set(String(k), String(v));
         catalog.modelsByGift.set(String(g), map);
       }
     }
@@ -272,9 +240,7 @@ function catalogImport(data) {
       for (const [g, arr] of Object.entries(data.backdropsByGift)) {
         if (!Array.isArray(arr)) continue;
         const map = new Map();
-        for (const [k, v] of arr) {
-          if (k && v) map.set(String(k), String(v));
-        }
+        for (const [k, v] of arr) if (k && v) map.set(String(k), String(v));
         catalog.backdropsByGift.set(String(g), map);
       }
     }
@@ -291,56 +257,6 @@ function n(x) {
   const v = Number(String(x).replace(',', '.'));
   return Number.isFinite(v) ? v : NaN;
 }
-function norm(s) {
-  return String(s || '').toLowerCase().trim().replace(/\s+/g, ' ');
-}
-// remove "(0%)"
-function normTraitName(s) {
-  return norm(s)
-    .replace(/\s*\([^)]*%[^)]*\)\s*/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-function sameTrait(actual, expectedLower) {
-  if (!expectedLower) return true;
-  return normTraitName(actual) === normTraitName(expectedLower);
-}
-function capWords(str) {
-  return String(str || '').replace(/\w+(?:'\w+)?/g, (w) => (w ? w[0].toUpperCase() + w.slice(1) : w));
-}
-function quotePlus(str) {
-  return encodeURIComponent(str).replace(/%20/g, '+');
-}
-function shorten(s, max = 32) {
-  const t = String(s || '');
-  return t.length <= max ? t : t.slice(0, max - 1) + '…';
-}
-function pruneSentDeals() {
-  const now = nowMs();
-  for (const [k, ts] of sentDeals.entries()) {
-    if (now - ts > SENT_TTL_MS) sentDeals.delete(k);
-  }
-}
-function clearUserSentDeals(userId) {
-  const prefix = `${userId}:`;
-  for (const k of Array.from(sentDeals.keys())) {
-    if (k.startsWith(prefix)) sentDeals.delete(k);
-  }
-}
-function percentChange(oldV, newV) {
-  if (!oldV || !Number.isFinite(oldV) || oldV <= 0) return null;
-  return ((newV - oldV) / oldV) * 100;
-}
-function buildPortalLotUrl(id) {
-  if (!id) return 'https://t.me/portals';
-  if (!PORTAL_LOT_URL_TEMPLATE.includes('{id}')) return PORTAL_LOT_URL_TEMPLATE;
-  return PORTAL_LOT_URL_TEMPLATE.replace('{id}', encodeURIComponent(String(id)));
-}
-function mrktLotUrlFromId(id) {
-  if (!id) return 'https://t.me/mrkt';
-  const appId = String(id).replace(/-/g, '');
-  return `https://t.me/mrkt/app?startapp=${appId}`;
-}
 function inRange(price, minPrice, maxPrice) {
   if (!Number.isFinite(price)) return false;
   const min = minPrice != null ? Number(minPrice) : 0;
@@ -354,8 +270,38 @@ function median(sorted) {
   const L = sorted.length;
   return L % 2 ? sorted[(L - 1) / 2] : (sorted[L / 2 - 1] + sorted[L / 2]) / 2;
 }
+function pruneSentDeals() {
+  const now = nowMs();
+  for (const [k, ts] of sentDeals.entries()) if (now - ts > SENT_TTL_MS) sentDeals.delete(k);
+}
+function clearUserSentDeals(userId) {
+  const prefix = `${userId}:`;
+  for (const k of Array.from(sentDeals.keys())) if (k.startsWith(prefix)) sentDeals.delete(k);
+}
+function percentChange(oldV, newV) {
+  if (!oldV || !Number.isFinite(oldV) || oldV <= 0) return null;
+  return ((newV - oldV) / oldV) * 100;
+}
+function shorten(s, max = 32) {
+  const t = String(s || '');
+  return t.length <= max ? t : t.slice(0, max - 1) + '…';
+}
 
-// ===== Portal tg url fix =====
+// Portal lot deep-link
+function buildPortalLotUrl(id) {
+  if (!id) return 'https://t.me/portals';
+  if (!PORTAL_LOT_URL_TEMPLATE.includes('{id}')) return PORTAL_LOT_URL_TEMPLATE;
+  return PORTAL_LOT_URL_TEMPLATE.replace('{id}', encodeURIComponent(String(id)));
+}
+
+// MRKT lot deep-link
+function mrktLotUrlFromId(id) {
+  if (!id) return 'https://t.me/mrkt';
+  const appId = String(id).replace(/-/g, '');
+  return `https://t.me/mrkt/app?startapp=${appId}`;
+}
+
+// Portal tg url fix
 function portalTgUrlFromNft(nft) {
   const tg = nft?.tg_id != null ? String(nft.tg_id).trim() : '';
   if (tg && tg.includes('-')) return `https://t.me/nft/${tg}`;
@@ -364,89 +310,10 @@ function portalTgUrlFromNft(nft) {
   const num = nft?.external_collection_number ?? null;
 
   if (name && num != null) {
-    const slugName = name.replace(/[^a-z0-9]+/gi, ''); // Love Candle -> LoveCandle
+    const slugName = name.replace(/[^a-z0-9]+/gi, '');
     if (slugName) return `https://t.me/nft/${slugName}-${num}`;
   }
   return 'https://t.me/portals';
-}
-
-// ===== Tonnel tg url guess (best effort) =====
-function tonnelTgUrlFromNameNum(name, giftNum) {
-  if (!name || giftNum == null) return 'https://t.me/Tonnel_Network_bot';
-  const slug = String(name).replace(/[^a-z0-9]+/gi, '');
-  if (!slug) return 'https://t.me/Tonnel_Network_bot';
-  return `https://t.me/nft/${slug}-${giftNum}`;
-}
-function tonnelTitle(text) {
-  const words = String(text || '').match(/\w+(?:'\w+)?/g) || [];
-  let out = String(text || '');
-  for (const w of words) {
-    if (!w) continue;
-    const cap = w[0].toUpperCase() + w.slice(1);
-    out = out.replace(w, cap);
-  }
-  return out;
-}
-function tonnelGiftNameFix(name) {
-  if (!name) return null;
-  const s = String(name).trim();
-  if (s.toLowerCase() === 'jack-in-the-box') return 'Jack-in-the-Box';
-  return tonnelTitle(s);
-}
-function tonnelRegexStartsWithTitle(val) {
-  // ^Title \(  (чтобы совпадало с "Cyberpunk (0%)")
-  const t = tonnelTitle(String(val || '').trim());
-  if (!t) return null;
-  // escape for JSON string: "\\(" already required in stringified JSON, but we build as normal string for JSON.stringify
-  return `^${t} \\(`;
-}
-
-// =====================
-// Portal headers/throttle
-// =====================
-function portalHeaders() {
-  const auth = process.env.PORTAL_AUTH;
-  return {
-    ...(auth ? { Authorization: auth } : {}),
-    Accept: 'application/json, text/plain, */*',
-    Origin: 'https://portal-market.com',
-    Referer: 'https://portal-market.com/',
-  };
-}
-
-async function throttledPortalFetch(url, opts) {
-  const now = nowMs();
-  const wait = portalNextAllowedAt - now;
-  if (wait > 0) await sleep(wait);
-  portalNextAllowedAt = nowMs() + PORTAL_THROTTLE_MS;
-
-  for (let i = 0; i < 3; i++) {
-    const res = await fetch(url, opts);
-    if (res.status !== 429) return res;
-    await sleep(1100 + i * 900);
-  }
-  return fetch(url, opts);
-}
-
-// =====================
-// TONNEL fetch/throttle
-// =====================
-function tonnelHeaders() {
-  return {
-    Accept: 'application/json',
-    'Content-Type': 'application/json',
-    origin: TONNEL_ORIGIN,
-    referer: TONNEL_REFERER,
-    'user-agent': TONNEL_UA,
-  };
-}
-
-async function throttledTonnelFetch(url, opts) {
-  const now = nowMs();
-  const wait = tonnelNextAllowedAt - now;
-  if (wait > 0) await sleep(wait);
-  tonnelNextAllowedAt = nowMs() + TONNEL_THROTTLE_MS;
-  return fetch(url, opts);
 }
 
 // =====================
@@ -462,124 +329,11 @@ async function sendMessageSafe(chatId, text, opts) {
         e?.response?.parameters?.retry_after ??
         null;
       if (retryAfter) {
-        const ms = (Number(retryAfter) + 1) * 1000;
-        await sleep(ms);
+        await sleep((Number(retryAfter) + 1) * 1000);
         continue;
       }
       throw e;
     }
-  }
-}
-
-// =====================
-// Portal probe
-// =====================
-async function portalProbe() {
-  if (!process.env.PORTAL_AUTH) {
-    return { ok: false, status: null, note: 'PORTAL_AUTH not set', bodyStart: '' };
-  }
-  const url = `${API_URL}collections?limit=1`;
-  const res = await throttledPortalFetch(url, { method: 'GET', headers: portalHeaders() }).catch(() => null);
-  if (!res) return { ok: false, status: null, note: 'fetch error', bodyStart: '' };
-
-  const ct = res.headers.get('content-type') || '';
-  const txt = await res.text().catch(() => '');
-  portalState.lastAt = nowMs();
-  portalState.lastStatus = res.status;
-  portalState.lastOk = res.ok;
-  portalState.lastBodyStart = txt.slice(0, 220);
-
-  return {
-    ok: res.ok,
-    status: res.status,
-    contentType: ct,
-    bodyStart: txt.slice(0, 220),
-  };
-}
-
-// =====================
-// Tonnel probe
-// =====================
-async function tonnelProbe() {
-  if (!TONNEL_ENABLED) return { ok: false, status: null, note: 'TONNEL_DISABLED', bodyStart: '' };
-  if (!TONNEL_USER_AUTH) return { ok: false, status: null, note: 'TONNEL_USER_AUTH not set', bodyStart: '' };
-
-  const url = 'https://gifts2.tonnel.network/api/pageGifts';
-  const filterObj = {
-    price: { $exists: true },
-    buyer: { $exists: false },
-    asset: 'TON',
-  };
-
-  const body = {
-    page: 1,
-    limit: 1,
-    sort: JSON.stringify({ message_post_time: -1, gift_id: -1 }),
-    filter: JSON.stringify(filterObj),
-    price_range: null,
-    ref: 0,
-    user_auth: TONNEL_USER_AUTH,
-  };
-
-  const res = await throttledTonnelFetch(url, { method: 'POST', headers: tonnelHeaders(), body: JSON.stringify(body) }).catch(() => null);
-  if (!res) return { ok: false, status: null, note: 'fetch error', bodyStart: '' };
-
-  const ct = res.headers.get('content-type') || '';
-  const txt = await res.text().catch(() => '');
-  tonnelState.lastAt = nowMs();
-  tonnelState.lastStatus = res.status;
-  tonnelState.lastOk = res.ok;
-  tonnelState.lastBodyStart = txt.slice(0, 220);
-
-  return { ok: res.ok, status: res.status, contentType: ct, bodyStart: txt.slice(0, 220) };
-}
-
-// =====================
-// MRKT auth alert
-// =====================
-function mrktAuthHeader() {
-  const t = process.env.MRKT_AUTH;
-  if (!t) return null;
-  return t; // token без Bearer
-}
-
-async function notifyMrktAuthExpired(statusCode) {
-  const now = nowMs();
-  if (now - mrktAuthState.lastNotifiedAt < MRKT_AUTH_NOTIFY_COOLDOWN_MS) return;
-
-  mrktAuthState.lastNotifiedAt = now;
-
-  const text =
-    `⚠️ MRKT токен не работает (HTTP ${statusCode}).\n` +
-    `Нужно обновить переменную MRKT_AUTH в Railway.\n` +
-    `Пока токен не обновишь — MRKT запросы будут пропускаться.`;
-
-  if (ADMIN_CHAT_ID && Number.isFinite(ADMIN_CHAT_ID)) {
-    try {
-      await sendMessageSafe(ADMIN_CHAT_ID, text, { disable_web_page_preview: true });
-      return;
-    } catch {}
-  }
-
-  for (const [uid] of users.entries()) {
-    try {
-      await sendMessageSafe(uid, text, { disable_web_page_preview: true });
-    } catch {}
-  }
-}
-
-function markMrktOk() {
-  mrktAuthState.ok = true;
-  mrktAuthState.lastOkAt = nowMs();
-}
-
-async function markMrktFailIfAuth(statusCode) {
-  mrktAuthState.ok = false;
-  mrktAuthState.lastFailAt = nowMs();
-  mrktAuthState.lastFailCode = statusCode;
-
-  if (statusCode === 401 || statusCode === 403) {
-    await notifyMrktAuthExpired(statusCode);
   }
 }
 
@@ -608,13 +362,13 @@ function getOrCreateUser(userId) {
       enabled: true,
       minPriceTon: 0,
       maxPriceTon: null,
-
-      // awaiting_max | awaiting_min | awaiting_gift_search | awaiting_model_search | awaiting_backdrop_search | awaiting_sub_max:<subId>
-      // + NEW: awaiting_gift_free | awaiting_model_free | awaiting_backdrop_free
       state: null,
-
-      filters: { gifts: [], models: [], backdrops: [], markets: ['Portal', 'MRKT', ...(TONNEL_ENABLED ? ['Tonnel'] : [])] },
-
+      filters: {
+        gifts: [],
+        models: [],
+        backdrops: [],
+        markets: ['MRKT', ...(TONNEL_ENABLED ? ['Tonnel'] : []), 'Portal'],
+      },
       subscriptions: [],
     });
   }
@@ -634,14 +388,12 @@ function exportState() {
   }
   return out;
 }
-
 function renumberSubs(user) {
   const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
   subs.forEach((s, idx) => {
     if (s) s.num = idx + 1;
   });
 }
-
 function importState(parsed) {
   const objUsers = parsed?.users && typeof parsed.users === 'object' ? parsed.users : {};
   for (const [idStr, u] of Object.entries(objUsers)) {
@@ -657,7 +409,9 @@ function importState(parsed) {
         gifts: Array.isArray(u?.filters?.gifts) ? u.filters.gifts : [],
         models: Array.isArray(u?.filters?.models) ? u.filters.models : [],
         backdrops: Array.isArray(u?.filters?.backdrops) ? u.filters.backdrops : [],
-        markets: Array.isArray(u?.filters?.markets) ? u.filters.markets : ['Portal', 'MRKT', ...(TONNEL_ENABLED ? ['Tonnel'] : [])],
+        markets: Array.isArray(u?.filters?.markets)
+          ? u.filters.markets
+          : ['MRKT', ...(TONNEL_ENABLED ? ['Tonnel'] : []), 'Portal'],
       },
       subscriptions: Array.isArray(u?.subscriptions) ? u.subscriptions : [],
     };
@@ -667,7 +421,7 @@ function importState(parsed) {
       if (!s.id) s.id = `sub_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`;
       if (s.enabled == null) s.enabled = true;
       if (!s.filters) s.filters = {};
-      if (!Array.isArray(s.filters.markets)) s.filters.markets = ['Portal', 'MRKT', ...(TONNEL_ENABLED ? ['Tonnel'] : [])];
+      if (!Array.isArray(s.filters.markets)) s.filters.markets = safe.filters.markets;
       if (s.maxPriceTon != null && !Number.isFinite(Number(s.maxPriceTon))) s.maxPriceTon = null;
       if (typeof s.filters.gift !== 'string') s.filters.gift = safe.filters.gifts[0] || '';
       if (typeof s.num !== 'number') s.num = 0;
@@ -677,10 +431,9 @@ function importState(parsed) {
     users.set(userId, safe);
   }
 }
-
 async function loadState() {
   if (!redis) return;
-  const keys = ['bot:state:v8', 'bot:state:v7', 'bot:state:v6', 'bot:state:v5', 'bot:state:v4', 'bot:state:v3', 'bot:state:v2', 'bot:state:v1'];
+  const keys = ['bot:state:v9', 'bot:state:v8', 'bot:state:v7', 'bot:state:v6', 'bot:state:v5'];
   for (const k of keys) {
     const raw = await redis.get(k);
     if (raw) {
@@ -690,7 +443,6 @@ async function loadState() {
     }
   }
 }
-
 async function loadCatalog() {
   if (!redis) return;
   const raw = await redis.get('bot:catalog:v1');
@@ -700,7 +452,6 @@ async function loadCatalog() {
     console.log('Loaded catalog from Redis.');
   } catch {}
 }
-
 let saveTimer = null;
 function scheduleSave() {
   if (!redis) return;
@@ -709,411 +460,302 @@ function scheduleSave() {
     saveTimer = null;
     saveState().catch((e) => console.error('saveState error:', e));
     saveCatalog().catch((e) => console.error('saveCatalog error:', e));
-  }, 300);
+  }, 350);
 }
-
 async function saveState() {
   if (!redis) return;
-  await redis.set('bot:state:v8', JSON.stringify(exportState()));
+  await redis.set('bot:state:v9', JSON.stringify(exportState()));
 }
-
 async function saveCatalog() {
   if (!redis) return;
   await redis.set('bot:catalog:v1', JSON.stringify(catalogExport()));
 }
 
 // =====================
-// Portal: collections / filters
+// Direct Portal (blocked by CF) — only for old compatibility / strict checks
 // =====================
-async function portalCollections(limit = 400) {
-  const now = nowMs();
-  if (collectionsCache.byLowerName.size && now - collectionsCache.time < COLLECTIONS_CACHE_TTL_MS) {
-    return collectionsCache;
-  }
-  if (!process.env.PORTAL_AUTH) {
-    collectionsCache = { time: now, byLowerName: new Map() };
-    return collectionsCache;
-  }
-
-  const url = `${API_URL}collections?limit=${limit}`;
-  const res = await throttledPortalFetch(url, { method: 'GET', headers: portalHeaders() }).catch(() => null);
-  if (!res || !res.ok) {
-    // Cloudflare 403 -> будет HTML, так что просто считаем недоступным
-    collectionsCache = { time: now, byLowerName: new Map() };
-    return collectionsCache;
-  }
-
-  const data = await res.json().catch(() => null);
-  const arr = Array.isArray(data?.collections) ? data.collections : Array.isArray(data) ? data : [];
-
-  const byLowerName = new Map();
-  for (const c of arr) {
-    const name = String(c?.name || c?.title || '').trim();
-    if (!name) continue;
-    byLowerName.set(name.toLowerCase(), { name, raw: c });
-    catalogPutGift(name); // пополняем каталог
-  }
-
-  collectionsCache = { time: now, byLowerName };
-  scheduleSave();
-  return collectionsCache;
-}
-
-function portalCollectionId(raw) {
-  return raw?.id || raw?.collection_id || raw?.collectionId || null;
-}
-function portalShortName(raw) {
-  return raw?.short_name || raw?.shortName || null;
-}
-
-async function portalCollectionFilters(shortName) {
-  if (!shortName || !process.env.PORTAL_AUTH) return null;
-
-  const now = nowMs();
-  const cached = filtersCache.get(shortName);
-  if (cached && now - cached.time < FILTERS_CACHE_TTL_MS) return cached.data;
-
-  const url = `${API_URL}collections/filters?short_names=${encodeURIComponent(shortName)}`;
-  const res = await throttledPortalFetch(url, { method: 'GET', headers: portalHeaders() }).catch(() => null);
-  if (!res || !res.ok) return null;
-
-  const data = await res.json().catch(() => null);
-  if (!data) return null;
-
-  let block = null;
-  if (data.collections && typeof data.collections === 'object') {
-    const key =
-      Object.keys(data.collections).find((k) => k.toLowerCase() === shortName.toLowerCase()) ||
-      shortName;
-    block = data.collections[key] || null;
-  } else if (data.floor_prices && typeof data.floor_prices === 'object') {
-    const key =
-      Object.keys(data.floor_prices).find((k) => k.toLowerCase() === shortName.toLowerCase()) ||
-      shortName;
-    block = data.floor_prices[key] || null;
-  }
-  if (!block) return null;
-
-  const out = { models: block.models || [], backdrops: block.backdrops || [] };
-  filtersCache.set(shortName, { time: now, data: out });
-  return out;
-}
-
-// =====================
-// Rarity parsing for Portal filters
-// =====================
-function parseRarityNumber(v) {
-  if (v == null) return null;
-  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-  if (typeof v === 'string') {
-    const cleaned = v.trim().replace('%', '').replace('‰', '');
-    const num = n(cleaned);
-    return Number.isFinite(num) ? num : null;
-  }
-  return null;
-}
-function extractRarityValue(obj) {
-  if (obj == null) return null;
-  const directNum = parseRarityNumber(obj);
-  if (directNum != null) return directNum;
-  if (typeof obj !== 'object') return null;
-
-  const direct =
-    obj.rarityPermille ??
-    obj.rarity_per_mille ??
-    obj.rarityPerMille ??
-    obj.rarity ??
-    obj.rarity_percent ??
-    obj.rarityPercent ??
-    null;
-
-  const v = extractRarityValue(direct);
-  if (v != null) return v;
-
-  for (const [k, val] of Object.entries(obj)) {
-    if (String(k).toLowerCase().includes('rarity')) {
-      const x = extractRarityValue(val);
-      if (x != null) return x;
-    }
-  }
-  for (const val of Object.values(obj)) {
-    const inner = extractRarityValue(val);
-    if (inner != null) return inner;
-  }
-  return null;
-}
-function extractModelTraits(block) {
-  const map = new Map(); // lower -> { name, rarity }
-  const push = (name, rarity) => {
-    const key = String(name).toLowerCase();
-    if (!map.has(key)) map.set(key, { name: String(name), rarity: rarity ?? null });
-    else {
-      const prev = map.get(key);
-      if (prev && prev.rarity == null && rarity != null) prev.rarity = rarity;
-    }
+function portalHeaders() {
+  const auth = process.env.PORTAL_AUTH;
+  return {
+    ...(auth ? { Authorization: auth } : {}),
+    Accept: 'application/json, text/plain, */*',
+    Origin: 'https://portal-market.com',
+    Referer: 'https://portal-market.com/',
   };
-
-  if (!block) return [];
-  if (Array.isArray(block)) {
-    for (const item of block) {
-      if (!item) continue;
-      if (typeof item === 'string') push(item.trim(), null);
-      else {
-        const name = item.name || item.model || item.value || item.title;
-        if (!name) continue;
-        push(name, extractRarityValue(item));
-      }
-    }
-  } else if (typeof block === 'object') {
-    for (const [k, v] of Object.entries(block)) push(k, extractRarityValue(v));
-  }
-
-  const arr = Array.from(map.values());
-  arr.sort((a, b) => {
-    const ra = a.rarity == null ? Infinity : a.rarity;
-    const rb = b.rarity == null ? Infinity : b.rarity;
-    if (ra !== rb) return ra - rb;
-    return a.name.localeCompare(b.name);
-  });
-  return arr;
 }
-function rarityLabelPercent(trait) {
-  if (!trait || trait.rarity == null) return '';
-  const v = Number(trait.rarity);
-  if (!Number.isFinite(v)) return '';
-  return `${v}%`;
-}
-
-// =====================
-// Portal search (active lots) with paging
-// =====================
-async function portalSearchPage({ giftLower, modelLower, backdropLower, minPriceTon, maxPriceTon, offset, limit }) {
-  if (!process.env.PORTAL_AUTH) return { ok: false, reason: 'NO_AUTH', gifts: [], collectionId: null };
-
-  const { byLowerName } = await portalCollections(400);
-  const col = byLowerName.get(giftLower);
-  const giftName = col?.name || capWords(giftLower);
-  const collectionId = portalCollectionId(col?.raw);
-
-  let url = `${API_URL}nfts/search?offset=${offset}&limit=${limit}${SORT_PRICE_ASC}`;
-
-  if (minPriceTon != null && Number.isFinite(minPriceTon)) url += `&min_price=${Number(minPriceTon)}`;
-  if (maxPriceTon != null && Number.isFinite(maxPriceTon)) url += `&max_price=${Number(maxPriceTon)}`;
-
-  if (collectionId) url += `&collection_ids=${encodeURIComponent(collectionId)}`;
-  else url += `&filter_by_collections=${quotePlus(giftName)}`;
-
-  if (modelLower) url += `&filter_by_models=${quotePlus(capWords(modelLower))}`;
-  if (backdropLower) url += `&filter_by_backdrops=${quotePlus(capWords(backdropLower))}`;
-
-  url += `&status=listed&exclude_bundled=true&premarket_status=${encodeURIComponent(PORTAL_PREMARKET_STATUS)}`;
-
-  const res = await throttledPortalFetch(url, { method: 'GET', headers: portalHeaders() }).catch(() => null);
-  if (!res) return { ok: false, reason: 'FETCH_ERROR', gifts: [], collectionId };
-  if (!res.ok) return { ok: false, reason: `HTTP_${res.status}`, gifts: [], collectionId };
-
-  const data = await res.json().catch(() => null);
-  const results = Array.isArray(data?.results) ? data.results : [];
-
-  const gifts = [];
-  for (const nft of results) {
-    const priceTon = n(nft?.price);
-    if (!Number.isFinite(priceTon) || priceTon <= 0) continue;
-
-    // ===== FIX: защита от "чужого гифта с той же моделью" =====
-    if (collectionId && nft?.collection_id && nft.collection_id !== collectionId) continue;
-
-    const baseName = nft?.name || 'NFT';
-    if (giftName && baseName && String(baseName).toLowerCase() !== String(giftName).toLowerCase()) continue;
-    // ==========================================================
-
-    let model = null, backdrop = null, symbol = null;
-    if (Array.isArray(nft.attributes)) {
-      for (const a of nft.attributes) {
-        if (!a?.type) continue;
-        if (a.type === 'model') model = a.value;
-        else if (a.type === 'backdrop') backdrop = a.value;
-        else if (a.type === 'symbol') symbol = a.value;
-      }
-    }
-
-    if (modelLower && !sameTrait(model, modelLower)) continue;
-    if (backdropLower && !sameTrait(backdrop, backdropLower)) continue;
-
-    const number = nft.external_collection_number ?? null;
-    const displayName = number != null ? `${baseName} #${number}` : baseName;
-
-    const urlTelegram = portalTgUrlFromNft(nft);
-
-    gifts.push({
-      id: `portal_${nft.id || nft.tg_id || displayName}`,
-      market: 'Portal',
-      name: displayName,
-      baseName,
-      priceTon,
-      urlTelegram,
-      urlMarket: buildPortalLotUrl(nft.id),
-      attrs: { model, backdrop, symbol },
-      raw: nft,
-    });
-
-    catalogRegisterGiftObj({ giftName: baseName, model, backdrop });
-  }
-
-  gifts.sort((a, b) => a.priceTon - b.priceTon);
-  scheduleSave();
-  return { ok: true, reason: 'OK', gifts, collectionId };
-}
-
-async function portalSearchByFilters({ giftLower, modelLower, backdropLower, minPriceTon, maxPriceTon }) {
-  const all = [];
-  let collectionId = null;
-
-  for (let page = 0; page < PORTAL_PAGES; page++) {
-    const offset = page * PORTAL_LIMIT;
-    const r = await portalSearchPage({
-      giftLower,
-      modelLower,
-      backdropLower,
-      minPriceTon,
-      maxPriceTon,
-      offset,
-      limit: PORTAL_LIMIT,
-    });
-
-    if (!r.ok) return r;
-    if (collectionId == null) collectionId = r.collectionId;
-
-    if (!r.gifts.length) break;
-    all.push(...r.gifts);
-
-    if (r.gifts.length < PORTAL_LIMIT) break;
-    if (all.length >= MAX_PER_MARKET) break;
-  }
-
-  all.sort((a, b) => a.priceTon - b.priceTon);
-  return { ok: true, reason: 'OK', gifts: all.slice(0, MAX_PER_MARKET), collectionId };
-}
-
-// =====================
-// Portal history (server-filter first, strict)
-// =====================
-function extractActionNft(act) {
-  return (
-    act?.nft ||
-    act?.item?.nft ||
-    act?.gift ||
-    act?.asset ||
-    act?.data?.nft ||
-    act?.data?.gift ||
-    null
-  );
-}
-function extractAttrs(nft) {
-  let model = nft?.model || nft?.modelName || nft?.modelTitle || null;
-  let backdrop = nft?.backdrop || nft?.backdropName || null;
-
-  const attrs = nft?.attributes || nft?.attrs || nft?.nft?.attributes || null;
-  if (Array.isArray(attrs)) {
-    for (const a of attrs) {
-      const t = String(a?.type || a?.trait_type || '').toLowerCase();
-      if (!t) continue;
-      if (t === 'model') model = a.value;
-      else if (t === 'backdrop') backdrop = a.value;
-    }
-  } else if (attrs && typeof attrs === 'object') {
-    if (attrs.model) model = attrs.model;
-    if (attrs.backdrop) backdrop = attrs.backdrop;
-  }
-
-  return { model, backdrop };
-}
-
-async function portalHistoryEstimate({ collectionId, modelLower, backdropLower }) {
-  if (!process.env.PORTAL_AUTH) return { ok: false, median: null, count: 0 };
-
-  const key = `portal|hist|${collectionId || ''}|${modelLower || ''}|${backdropLower || ''}|target=${PORTAL_HISTORY_TARGET_SALES}`;
+async function throttledPortalFetch(url, opts) {
   const now = nowMs();
-  const cached = historyCache.get(key);
-  if (cached && now - cached.time < HISTORY_CACHE_TTL_MS) return cached;
-
-  const started = nowMs();
-  const prices = [];
-  let page = 0;
-
-  while (page < PORTAL_HISTORY_PAGES && prices.length < PORTAL_HISTORY_TARGET_SALES) {
-    if (nowMs() - started > PORTAL_HISTORY_TIME_BUDGET_MS) break;
-
-    const offset = page * PORTAL_HISTORY_LIMIT;
-
-    let url =
-      `${API_URL}market/actions/?offset=${offset}&limit=${PORTAL_HISTORY_LIMIT}` +
-      `&action_types=buy&sort_by=created_at+desc`;
-
-    if (collectionId) url += `&collection_ids=${encodeURIComponent(collectionId)}`;
-    if (modelLower) url += `&filter_by_models=${quotePlus(capWords(modelLower))}`;
-    if (backdropLower) url += `&filter_by_backdrops=${quotePlus(capWords(backdropLower))}`;
-
-    let res = await throttledPortalFetch(url, { method: 'GET', headers: portalHeaders() }).catch(() => null);
-
-    let serverFiltered = true;
-    if (res && !res.ok && res.status === 422) {
-      serverFiltered = false;
-      url =
-        `${API_URL}market/actions/?offset=${offset}&limit=${PORTAL_HISTORY_LIMIT}` +
-        `&action_types=buy&sort_by=created_at+desc`;
-      if (collectionId) url += `&collection_ids=${encodeURIComponent(collectionId)}`;
-      res = await throttledPortalFetch(url, { method: 'GET', headers: portalHeaders() }).catch(() => null);
-    }
-
-    if (!res || !res.ok) break;
-
-    const data = await res.json().catch(() => null);
-    const actions =
-      Array.isArray(data?.actions) ? data.actions :
-      Array.isArray(data?.items) ? data.items :
-      Array.isArray(data) ? data :
-      [];
-
-    if (!actions.length) break;
-
-    for (const act of actions) {
-      const amount = act?.amount ?? act?.price ?? act?.ton_amount ?? act?.tonAmount ?? act?.value ?? null;
-      const priceTon = n(amount);
-      if (!Number.isFinite(priceTon) || priceTon <= 0) continue;
-
-      if (!serverFiltered) {
-        const nft = extractActionNft(act);
-        if (!nft) continue;
-
-        if (collectionId) {
-          const actCollectionId =
-            nft?.collection_id || nft?.collectionId || nft?.collection?.id || nft?.collection?.collection_id || null;
-          if (actCollectionId && actCollectionId !== collectionId) continue;
-        }
-
-        const { model, backdrop } = extractAttrs(nft);
-        if (modelLower && !sameTrait(model, modelLower)) continue;
-        if (backdropLower && !sameTrait(backdrop, backdropLower)) continue;
-      }
-
-      prices.push(priceTon);
-      if (prices.length >= PORTAL_HISTORY_TARGET_SALES) break;
-    }
-
-    page++;
-    await sleep(PORTAL_HISTORY_PAGE_DELAY_MS);
+  const wait = portalNextAllowedAt - now;
+  if (wait > 0) await sleep(wait);
+  portalNextAllowedAt = nowMs() + PORTAL_THROTTLE_MS;
+  return fetch(url, opts);
+}
+async function portalProbe() {
+  if (!process.env.PORTAL_AUTH) {
+    return { ok: false, status: null, note: 'PORTAL_AUTH not set', bodyStart: '' };
   }
+  const url = `${API_URL}collections?limit=1`;
+  const res = await throttledPortalFetch(url, { method: 'GET', headers: portalHeaders() }).catch(() => null);
+  if (!res) return { ok: false, status: null, note: 'fetch error', bodyStart: '' };
 
-  prices.sort((a, b) => a - b);
+  const txt = await res.text().catch(() => '');
+  portalState.lastAt = nowMs();
+  portalState.lastStatus = res.status;
+  portalState.lastOk = res.ok;
+  portalState.lastBodyStart = txt.slice(0, 220);
 
-  const out = { ok: true, median: median(prices), count: prices.length, time: now };
-  historyCache.set(key, out);
-  return out;
+  return {
+    ok: res.ok,
+    status: res.status,
+    contentType: res.headers.get('content-type') || '',
+    bodyStart: txt.slice(0, 220),
+  };
 }
 
 // =====================
-// MRKT: saling (lots) with cursor
+// Satellite fetch
+// =====================
+async function throttledSatelliteFetch(url, opts) {
+  const now = nowMs();
+  const wait = satelliteNextAllowedAt - now;
+  if (wait > 0) await sleep(wait);
+  satelliteNextAllowedAt = nowMs() + SATELLITE_THROTTLE_MS;
+  return fetch(url, opts);
+}
+
+async function satelliteFetchJson(url) {
+  const res = await throttledSatelliteFetch(url, { method: 'GET' }).catch(() => null);
+  if (!res) return { ok: false, status: null, data: null, text: 'fetch error' };
+
+  const txt = await res.text().catch(() => '');
+  let data = null;
+  try {
+    data = txt ? JSON.parse(txt) : null;
+  } catch {
+    data = null;
+  }
+  return { ok: res.ok, status: res.status, data, text: txt };
+}
+
+async function satelliteProbe() {
+  if (!SATELLITE_ENABLED) return { ok: false, status: null, note: 'SATELLITE_DISABLED', bodyStart: '' };
+
+  const url = `${SATELLITE_BASE}/api/history/floors?market=PORTALS`;
+  const r = await satelliteFetchJson(url);
+  satelliteState.lastAt = nowMs();
+  satelliteState.lastStatus = r.status;
+  satelliteState.lastOk = r.ok;
+  satelliteState.lastBodyStart = (r.text || '').slice(0, 220);
+
+  return {
+    ok: r.ok,
+    status: r.status,
+    contentType: 'application/json',
+    bodyStart: (r.text || '').slice(0, 220),
+  };
+}
+
+// =====================
+// Satellite: Portal floors / model-floors
+// =====================
+let satPortalFloorsCache = { time: 0, data: null };
+const SAT_PORTAL_FLOORS_TTL_MS = 30_000;
+
+const satPortalModelsCache = new Map(); // giftDisplayLower -> { time, data }
+const SAT_PORTAL_MODELS_TTL_MS = 60_000;
+
+async function satPortalFloors() {
+  const now = nowMs();
+  if (satPortalFloorsCache.data && now - satPortalFloorsCache.time < SAT_PORTAL_FLOORS_TTL_MS) {
+    return satPortalFloorsCache.data;
+  }
+  if (!SATELLITE_ENABLED) return null;
+
+  const url = `${SATELLITE_BASE}/api/history/floors?market=PORTALS`;
+  const r = await satelliteFetchJson(url);
+  if (!r.ok || !r.data || typeof r.data !== 'object') return null;
+
+  // update catalog gifts
+  for (const name of Object.keys(r.data)) catalogPutGift(name);
+  scheduleSave();
+
+  satPortalFloorsCache = { time: now, data: r.data };
+  return r.data;
+}
+
+async function satPortalModelsFloors(collectionNameDisplay) {
+  const now = nowMs();
+  const giftKey = normGiftKey(collectionNameDisplay);
+  const cached = satPortalModelsCache.get(giftKey);
+  if (cached && now - cached.time < SAT_PORTAL_MODELS_TTL_MS) return cached.data;
+
+  if (!SATELLITE_ENABLED) return null;
+
+  const url = `${SATELLITE_BASE}/api/history/models-floors?collectionName=${encodeURIComponent(collectionNameDisplay)}&market=PORTALS`;
+  const r = await satelliteFetchJson(url);
+  if (!r.ok || !r.data || typeof r.data !== 'object') return null;
+
+  // update catalog models
+  for (const modelName of Object.keys(r.data)) catalogPutModel(giftKey, modelName);
+  scheduleSave();
+
+  satPortalModelsCache.set(giftKey, { time: now, data: r.data });
+  return r.data;
+}
+
+// =====================
+// Satellite: Tonnel search
+// =====================
+function getGiftDisplay(giftLower) {
+  if (!giftLower) return null;
+  return catalog.gifts.get(giftLower) || capWords(giftLower);
+}
+
+function pickMapValueCaseInsensitive(mapObj, key) {
+  if (!mapObj || typeof mapObj !== 'object' || !key) return null;
+  if (mapObj[key] != null) return mapObj[key];
+  const target = String(key).toLowerCase().trim();
+  for (const [k, v] of Object.entries(mapObj)) {
+    if (String(k).toLowerCase().trim() === target) return v;
+  }
+  return null;
+}
+
+async function satTonnelSearchLots({ giftLower, modelLower, backdropLower }, minPriceTon, maxPriceTon) {
+  if (!SATELLITE_ENABLED || !TONNEL_ENABLED) return { ok: false, reason: 'DISABLED', gifts: [] };
+  if (!giftLower) return { ok: false, reason: 'NO_GIFT', gifts: [] };
+
+  const giftDisplay = getGiftDisplay(giftLower);
+  const model = modelLower ? capWords(modelLower) : '';
+  const backdrop = backdropLower ? capWords(backdropLower) : '';
+
+  const url =
+    `${SATELLITE_BASE}/api/search/tonnel/${encodeURIComponent(giftDisplay)}` +
+    `?models=${encodeURIComponent(model)}` +
+    `&backdrops=${encodeURIComponent(backdrop)}` +
+    `&notMinted=0`;
+
+  const r = await satelliteFetchJson(url);
+
+  // Satellite может возвращать 500 "no results" вместо []
+  if (!r.ok) {
+    const msg = (r.data && r.data.message) ? String(r.data.message) : '';
+    if (r.status === 500 && msg.toLowerCase().includes('no results')) {
+      return { ok: true, reason: 'OK', gifts: [] };
+    }
+    return { ok: false, reason: `HTTP_${r.status}`, gifts: [] };
+  }
+
+  if (!Array.isArray(r.data)) return { ok: false, reason: 'BAD_FORMAT', gifts: [] };
+
+  const out = [];
+  for (const it of r.data) {
+    const priceBase = Number(it?.formattedPrice ?? it?.price);
+    if (!Number.isFinite(priceBase) || priceBase <= 0) continue;
+    if (!inRange(priceBase, minPriceTon, maxPriceTon)) continue;
+
+    const collectionName = it.collectionName || giftDisplay;
+    const slug = it.slug || null;
+    const giftId = it.giftId || null;
+
+    const modelName = it.model || null;
+    const backdropName = it.backdrop || null;
+    const symbolName = it.symbol || null;
+
+    // strict local filters
+    if (modelLower && normTraitName(modelName) !== normTraitName(modelLower)) continue;
+    if (backdropLower && normTraitName(backdropName) !== normTraitName(backdropLower)) continue;
+
+    const urlTelegram = slug ? `https://t.me/nft/${slug}` : (it.link || 'https://t.me/tonnel_network_bot');
+    const urlMarket = it.link || 'https://t.me/tonnel_network_bot';
+
+    out.push({
+      id: `tonnel_sat_${giftId || slug || Math.random()}`,
+      market: 'Tonnel',
+      name: slug ? `${collectionName} (${slug})` : collectionName,
+      baseName: collectionName,
+      priceTon: priceBase,
+      urlTelegram,
+      urlMarket,
+      attrs: { model: modelName, backdrop: backdropName, symbol: symbolName },
+      raw: it,
+    });
+
+    catalogRegisterGiftObj({ giftName: collectionName, model: modelName, backdrop: backdropName });
+  }
+
+  out.sort((a, b) => a.priceTon - b.priceTon);
+  scheduleSave();
+  return { ok: true, reason: 'OK', gifts: out.slice(0, MAX_PER_MARKET) };
+}
+
+// =====================
+// Portal floors via Satellite (for subscriptions/sellprice)
+// =====================
+async function satPortalFloorForFilters(giftLower, modelLower) {
+  const giftDisplay = getGiftDisplay(giftLower);
+  if (!giftDisplay) return null;
+
+  // model-specific
+  if (modelLower) {
+    const map = await satPortalModelsFloors(giftDisplay);
+    if (!map) return null;
+    const price = pickMapValueCaseInsensitive(map, capWords(modelLower));
+    return price != null ? Number(price) : null;
+  }
+
+  const floors = await satPortalFloors();
+  if (!floors) return null;
+  const price = pickMapValueCaseInsensitive(floors, giftDisplay);
+  return price != null ? Number(price) : null;
+}
+
+// =====================
+// MRKT auth helpers
+// =====================
+function mrktAuthHeader() {
+  const t = process.env.MRKT_AUTH;
+  if (!t) return null;
+  return t;
+}
+
+async function notifyMrktAuthExpired(statusCode) {
+  const now = nowMs();
+  if (now - mrktAuthState.lastNotifiedAt < MRKT_AUTH_NOTIFY_COOLDOWN_MS) return;
+
+  mrktAuthState.lastNotifiedAt = now;
+
+  const text =
+    `⚠️ MRKT токен не работает (HTTP ${statusCode}).\n` +
+    `Нужно обновить переменную MRKT_AUTH в Railway.`;
+
+  if (ADMIN_CHAT_ID && Number.isFinite(ADMIN_CHAT_ID)) {
+    try {
+      await sendMessageSafe(ADMIN_CHAT_ID, text, { disable_web_page_preview: true });
+      return;
+    } catch {}
+  }
+
+  for (const [uid] of users.entries()) {
+    try {
+      await sendMessageSafe(uid, text, { disable_web_page_preview: true });
+    } catch {}
+  }
+}
+
+function markMrktOk() {
+  mrktAuthState.ok = true;
+  mrktAuthState.lastOkAt = nowMs();
+}
+async function markMrktFailIfAuth(statusCode) {
+  mrktAuthState.ok = false;
+  mrktAuthState.lastFailAt = nowMs();
+  mrktAuthState.lastFailCode = statusCode;
+  if (statusCode === 401 || statusCode === 403) await notifyMrktAuthExpired(statusCode);
+}
+
+// =====================
+// MRKT: saling (lots)
 // =====================
 async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cursor }) {
   const auth = mrktAuthHeader();
@@ -1157,7 +799,6 @@ async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cu
   const data = await res.json().catch(() => null);
   const gifts = Array.isArray(data?.gifts) ? data.gifts : [];
   const nextCursor = data?.cursor || data?.nextCursor || '';
-
   return { ok: true, reason: 'OK', gifts, cursor: nextCursor };
 }
 
@@ -1166,7 +807,7 @@ async function mrktSearchByFilters({ giftLower, modelLower, backdropLower }, min
   if (!auth) return { ok: false, reason: 'NO_AUTH', gifts: [] };
   if (!giftLower) return { ok: false, reason: 'NO_GIFT', gifts: [] };
 
-  const collectionName = catalog.gifts.get(giftLower) || collectionsCache.byLowerName.get(giftLower)?.name || capWords(giftLower);
+  const collectionName = getGiftDisplay(giftLower);
   const modelName = modelLower ? capWords(modelLower) : null;
   const backdropName = backdropLower ? capWords(backdropLower) : null;
 
@@ -1195,8 +836,8 @@ async function mrktSearchByFilters({ giftLower, modelLower, backdropLower }, min
       const backdrop = g.backdropName || null;
       const symbol = g.symbolName || null;
 
-      if (modelLower && !sameTrait(model, modelLower)) continue;
-      if (backdropLower && !sameTrait(backdrop, backdropLower)) continue;
+      if (modelLower && normTraitName(model) !== normTraitName(modelLower)) continue;
+      if (backdropLower && normTraitName(backdrop) !== normTraitName(backdropLower)) continue;
 
       let urlTelegram = 'https://t.me/mrkt';
       if (g.name && String(g.name).includes('-')) urlTelegram = `https://t.me/nft/${g.name}`;
@@ -1229,7 +870,7 @@ async function mrktSearchByFilters({ giftLower, modelLower, backdropLower }, min
 }
 
 // =====================
-// MRKT: FEED (history + events)
+// MRKT feed (events) + sales history median
 // =====================
 async function mrktFeedFetch({ collectionName, modelName, backdropName, cursor, count, ordering = 'Latest', types = [] }) {
   const auth = mrktAuthHeader();
@@ -1274,13 +915,12 @@ async function mrktFeedFetch({ collectionName, modelName, backdropName, cursor, 
   return { ok: true, reason: 'OK', items, cursor: nextCursor };
 }
 
-// MRKT history sales: медиана
 async function mrktHistorySalesEstimate({ giftLower, modelLower, backdropLower }) {
   const auth = mrktAuthHeader();
   if (!auth) return { ok: false, reason: 'NO_AUTH', median: null, count: 0 };
   if (!giftLower) return { ok: false, reason: 'NO_GIFT', median: null, count: 0 };
 
-  const collectionName = catalog.gifts.get(giftLower) || collectionsCache.byLowerName.get(giftLower)?.name || capWords(giftLower);
+  const collectionName = getGiftDisplay(giftLower);
   const modelName = modelLower ? capWords(modelLower) : null;
   const backdropName = backdropLower ? capWords(backdropLower) : null;
 
@@ -1324,11 +964,11 @@ async function mrktHistorySalesEstimate({ giftLower, modelLower, backdropLower }
 
       if (modelLower) {
         const m = g.modelTitle || g.modelName || null;
-        if (!sameTrait(m, modelLower)) continue;
+        if (normTraitName(m) !== normTraitName(modelLower)) continue;
       }
       if (backdropLower) {
         const b = g.backdropName || null;
-        if (!sameTrait(b, backdropLower)) continue;
+        if (normTraitName(b) !== normTraitName(backdropLower)) continue;
       }
 
       const amountNano = item?.amount ?? g?.salePrice ?? null;
@@ -1347,225 +987,13 @@ async function mrktHistorySalesEstimate({ giftLower, modelLower, backdropLower }
   }
 
   prices.sort((a, b) => a - b);
-
   const out = { ok: true, reason: 'OK', median: median(prices), count: prices.length, time: now };
   historyCache.set(key, out);
   return out;
 }
 
 // =====================
-// TONNEL: pageGifts (lots)
-// =====================
-async function tonnelFetchPageGifts({ giftLower, modelLower, backdropLower, minPriceTon, maxPriceTon, page, limit, sortObj }) {
-  if (!TONNEL_ENABLED) return { ok: false, reason: 'DISABLED', items: [] };
-  if (!TONNEL_USER_AUTH) return { ok: false, reason: 'NO_AUTH', items: [] };
-
-  const filterObj = {
-    price: { $exists: true },
-    buyer: { $exists: false },
-    asset: 'TON',
-  };
-
-  // gift name
-  if (giftLower) {
-    const fixed = tonnelGiftNameFix(giftLower);
-    if (fixed) filterObj.gift_name = fixed;
-  }
-
-  // model/backdrop regex to match "Cyberpunk (0%)"
-  if (modelLower) {
-    const rx = tonnelRegexStartsWithTitle(modelLower);
-    if (rx) filterObj.model = { $regex: rx };
-  }
-  if (backdropLower) {
-    const rx = tonnelRegexStartsWithTitle(backdropLower);
-    if (rx) filterObj.backdrop = { $regex: rx };
-  }
-
-  // optional price range: if you want, set it via env later
-  // payload.price_range is null in your captured payload
-  const body = {
-    page: page || 1,
-    limit: limit || TONNEL_LIMIT,
-    sort: JSON.stringify(sortObj || { message_post_time: -1, gift_id: -1 }),
-    filter: JSON.stringify(filterObj),
-    price_range: null,
-    ref: 0,
-    user_auth: TONNEL_USER_AUTH,
-  };
-
-  const url = 'https://gifts2.tonnel.network/api/pageGifts';
-  const res = await throttledTonnelFetch(url, { method: 'POST', headers: tonnelHeaders(), body: JSON.stringify(body) }).catch(() => null);
-  if (!res) return { ok: false, reason: 'FETCH_ERROR', items: [] };
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    tonnelState.lastAt = nowMs();
-    tonnelState.lastStatus = res.status;
-    tonnelState.lastOk = false;
-    tonnelState.lastBodyStart = txt.slice(0, 220);
-    return { ok: false, reason: `HTTP_${res.status}`, items: [] };
-  }
-
-  const data = await res.json().catch(() => null);
-  if (!Array.isArray(data)) return { ok: false, reason: 'BAD_FORMAT', items: [] };
-
-  // filter by min/max locally
-  const items = [];
-  for (const it of data) {
-    const priceTon = Number(it?.price);
-    if (!Number.isFinite(priceTon) || priceTon <= 0) continue;
-    if (!inRange(priceTon, minPriceTon, maxPriceTon)) continue;
-    items.push(it);
-  }
-  return { ok: true, reason: 'OK', items };
-}
-
-async function tonnelSearchByFilters({ giftLower, modelLower, backdropLower }, minPriceTonLocal, maxPriceTonLocal) {
-  if (!TONNEL_ENABLED) return { ok: false, reason: 'DISABLED', gifts: [] };
-  if (!TONNEL_USER_AUTH) return { ok: false, reason: 'NO_AUTH', gifts: [] };
-  if (!giftLower) return { ok: false, reason: 'NO_GIFT', gifts: [] };
-
-  const out = [];
-
-  for (let p = 1; p <= TONNEL_PAGES; p++) {
-    const r = await tonnelFetchPageGifts({
-      giftLower,
-      modelLower,
-      backdropLower,
-      minPriceTon: minPriceTonLocal,
-      maxPriceTon: maxPriceTonLocal,
-      page: p,
-      limit: TONNEL_LIMIT,
-      sortObj: { price: 1, gift_id: -1 }, // самый дешёвый вперёд
-    });
-
-    if (!r.ok) return { ok: false, reason: r.reason, gifts: [] };
-
-    for (const it of r.items) {
-      const priceTon = Number(it.price);
-      if (!Number.isFinite(priceTon) || priceTon <= 0) continue;
-
-      const baseName = it.name || it.gift_name || 'Gift';
-      const number = it.gift_num ?? null;
-      const displayName = number != null ? `${baseName} #${number}` : baseName;
-
-      const model = it.model || null;
-      const backdrop = it.backdrop || null;
-      const symbol = it.symbol || null;
-
-      // safety local filter by trait (because regex is best-effort)
-      if (modelLower && !sameTrait(model, modelLower)) continue;
-      if (backdropLower && !sameTrait(backdrop, backdropLower)) continue;
-
-      const urlTelegram = tonnelTgUrlFromNameNum(baseName, number);
-      const urlMarket = 'https://t.me/Tonnel_Network_bot'; // пока без точного deep-link
-
-      out.push({
-        id: `tonnel_${it.gift_id || it.gift_num || Math.random()}`,
-        market: 'Tonnel',
-        name: displayName,
-        baseName,
-        priceTon,
-        urlTelegram,
-        urlMarket,
-        attrs: { model, backdrop, symbol },
-        raw: it,
-      });
-
-      catalogRegisterGiftObj({ giftName: baseName, model, backdrop });
-    }
-
-    if (!r.items.length) break;
-    if (out.length >= MAX_PER_MARKET) break;
-  }
-
-  out.sort((a, b) => a.priceTon - b.priceTon);
-  scheduleSave();
-  return { ok: true, reason: 'OK', gifts: out.slice(0, MAX_PER_MARKET) };
-}
-
-// =====================
-// TONNEL: saleHistory median (history)
-// =====================
-async function tonnelSaleHistoryMedian({ giftLower, modelLower, backdropLower }) {
-  if (!TONNEL_ENABLED) return { ok: false, reason: 'DISABLED', median: null, count: 0 };
-  if (!TONNEL_AUTHDATA) return { ok: false, reason: 'NO_AUTH', median: null, count: 0 };
-  if (!giftLower) return { ok: false, reason: 'NO_GIFT', median: null, count: 0 };
-
-  const giftName = tonnelGiftNameFix(giftLower);
-
-  const key = `tonnel|hist|${giftName}|${modelLower || ''}|${backdropLower || ''}|target=${TONNEL_HISTORY_TARGET_SALES}`;
-  const now = nowMs();
-  const cached = historyCache.get(key);
-  if (cached && now - cached.time < HISTORY_CACHE_TTL_MS) return cached;
-
-  const started = nowMs();
-  const prices = [];
-  let page = 1;
-
-  while (page <= TONNEL_HISTORY_PAGES && prices.length < TONNEL_HISTORY_TARGET_SALES) {
-    if (nowMs() - started > TONNEL_HISTORY_TIME_BUDGET_MS) break;
-
-    const filter = { gift_name: giftName };
-    if (modelLower) {
-      const rx = tonnelRegexStartsWithTitle(modelLower);
-      if (rx) filter.model = { $regex: rx };
-    }
-    if (backdropLower) {
-      const rx = tonnelRegexStartsWithTitle(backdropLower);
-      if (rx) filter.backdrop = { $regex: rx };
-    }
-
-    const body = {
-      authData: TONNEL_AUTHDATA,
-      page,
-      limit: TONNEL_HISTORY_LIMIT,
-      type: 'ALL',
-      filter,
-      sort: { timestamp: -1, gift_id: -1 },
-    };
-
-    const url = 'https://gifts2.tonnel.network/api/saleHistory';
-    const res = await throttledTonnelFetch(url, { method: 'POST', headers: tonnelHeaders(), body: JSON.stringify(body) }).catch(() => null);
-    if (!res) return { ok: false, reason: 'FETCH_ERROR', median: null, count: 0 };
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      tonnelState.lastAt = nowMs();
-      tonnelState.lastStatus = res.status;
-      tonnelState.lastOk = false;
-      tonnelState.lastBodyStart = txt.slice(0, 220);
-      return { ok: false, reason: `HTTP_${res.status}`, median: null, count: 0 };
-    }
-
-    const data = await res.json().catch(() => null);
-    if (!Array.isArray(data) || !data.length) break;
-
-    for (const it of data) {
-      const price = Number(it?.price);
-      if (!Number.isFinite(price) || price <= 0) continue;
-
-      // strict trait match locally too
-      if (modelLower && !sameTrait(it?.model, modelLower)) continue;
-      if (backdropLower && !sameTrait(it?.backdrop, backdropLower)) continue;
-
-      prices.push(price);
-      if (prices.length >= TONNEL_HISTORY_TARGET_SALES) break;
-    }
-
-    page++;
-    await sleep(120);
-  }
-
-  prices.sort((a, b) => a - b);
-  const out = { ok: true, reason: 'OK', median: median(prices), count: prices.length, time: now };
-  historyCache.set(key, out);
-  return out;
-}
-
-// =====================
-// Notifications (link bottom, preview ON)
+// Notifications (link at bottom, preview ON)
 // =====================
 async function sendDeal(userId, gift) {
   const lines = [];
@@ -1575,13 +1003,12 @@ async function sendDeal(userId, gift) {
   if (gift.attrs?.symbol) lines.push(`Symbol: ${gift.attrs.symbol}`);
   if (gift.attrs?.backdrop) lines.push(`Backdrop: ${gift.attrs.backdrop}`);
   lines.push(`Market: ${gift.market}`);
-
   if (gift.urlTelegram) lines.push(gift.urlTelegram);
 
   const btnText =
-    gift.market === 'Portal' ? 'Открыть Portal' :
     gift.market === 'MRKT' ? 'Открыть MRKT' :
-    'Открыть Tonnel';
+    gift.market === 'Tonnel' ? 'Открыть Tonnel' :
+    'Открыть Portal';
 
   const reply_markup = gift.urlMarket
     ? { inline_keyboard: [[{ text: btnText, url: gift.urlMarket }]] }
@@ -1602,55 +1029,39 @@ async function sendSellPriceForUser(chatId, user) {
   const modelLower = user.filters.models[0] || null;
   const backdropLower = user.filters.backdrops[0] || null;
 
-  const giftName =
-    catalog.gifts.get(giftLower) ||
-    collectionsCache.byLowerName.get(giftLower)?.name ||
-    capWords(giftLower);
+  const giftName = getGiftDisplay(giftLower);
 
   let text = 'Оценка цен продажи:\n\n';
   text += `Подарок: ${giftName}\n`;
   text += `Модель: ${modelLower ? capWords(modelLower) : 'любая'}\n`;
   text += `Фон: ${backdropLower ? capWords(backdropLower) : 'любой'}\n\n`;
 
-  // Portal
-  if ((user.filters.markets || []).includes('Portal')) {
-    const r = await portalSearchByFilters({ giftLower, modelLower, backdropLower, minPriceTon: null, maxPriceTon: null });
+  const markets = user.filters.markets || [];
 
-    if (r.ok && r.gifts.length) {
-      const best = r.gifts[0];
-      const net = best.priceTon * (1 - PORTAL_FEE);
-      text += `Portal:\n`;
-      text += `  ~${best.priceTon.toFixed(3)} TON (флор)\n`;
+  // Portal (через Satellite floors)
+  if (markets.includes('Portal')) {
+    const floor = await satPortalFloorForFilters(giftLower, modelLower);
+    if (floor != null && Number.isFinite(floor)) {
+      const net = floor * (1 - PORTAL_FEE);
+      text += `Portal (кэш Satellite):\n`;
+      text += `  ~${Number(floor).toFixed(3)} TON (floor)\n`;
       text += `  Чистыми после комиссии ${(PORTAL_FEE * 100).toFixed(1)}%: ~${net.toFixed(3)} TON\n`;
-    } else if (r.ok) {
-      text += `Portal: активных лотов по этим фильтрам нет\n`;
-      if (r.collectionId) {
-        const h = await portalHistoryEstimate({ collectionId: r.collectionId, modelLower, backdropLower });
-        if (h.ok && h.median != null) {
-          text += `Portal (история продаж): ~${h.median.toFixed(3)} TON (n=${h.count})\n`;
-        } else {
-          text += `Portal (история продаж): нет данных\n`;
-        }
-      } else {
-        text += `Portal (история продаж): нет collection_id\n`;
-      }
     } else {
-      text += `Portal: ошибка (${r.reason})\n`;
+      text += `Portal (кэш Satellite): нет данных\n`;
     }
   }
 
   // MRKT
-  if ((user.filters.markets || []).includes('MRKT')) {
+  if (markets.includes('MRKT')) {
     const r = await mrktSearchByFilters({ giftLower, modelLower, backdropLower }, null, null);
-
     if (r.ok && r.gifts.length) {
       const best = r.gifts[0];
       const net = best.priceTon * (1 - MRKT_FEE);
       text += `\nMRKT:\n`;
-      text += `  ~${best.priceTon.toFixed(3)} TON (флор)\n`;
+      text += `  ~${best.priceTon.toFixed(3)} TON (floor)\n`;
       text += `  Комиссия ${(MRKT_FEE * 100).toFixed(1)}%: ~${net.toFixed(3)} TON чистыми\n`;
     } else if (r.ok) {
-      text += `\nMRKT: активных лотов по этим фильтрам нет\n`;
+      text += `\nMRKT: активных лотов нет\n`;
       const hs = await mrktHistorySalesEstimate({ giftLower, modelLower, backdropLower });
       if (hs.ok && hs.median != null) {
         text += `MRKT (история продаж): ~${hs.median.toFixed(3)} TON (n=${hs.count})\n`;
@@ -1662,24 +1073,17 @@ async function sendSellPriceForUser(chatId, user) {
     }
   }
 
-  // TONNEL
-  if ((user.filters.markets || []).includes('Tonnel')) {
-    const r = await tonnelSearchByFilters({ giftLower, modelLower, backdropLower }, null, null);
-
+  // TONNEL (через Satellite search) — берём минимальную цену из текущих лотов
+  if (markets.includes('Tonnel')) {
+    const r = await satTonnelSearchLots({ giftLower, modelLower, backdropLower }, null, null);
     if (r.ok && r.gifts.length) {
       const best = r.gifts[0];
-      text += `\nTonnel:\n`;
-      text += `  ~${best.priceTon.toFixed(3)} TON (флор)\n`;
+      text += `\nTonnel (Satellite):\n`;
+      text += `  ~${best.priceTon.toFixed(3)} TON (минимальный активный лот)\n`;
     } else if (r.ok) {
-      text += `\nTonnel: активных лотов по этим фильтрам нет\n`;
-      const hs = await tonnelSaleHistoryMedian({ giftLower, modelLower, backdropLower });
-      if (hs.ok && hs.median != null) {
-        text += `Tonnel (история продаж): ~${hs.median.toFixed(3)} TON (n=${hs.count})\n`;
-      } else {
-        text += `Tonnel (история продаж): нет данных (${hs.reason || 'unknown'})\n`;
-      }
+      text += `\nTonnel (Satellite): активных лотов нет\n`;
     } else {
-      text += `\nTonnel: ошибка (${r.reason})\n`;
+      text += `\nTonnel (Satellite): ошибка (${r.reason})\n`;
     }
   }
 
@@ -1695,7 +1099,7 @@ function formatMarkets(markets) {
 }
 
 function formatSubTitle(sub) {
-  const gift = catalog.gifts.get(sub.filters.gift) || collectionsCache.byLowerName.get(sub.filters.gift)?.name || capWords(sub.filters.gift);
+  const gift = getGiftDisplay(sub.filters.gift);
   const model = sub.filters.model ? capWords(sub.filters.model) : 'Любая';
   const backdrop = sub.filters.backdrop ? capWords(sub.filters.backdrop) : 'Любой';
   const markets = formatMarkets(sub.filters.markets || []);
@@ -1762,7 +1166,7 @@ function makeSubFromCurrentFilters(user) {
 }
 
 async function notifySubFloor(userId, sub, market, prevFloor, newFloor, lot) {
-  const gift = catalog.gifts.get(sub.filters.gift) || collectionsCache.byLowerName.get(sub.filters.gift)?.name || capWords(sub.filters.gift);
+  const gift = getGiftDisplay(sub.filters.gift);
 
   let text = `${gift}\n`;
   if (prevFloor == null) {
@@ -1820,13 +1224,22 @@ async function notifySubMrktEvent(userId, sub, item) {
 
 async function getFloorForSub(market, sub) {
   const giftLower = sub.filters.gift;
-  const modelLower = sub.filters.model ? norm(sub.filters.model) : null;
-  const backdropLower = sub.filters.backdrop ? norm(sub.filters.backdrop) : null;
+  const modelLower = sub.filters.model ? normTraitName(sub.filters.model) : null;
+  const backdropLower = sub.filters.backdrop ? normTraitName(sub.filters.backdrop) : null;
 
   if (market === 'Portal') {
-    const r = await portalSearchByFilters({ giftLower, modelLower, backdropLower, minPriceTon: null, maxPriceTon: null });
-    if (!r.ok) return { ok: false };
-    return { ok: true, lot: r.gifts[0] || null };
+    // Portal CF-blocked -> use Satellite floor cache
+    const floor = await satPortalFloorForFilters(giftLower, modelLower);
+    if (floor == null || !Number.isFinite(floor)) return { ok: true, lot: null };
+    return {
+      ok: true,
+      lot: {
+        market: 'Portal',
+        priceTon: Number(floor),
+        urlTelegram: 'https://t.me/portals',
+        urlMarket: 'https://t.me/portals',
+      },
+    };
   }
 
   if (market === 'MRKT') {
@@ -1836,7 +1249,7 @@ async function getFloorForSub(market, sub) {
   }
 
   if (market === 'Tonnel') {
-    const r = await tonnelSearchByFilters({ giftLower, modelLower, backdropLower }, null, null);
+    const r = await satTonnelSearchLots({ giftLower, modelLower, backdropLower }, null, null);
     if (!r.ok) return { ok: false };
     return { ok: true, lot: r.gifts[0] || null };
   }
@@ -1844,17 +1257,59 @@ async function getFloorForSub(market, sub) {
   return { ok: false };
 }
 
+async function mrktFeedFetch({ collectionName, modelName, backdropName, cursor, count, ordering = 'Latest', types = [] }) {
+  const auth = mrktAuthHeader();
+  if (!auth) return { ok: false, reason: 'NO_AUTH', items: [], cursor: null };
+
+  const body = {
+    count: Number(count || MRKT_FEED_COUNT),
+    cursor: cursor || '',
+    collectionNames: collectionName ? [collectionName] : [],
+    modelNames: modelName ? [modelName] : [],
+    backdropNames: backdropName ? [backdropName] : [],
+    lowToHigh: false,
+    maxPrice: null,
+    minPrice: null,
+    number: null,
+    ordering: ordering || 'Latest',
+    query: null,
+    type: Array.isArray(types) ? types : [],
+  };
+
+  const res = await fetch(`${MRKT_API_URL}/feed`, {
+    method: 'POST',
+    headers: {
+      Authorization: auth,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(body),
+  }).catch(() => null);
+
+  if (!res) return { ok: false, reason: 'FETCH_ERROR', items: [], cursor: null };
+  if (!res.ok) {
+    await markMrktFailIfAuth(res.status);
+    return { ok: false, reason: `HTTP_${res.status}`, items: [], cursor: null };
+  }
+
+  markMrktOk();
+
+  const data = await res.json().catch(() => null);
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const nextCursor = data?.cursor || data?.nextCursor || '';
+  return { ok: true, reason: 'OK', items, cursor: nextCursor };
+}
+
 async function processMrktFeedForSub(userId, sub, stateKey, budgetEvents) {
   if (budgetEvents <= 0) return 0;
-
   const auth = mrktAuthHeader();
   if (!auth) return 0;
 
   const giftLower = sub.filters.gift;
-  const modelLower = sub.filters.model ? norm(sub.filters.model) : null;
-  const backdropLower = sub.filters.backdrop ? norm(sub.filters.backdrop) : null;
+  const modelLower = sub.filters.model ? normTraitName(sub.filters.model) : null;
+  const backdropLower = sub.filters.backdrop ? normTraitName(sub.filters.backdrop) : null;
 
-  const collectionName = catalog.gifts.get(giftLower) || collectionsCache.byLowerName.get(giftLower)?.name || capWords(giftLower);
+  const collectionName = getGiftDisplay(giftLower);
   const modelName = modelLower ? capWords(modelLower) : null;
   const backdropName = backdropLower ? capWords(backdropLower) : null;
 
@@ -1870,8 +1325,7 @@ async function processMrktFeedForSub(userId, sub, stateKey, budgetEvents) {
     types: [],
   });
 
-  if (!r.ok) return 0;
-  if (!r.items.length) return 0;
+  if (!r.ok || !r.items.length) return 0;
 
   const latestId = r.items[0]?.id || null;
   if (!latestId) return 0;
@@ -2011,31 +1465,25 @@ async function checkMarketsForAllUsers() {
       const giftLower = user.filters.gifts[0];
       const modelLower = user.filters.models[0] || null;
       const backdropLower = user.filters.backdrops[0] || null;
-      const markets = user.filters.markets || ['MRKT'];
+      const markets = user.filters.markets || [];
 
       const minP = user.minPriceTon != null ? Number(user.minPriceTon) : 0;
       const maxP = Number(user.maxPriceTon);
 
-      const promises = [];
-
-      if (markets.includes('Portal')) {
-        promises.push(portalSearchByFilters({ giftLower, modelLower, backdropLower, minPriceTon: minP, maxPriceTon: maxP }));
-      } else promises.push(Promise.resolve(null));
+      const found = [];
 
       if (markets.includes('MRKT') && mrktAuthHeader()) {
-        promises.push(mrktSearchByFilters({ giftLower, modelLower, backdropLower }, minP, maxP));
-      } else promises.push(Promise.resolve(null));
+        const r = await mrktSearchByFilters({ giftLower, modelLower, backdropLower }, minP, maxP);
+        if (r.ok && r.gifts?.length) found.push(...r.gifts);
+      }
 
       if (markets.includes('Tonnel')) {
-        promises.push(tonnelSearchByFilters({ giftLower, modelLower, backdropLower }, minP, maxP));
-      } else promises.push(Promise.resolve(null));
+        const r = await satTonnelSearchLots({ giftLower, modelLower, backdropLower }, minP, maxP);
+        if (r.ok && r.gifts?.length) found.push(...r.gifts);
+      }
 
-      const [portalRes, mrktRes, tonnelRes] = await Promise.all(promises);
-
-      const found = [];
-      if (portalRes?.ok && portalRes.gifts?.length) found.push(...portalRes.gifts);
-      if (mrktRes?.ok && mrktRes.gifts?.length) found.push(...mrktRes.gifts);
-      if (tonnelRes?.ok && tonnelRes.gifts?.length) found.push(...tonnelRes.gifts);
+      // Portal direct search сейчас блокируется Cloudflare — лоты не ловим.
+      // Portal остаётся в подписках и sellprice через Satellite floors.
 
       found.sort((a, b) => a.priceTon - b.priceTon);
 
@@ -2066,13 +1514,16 @@ async function checkMarketsForAllUsers() {
 // =====================
 bot.onText(/^\/start\b/, async (msg) => {
   getOrCreateUser(msg.from.id);
-  await portalCollections(200).catch(() => {});
   await sendMessageSafe(msg.chat.id, 'Бот запущен.', { reply_markup: MAIN_KEYBOARD });
+});
+
+bot.onText(/^\/sellprice\b/, async (msg) => {
+  const user = getOrCreateUser(msg.from.id);
+  await sendSellPriceForUser(msg.chat.id, user);
 });
 
 bot.onText(/^\/status\b/, async (msg) => {
   const user = getOrCreateUser(msg.from.id);
-  await portalCollections(200).catch(() => {});
   const text =
     `Настройки:\n` +
     `• Мониторинг: ${user.enabled ? 'ON' : 'OFF'}\n` +
@@ -2086,18 +1537,9 @@ bot.onText(/^\/status\b/, async (msg) => {
     `API:\n` +
     `• Portal auth: ${process.env.PORTAL_AUTH ? '✅' : '❌'}\n` +
     `• MRKT auth: ${process.env.MRKT_AUTH ? '✅' : '❌'}\n` +
-    `• MRKT last ok: ${mrktAuthState.lastOkAt ? new Date(mrktAuthState.lastOkAt).toLocaleString() : '-'}\n` +
-    `• MRKT last fail: ${mrktAuthState.lastFailAt ? `HTTP ${mrktAuthState.lastFailCode} @ ${new Date(mrktAuthState.lastFailAt).toLocaleString()}` : '-'}\n` +
-    `• Tonnel enabled: ${TONNEL_ENABLED ? '✅' : '❌'}\n` +
-    `• Tonnel auth: ${TONNEL_USER_AUTH ? '✅' : '❌'}\n` +
+    `• Tonnel via Satellite: ${(SATELLITE_ENABLED && TONNEL_ENABLED) ? '✅' : '❌'}\n` +
     `• Redis: ${redis ? '✅' : '❌'}\n`;
   await sendMessageSafe(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
-});
-
-bot.onText(/^\/sellprice\b/, async (msg) => {
-  const user = getOrCreateUser(msg.from.id);
-  await portalCollections(200).catch(() => {});
-  await sendSellPriceForUser(msg.chat.id, user);
 });
 
 // =====================
@@ -2113,37 +1555,9 @@ bot.on('message', async (msg) => {
 
   const user = getOrCreateUser(userId);
   const t = text.trim();
-  const q = norm(t);
+  const q = normGiftKey(t);
 
-  // ===== free manual states (work even when Portal is down) =====
-  if (user.state === 'awaiting_gift_free') {
-    user.state = null;
-    if (!q) return sendMessageSafe(chatId, 'Пусто. Напиши название подарка.', { reply_markup: MAIN_KEYBOARD });
-    user.filters.gifts = [q];
-    user.filters.models = [];
-    user.filters.backdrops = [];
-    clearUserSentDeals(userId);
-    scheduleSave();
-    return sendMessageSafe(chatId, `Ок. Подарок: ${capWords(q)}`, { reply_markup: MAIN_KEYBOARD });
-  }
-  if (user.state === 'awaiting_model_free') {
-    user.state = null;
-    if (!q) return sendMessageSafe(chatId, 'Пусто. Напиши название модели.', { reply_markup: MAIN_KEYBOARD });
-    user.filters.models = [q];
-    clearUserSentDeals(userId);
-    scheduleSave();
-    return sendMessageSafe(chatId, `Ок. Модель: ${capWords(q)}`, { reply_markup: MAIN_KEYBOARD });
-  }
-  if (user.state === 'awaiting_backdrop_free') {
-    user.state = null;
-    if (!q) return sendMessageSafe(chatId, 'Пусто. Напиши название фона.', { reply_markup: MAIN_KEYBOARD });
-    user.filters.backdrops = [q];
-    clearUserSentDeals(userId);
-    scheduleSave();
-    return sendMessageSafe(chatId, `Ок. Фон: ${capWords(q)}`, { reply_markup: MAIN_KEYBOARD });
-  }
-
-  // ===== existing states =====
+  // states
   if (user.state === 'awaiting_max') {
     const v = n(t);
     if (!Number.isFinite(v) || v <= 0) return sendMessageSafe(chatId, 'Введи MAX TON (пример: 12)', { reply_markup: MAIN_KEYBOARD });
@@ -2164,99 +1578,38 @@ bot.on('message', async (msg) => {
     return sendMessageSafe(chatId, `Ок. MIN: ${user.minPriceTon.toFixed(3)} TON`, { reply_markup: MAIN_KEYBOARD });
   }
 
-  if (user.state === 'awaiting_gift_search') {
+  if (user.state === 'awaiting_gift_free') {
     user.state = null;
+    if (!q) return sendMessageSafe(chatId, 'Пусто. Напиши название подарка.', { reply_markup: MAIN_KEYBOARD });
+    user.filters.gifts = [q];
+    user.filters.models = [];
+    user.filters.backdrops = [];
+    catalogPutGift(capWords(q));
+    clearUserSentDeals(userId);
     scheduleSave();
-
-    // try Portal list
-    const { byLowerName } = await portalCollections(400);
-    const portalNames = Array.from(byLowerName.values()).map((x) => x.name);
-
-    // merge with catalog
-    const catalogNames = Array.from(catalog.gifts.values());
-
-    const all = [...new Set([...portalNames, ...catalogNames])];
-    const matched = all.filter((name) => String(name).toLowerCase().includes(q)).sort().slice(0, MAX_SEARCH_RESULTS);
-
-    if (!matched.length) {
-      return sendMessageSafe(
-        chatId,
-        'Ничего не нашёл по этому запросу.\nЕсли Portal заблокирован — напиши название подарка вручную (я запомню).',
-        { reply_markup: MAIN_KEYBOARD }
-      );
-    }
-
-    return sendMessageSafe(chatId, 'Нашёл подарки, выбери:', {
-      reply_markup: { inline_keyboard: matched.map((name) => [{ text: shorten(name, 32), callback_data: `set_gift:${name}` }]) },
-    });
+    return sendMessageSafe(chatId, `Ок. Подарок: ${capWords(q)}`, { reply_markup: MAIN_KEYBOARD });
   }
 
-  if (user.state === 'awaiting_model_search') {
+  if (user.state === 'awaiting_model_free') {
     user.state = null;
+    if (!q) return sendMessageSafe(chatId, 'Пусто. Напиши модель.', { reply_markup: MAIN_KEYBOARD });
+    user.filters.models = [q];
+    const gl = user.filters.gifts[0];
+    if (gl) catalogPutModel(gl, capWords(q));
+    clearUserSentDeals(userId);
     scheduleSave();
-    if (!user.filters.gifts.length) return sendMessageSafe(chatId, 'Сначала выбери подарок.', { reply_markup: MAIN_KEYBOARD });
-
-    const giftLower = user.filters.gifts[0];
-
-    // try portal filters
-    const col = collectionsCache.byLowerName.get(giftLower);
-    const shortName = portalShortName(col?.raw);
-    const f = await portalCollectionFilters(shortName);
-
-    let candidates = [];
-    if (f) {
-      const traits = extractModelTraits(f.models);
-      candidates = traits.map((m) => m.name);
-    } else {
-      // fallback from catalog
-      const m = catalog.modelsByGift.get(giftLower);
-      if (m) candidates = Array.from(m.values());
-    }
-
-    const matched = candidates.filter((name) => String(name).toLowerCase().includes(q)).slice(0, MAX_SEARCH_RESULTS);
-    if (!matched.length) {
-      user.state = 'awaiting_model_free';
-      scheduleSave();
-      return sendMessageSafe(chatId, 'Модель не найдена в списках.\nВведи модель вручную (например: Cyberpunk):', { reply_markup: MAIN_KEYBOARD });
-    }
-
-    const inline_keyboard = matched.map((name) => [{ text: shorten(name, 32), callback_data: `set_model:${name}` }]);
-    return sendMessageSafe(chatId, 'Выбери модель:', { reply_markup: { inline_keyboard } });
+    return sendMessageSafe(chatId, `Ок. Модель: ${capWords(q)}`, { reply_markup: MAIN_KEYBOARD });
   }
 
-  if (user.state === 'awaiting_backdrop_search') {
+  if (user.state === 'awaiting_backdrop_free') {
     user.state = null;
+    if (!q) return sendMessageSafe(chatId, 'Пусто. Напиши фон.', { reply_markup: MAIN_KEYBOARD });
+    user.filters.backdrops = [q];
+    const gl = user.filters.gifts[0];
+    if (gl) catalogPutBackdrop(gl, capWords(q));
+    clearUserSentDeals(userId);
     scheduleSave();
-    if (!user.filters.gifts.length) return sendMessageSafe(chatId, 'Сначала выбери подарок.', { reply_markup: MAIN_KEYBOARD });
-
-    const giftLower = user.filters.gifts[0];
-
-    // try portal filters
-    const col = collectionsCache.byLowerName.get(giftLower);
-    const shortName = portalShortName(col?.raw);
-    const f = await portalCollectionFilters(shortName);
-
-    let candidates = [];
-    if (f) {
-      const backdrops = Array.isArray(f.backdrops)
-        ? f.backdrops.map((x) => (typeof x === 'string' ? x : x?.name || x?.value || x?.title || '')).filter(Boolean)
-        : Object.keys(f.backdrops || {});
-      candidates = backdrops;
-    } else {
-      const m = catalog.backdropsByGift.get(giftLower);
-      if (m) candidates = Array.from(m.values());
-    }
-
-    const matched = candidates.filter((b) => String(b).toLowerCase().includes(q)).sort().slice(0, MAX_SEARCH_RESULTS);
-    if (!matched.length) {
-      user.state = 'awaiting_backdrop_free';
-      scheduleSave();
-      return sendMessageSafe(chatId, 'Фон не найден в списках.\nВведи фон вручную (например: Electric Purple):', { reply_markup: MAIN_KEYBOARD });
-    }
-
-    return sendMessageSafe(chatId, 'Выбери фон:', {
-      reply_markup: { inline_keyboard: matched.map((name) => [{ text: shorten(name, 32), callback_data: `set_backdrop:${name}` }]) },
-    });
+    return sendMessageSafe(chatId, `Ок. Фон: ${capWords(q)}`, { reply_markup: MAIN_KEYBOARD });
   }
 
   if (typeof user.state === 'string' && user.state.startsWith('awaiting_sub_max:')) {
@@ -2292,14 +1645,49 @@ bot.on('message', async (msg) => {
     return sendMessageSafe(chatId, 'Введи MIN TON (0 = убрать):', { reply_markup: MAIN_KEYBOARD });
   }
   if (t === '💸 Цена подарка') {
-    await portalCollections(200).catch(() => {});
     return sendSellPriceForUser(chatId, user);
   }
   if (t === '📡 Подписки') return showSubsMenu(chatId);
 
   if (t === '📌 Статус API') {
     const p = await portalProbe();
-    const tn = await tonnelProbe();
+    const s = await satelliteProbe();
+
+    // tonnel direct probe (optional)
+    let tn = { ok: false, status: null, contentType: '', bodyStart: '' };
+    if (TONNEL_DIRECT_ENABLED && TONNEL_USER_AUTH) {
+      const url = 'https://gifts2.tonnel.network/api/pageGifts';
+      const headers = {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        origin: TONNEL_ORIGIN,
+        referer: TONNEL_REFERER,
+        'user-agent': TONNEL_UA,
+      };
+      const body = {
+        page: 1,
+        limit: 1,
+        sort: JSON.stringify({ message_post_time: -1, gift_id: -1 }),
+        filter: JSON.stringify({ price: { $exists: true }, buyer: { $exists: false }, asset: 'TON' }),
+        price_range: null,
+        ref: 0,
+        user_auth: TONNEL_USER_AUTH,
+      };
+      const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) }).catch(() => null);
+      if (res) {
+        const txt = await res.text().catch(() => '');
+        tn = {
+          ok: res.ok,
+          status: res.status,
+          contentType: res.headers.get('content-type') || '',
+          bodyStart: txt.slice(0, 220),
+        };
+        tonnelDirectState.lastAt = nowMs();
+        tonnelDirectState.lastStatus = res.status;
+        tonnelDirectState.lastOk = res.ok;
+        tonnelDirectState.lastBodyStart = txt.slice(0, 220);
+      }
+    }
 
     const text =
       `API статус:\n` +
@@ -2310,11 +1698,11 @@ bot.on('message', async (msg) => {
       `\n• MRKT auth: ${process.env.MRKT_AUTH ? '✅' : '❌'}\n` +
       `• MRKT last ok: ${mrktAuthState.lastOkAt ? new Date(mrktAuthState.lastOkAt).toLocaleString() : '-'}\n` +
       `• MRKT last fail: ${mrktAuthState.lastFailAt ? `HTTP ${mrktAuthState.lastFailCode}` : '-'}\n` +
-      `\n• Tonnel enabled: ${TONNEL_ENABLED ? '✅' : '❌'}\n` +
-      `• Tonnel auth: ${TONNEL_USER_AUTH ? '✅' : '❌'}\n` +
-      `• Tonnel probe: ${tn.status ?? '-'} ${tn.ok ? 'OK' : 'FAIL'}\n` +
-      (tn.contentType ? `• Tonnel content-type: ${tn.contentType}\n` : '') +
-      (tn.bodyStart ? `• Tonnel body start: ${tn.bodyStart}\n` : '') +
+      `\n• Satellite: ${SATELLITE_ENABLED ? '✅' : '❌'}\n` +
+      `• Satellite probe: ${s.status ?? '-'} ${s.ok ? 'OK' : 'FAIL'}\n` +
+      (s.bodyStart ? `• Satellite body start: ${s.bodyStart}\n` : '') +
+      `\n• Tonnel via Satellite: ${(SATELLITE_ENABLED && TONNEL_ENABLED) ? '✅' : '❌'}\n` +
+      (TONNEL_DIRECT_ENABLED ? `• Tonnel direct probe: ${tn.status ?? '-'} ${tn.ok ? 'OK' : 'FAIL'}\n` : '') +
       `\n• Redis: ${redis ? '✅' : '❌'}\n`;
 
     return sendMessageSafe(chatId, text, { reply_markup: MAIN_KEYBOARD });
@@ -2339,14 +1727,13 @@ bot.on('message', async (msg) => {
           { text: '🔍 Поиск фона', callback_data: 'search_backdrop' },
         ],
         [
-          { text: '🅿 Portal', callback_data: 'set_markets:Portal' },
           { text: '🅼 MRKT', callback_data: 'set_markets:MRKT' },
           ...(TONNEL_ENABLED ? [{ text: '🅣 Tonnel', callback_data: 'set_markets:Tonnel' }] : []),
+          { text: '🅿 Portal (floors)', callback_data: 'set_markets:Portal' },
         ],
         [
-          { text: '🅼+🅣 MRKT+Tonnel', callback_data: 'set_markets:MRKT_TONNEL' },
-          { text: '🅿+🅼 Portal+MRKT', callback_data: 'set_markets:PORTAL_MRKT' },
-          { text: '🅿+🅼+🅣 ALL', callback_data: 'set_markets:ALL' },
+          { text: 'MRKT+Tonnel', callback_data: 'set_markets:MRKT_TONNEL' },
+          { text: 'ALL', callback_data: 'set_markets:ALL' },
         ],
         [
           { text: '♻️ Сбросить модель', callback_data: 'clear_model' },
@@ -2373,40 +1760,34 @@ bot.on('callback_query', async (query) => {
 
   try {
     if (data === 'gift_free') {
-      user.state = 'awaiting_gift_free';
-      scheduleSave();
-      await sendMessageSafe(chatId, 'Напиши название подарка вручную (например: Love Candle):', { reply_markup: MAIN_KEYBOARD });
+      user.state = 'awaiting_gift_free'; scheduleSave();
+      await sendMessageSafe(chatId, 'Напиши название подарка вручную (например: Lol Pop):', { reply_markup: MAIN_KEYBOARD });
     } else if (data === 'model_free') {
-      user.state = 'awaiting_model_free';
-      scheduleSave();
+      user.state = 'awaiting_model_free'; scheduleSave();
       await sendMessageSafe(chatId, 'Напиши модель вручную (например: Cyberpunk):', { reply_markup: MAIN_KEYBOARD });
     } else if (data === 'backdrop_free') {
-      user.state = 'awaiting_backdrop_free';
-      scheduleSave();
+      user.state = 'awaiting_backdrop_free'; scheduleSave();
       await sendMessageSafe(chatId, 'Напиши фон вручную (например: Electric Purple):', { reply_markup: MAIN_KEYBOARD });
     }
 
     else if (data === 'filter_gift') {
-      // try Portal collections first
-      const { byLowerName } = await portalCollections(400);
-      const portalNames = Array.from(byLowerName.values()).map((x) => x.name);
+      const names = [];
 
-      // fallback: catalog list
-      const catalogNames = Array.from(catalog.gifts.values());
+      // from Satellite portal floors
+      const floors = await satPortalFloors();
+      if (floors) names.push(...Object.keys(floors));
 
-      const names = [...new Set([...portalNames, ...catalogNames])].sort().slice(0, 80);
+      // from catalog
+      names.push(...Array.from(catalog.gifts.values()));
 
-      if (!names.length) {
-        user.state = 'awaiting_gift_free';
-        scheduleSave();
-        await sendMessageSafe(
-          chatId,
-          'Список подарков сейчас недоступен (Portal может быть заблокирован Cloudflare).\nНапиши название подарка вручную:',
-          { reply_markup: MAIN_KEYBOARD }
-        );
+      const uniq = [...new Set(names)].sort().slice(0, 80);
+
+      if (!uniq.length) {
+        user.state = 'awaiting_gift_free'; scheduleSave();
+        await sendMessageSafe(chatId, 'Список подарков недоступен. Напиши подарок вручную:', { reply_markup: MAIN_KEYBOARD });
       } else {
         await sendMessageSafe(chatId, 'Выбери подарок:', {
-          reply_markup: { inline_keyboard: names.map((name) => [{ text: shorten(name, 32), callback_data: `set_gift:${name}` }]) },
+          reply_markup: { inline_keyboard: uniq.map((name) => [{ text: shorten(name, 32), callback_data: `set_gift:${name}` }]) },
         });
       }
     }
@@ -2416,28 +1797,26 @@ bot.on('callback_query', async (query) => {
         await sendMessageSafe(chatId, 'Сначала выбери подарок.', { reply_markup: MAIN_KEYBOARD });
       } else {
         const giftLower = user.filters.gifts[0];
+        const giftDisplay = getGiftDisplay(giftLower);
 
-        // try portal filters
-        const col = collectionsCache.byLowerName.get(giftLower);
-        const shortName = portalShortName(col?.raw);
-        const f = await portalCollectionFilters(shortName);
+        const list = [];
 
-        let names = [];
-        if (f) {
-          const traits = extractModelTraits(f.models).slice(0, 80);
-          names = traits.map((m) => m.name);
-        } else {
-          const m = catalog.modelsByGift.get(giftLower);
-          if (m) names = Array.from(m.values()).slice(0, 80);
-        }
+        // Satellite model floors (Portal)
+        const map = await satPortalModelsFloors(giftDisplay);
+        if (map) list.push(...Object.keys(map));
 
-        if (!names.length) {
-          user.state = 'awaiting_model_free';
-          scheduleSave();
+        // catalog fallback
+        const mm = catalog.modelsByGift.get(giftLower);
+        if (mm) list.push(...Array.from(mm.values()));
+
+        const uniq = [...new Set(list)].sort().slice(0, 80);
+
+        if (!uniq.length) {
+          user.state = 'awaiting_model_free'; scheduleSave();
           await sendMessageSafe(chatId, 'Список моделей недоступен. Напиши модель вручную:', { reply_markup: MAIN_KEYBOARD });
         } else {
           await sendMessageSafe(chatId, 'Выбери модель:', {
-            reply_markup: { inline_keyboard: names.map((name) => [{ text: shorten(name, 32), callback_data: `set_model:${name}` }]) },
+            reply_markup: { inline_keyboard: uniq.map((name) => [{ text: shorten(name, 32), callback_data: `set_model:${name}` }]) },
           });
         }
       }
@@ -2448,29 +1827,18 @@ bot.on('callback_query', async (query) => {
         await sendMessageSafe(chatId, 'Сначала выбери подарок.', { reply_markup: MAIN_KEYBOARD });
       } else {
         const giftLower = user.filters.gifts[0];
+        const list = [];
+        const mm = catalog.backdropsByGift.get(giftLower);
+        if (mm) list.push(...Array.from(mm.values()));
 
-        const col = collectionsCache.byLowerName.get(giftLower);
-        const shortName = portalShortName(col?.raw);
-        const f = await portalCollectionFilters(shortName);
+        const uniq = [...new Set(list)].sort().slice(0, 80);
 
-        let names = [];
-        if (f) {
-          const backdrops = Array.isArray(f.backdrops)
-            ? f.backdrops.map((x) => (typeof x === 'string' ? x : x?.name || x?.value || x?.title || '')).filter(Boolean)
-            : Object.keys(f.backdrops || {});
-          names = backdrops.sort().slice(0, 80);
-        } else {
-          const m = catalog.backdropsByGift.get(giftLower);
-          if (m) names = Array.from(m.values()).sort().slice(0, 80);
-        }
-
-        if (!names.length) {
-          user.state = 'awaiting_backdrop_free';
-          scheduleSave();
+        if (!uniq.length) {
+          user.state = 'awaiting_backdrop_free'; scheduleSave();
           await sendMessageSafe(chatId, 'Список фонов недоступен. Напиши фон вручную:', { reply_markup: MAIN_KEYBOARD });
         } else {
           await sendMessageSafe(chatId, 'Выбери фон:', {
-            reply_markup: { inline_keyboard: names.map((name) => [{ text: shorten(name, 32), callback_data: `set_backdrop:${name}` }]) },
+            reply_markup: { inline_keyboard: uniq.map((name) => [{ text: shorten(name, 32), callback_data: `set_backdrop:${name}` }]) },
           });
         }
       }
@@ -2511,47 +1879,36 @@ bot.on('callback_query', async (query) => {
 
     else if (data.startsWith('set_gift:')) {
       const name = data.slice('set_gift:'.length).trim();
-      const lower = name.toLowerCase().trim();
+      const lower = normGiftKey(name);
       user.filters.gifts = [lower];
       user.filters.models = [];
       user.filters.backdrops = [];
-      clearUserSentDeals(userId);
-      scheduleSave();
-
       catalogPutGift(name);
-      scheduleSave();
-
+      clearUserSentDeals(userId); scheduleSave();
       await sendMessageSafe(chatId, `Подарок выбран: ${name}`, { reply_markup: MAIN_KEYBOARD });
     } else if (data.startsWith('set_model:')) {
       const name = data.slice('set_model:'.length).trim();
-      user.filters.models = [name.toLowerCase().trim()];
+      user.filters.models = [normGiftKey(name)];
+      const gl = user.filters.gifts[0];
+      if (gl) catalogPutModel(gl, name);
       clearUserSentDeals(userId); scheduleSave();
-
-      const giftLower = user.filters.gifts[0];
-      if (giftLower) catalogPutModel(giftLower, name);
-      scheduleSave();
-
       await sendMessageSafe(chatId, `Модель выбрана: ${name}`, { reply_markup: MAIN_KEYBOARD });
     } else if (data.startsWith('set_backdrop:')) {
       const name = data.slice('set_backdrop:'.length).trim();
-      user.filters.backdrops = [name.toLowerCase().trim()];
+      user.filters.backdrops = [normGiftKey(name)];
+      const gl = user.filters.gifts[0];
+      if (gl) catalogPutBackdrop(gl, name);
       clearUserSentDeals(userId); scheduleSave();
-
-      const giftLower = user.filters.gifts[0];
-      if (giftLower) catalogPutBackdrop(giftLower, name);
-      scheduleSave();
-
       await sendMessageSafe(chatId, `Фон выбран: ${name}`, { reply_markup: MAIN_KEYBOARD });
     }
 
     else if (data.startsWith('set_markets:')) {
       const v = data.split(':')[1];
-      if (v === 'Portal') user.filters.markets = ['Portal'];
-      else if (v === 'MRKT') user.filters.markets = ['MRKT'];
+      if (v === 'MRKT') user.filters.markets = ['MRKT'];
       else if (v === 'Tonnel') user.filters.markets = ['Tonnel'];
+      else if (v === 'Portal') user.filters.markets = ['Portal'];
       else if (v === 'MRKT_TONNEL') user.filters.markets = ['MRKT', 'Tonnel'];
-      else if (v === 'PORTAL_MRKT') user.filters.markets = ['Portal', 'MRKT'];
-      else user.filters.markets = ['Portal', 'MRKT', ...(TONNEL_ENABLED ? ['Tonnel'] : [])];
+      else user.filters.markets = ['MRKT', ...(TONNEL_ENABLED ? ['Tonnel'] : []), 'Portal'];
 
       clearUserSentDeals(userId); scheduleSave();
       await sendMessageSafe(chatId, `Ок. Маркеты: ${(user.filters.markets || []).join('+')}`, { reply_markup: MAIN_KEYBOARD });
@@ -2628,6 +1985,5 @@ setInterval(() => {
       await loadCatalog();
     }
   }
-  await portalCollections(200).catch(() => {});
   console.log('Бот запущен. /start');
 })();
