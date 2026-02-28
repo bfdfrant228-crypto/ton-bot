@@ -1,11 +1,12 @@
 /**
  * ton-bot MRKT + WebApp Panel (single-file)
- * version: 2026-02-28-webapp-pretty-filters-fragment-img-token-redis-v5
+ * version: 2026-02-28-webapp-dark-fragment-proxy-v6
  */
 
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const crypto = require('crypto');
+const { Readable } = require('stream');
 
 // =====================
 // ENV
@@ -25,7 +26,7 @@ const WEBAPP_AUTH_MAX_AGE_SEC = Number(process.env.WEBAPP_AUTH_MAX_AGE_SEC || 86
 // Admin
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID ? Number(process.env.ADMIN_USER_ID) : null;
 
-// Redis (optional but recommended)
+// Redis (optional)
 const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL || null;
 
 // MRKT
@@ -39,12 +40,6 @@ let MRKT_AUTH_RUNTIME = (process.env.MRKT_AUTH || '').trim() || null;
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5000);
 const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 8000);
 
-// WebApp lots/suggest
-const WEBAPP_LOTS_LIMIT = Number(process.env.WEBAPP_LOTS_LIMIT || 25);
-const WEBAPP_LOTS_PAGES = Number(process.env.WEBAPP_LOTS_PAGES || 1);
-const WEBAPP_SUGGEST_LIMIT = Number(process.env.WEBAPP_SUGGEST_LIMIT || 18);
-
-// MRKT settings
 const MRKT_COUNT = Number(process.env.MRKT_COUNT || 50);
 const MRKT_PAGES = Number(process.env.MRKT_PAGES || 6);
 const MRKT_PAGES_MONITOR = Number(process.env.MRKT_PAGES_MONITOR || 1);
@@ -52,28 +47,10 @@ const ONLY_CHEAPEST_PER_CHECK = String(process.env.ONLY_CHEAPEST_PER_CHECK || '1
 const SEND_DELAY_MS = Number(process.env.SEND_DELAY_MS || 80);
 const SENT_TTL_MS = Number(process.env.SENT_TTL_MS || 24 * 60 * 60 * 1000);
 
-// subscriptions
-const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 9000);
-const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 8);
-const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
-const SUBS_MRKT_FEED_MAX_EVENTS_PER_CYCLE = Number(process.env.SUBS_MRKT_FEED_MAX_EVENTS_PER_CYCLE || 12);
-
-// feed
-const MRKT_FEED_COUNT = Number(process.env.MRKT_FEED_COUNT || 80);
-const MRKT_FEED_THROTTLE_MS = Number(process.env.MRKT_FEED_THROTTLE_MS || 110);
-
-const MRKT_FEED_NOTIFY_TYPES_RAW = String(process.env.MRKT_FEED_NOTIFY_TYPES || 'sale,listing,change_price');
-const MRKT_FEED_NOTIFY_TYPES = new Set(
-  MRKT_FEED_NOTIFY_TYPES_RAW.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
-);
-
-// ===== AUTO BUY =====
-const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '0') === '1';
-const AUTO_BUY_DRY_RUN = String(process.env.AUTO_BUY_DRY_RUN || '1') !== '0';
-const AUTO_BUY_ONLY_NEW_LISTINGS = String(process.env.AUTO_BUY_ONLY_NEW_LISTINGS || '1') !== '0';
-const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 30_000);
-const AUTO_BUY_MAX_PER_CHECK = Number(process.env.AUTO_BUY_MAX_PER_CHECK || 1);
-const AUTO_BUY_NO_FUNDS_PAUSE_MS = Number(process.env.AUTO_BUY_NO_FUNDS_PAUSE_MS || 10 * 60 * 1000);
+// WebApp lots/suggest
+const WEBAPP_LOTS_LIMIT = Number(process.env.WEBAPP_LOTS_LIMIT || 25);
+const WEBAPP_LOTS_PAGES = Number(process.env.WEBAPP_LOTS_PAGES || 1);
+const WEBAPP_SUGGEST_LIMIT = Number(process.env.WEBAPP_SUGGEST_LIMIT || 18);
 
 // collections for gift suggest
 const MRKT_COLLECTIONS = String(process.env.MRKT_COLLECTIONS || '')
@@ -81,7 +58,7 @@ const MRKT_COLLECTIONS = String(process.env.MRKT_COLLECTIONS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
-console.log('Bot version 2026-02-28-webapp-pretty-filters-fragment-img-token-redis-v5');
+console.log('Bot version 2026-02-28-webapp-dark-fragment-proxy-v6');
 console.log('MODE=', MODE);
 console.log('WEBAPP_URL=', WEBAPP_URL || 'not set');
 console.log('ADMIN_USER_ID=', ADMIN_USER_ID || 'not set');
@@ -100,7 +77,7 @@ const MAIN_KEYBOARD = {
   keyboard: [
     [{ text: '🔍 Запустить поиск' }, { text: '⏹ Остановить поиск' }],
     [{ text: '💰 Макс. цена' }, { text: '💵 Мин. цена' }],
-    [{ text: '🤖 Автопокупка' }, { text: '📌 Статус' }]
+    [{ text: '📌 Статус' }]
   ],
   resize_keyboard: true,
 };
@@ -110,13 +87,8 @@ const MAIN_KEYBOARD = {
 // =====================
 const users = new Map();
 const sentDeals = new Map();
-const subStates = new Map();
 
 let isChecking = false;
-let isSubsChecking = false;
-
-const autoBuyLocks = new Set();
-const autoBuyRecentAttempts = new Map();
 
 const mrktAuthState = { ok: null, lastOkAt: 0, lastFailAt: 0, lastFailCode: null };
 
@@ -182,10 +154,14 @@ function formatPctFromPermille(perMille) {
   const s = (pct % 1 === 0) ? pct.toFixed(0) : pct.toFixed(1);
   return `${s}%`;
 }
-function fragmentGiftImgUrl(giftName) {
+function fragmentGiftRemoteUrl(giftName) {
   if (!giftName) return null;
-  // VictoryMedal-29983.medium.jpg
   return joinUrl(FRAGMENT_GIFT_IMG_BASE, `${encodeURIComponent(String(giftName))}.medium.jpg`);
+}
+function giftNameFallbackFromCollectionAndNumber(collectionTitleOrName, number) {
+  const base = String(collectionTitleOrName || '').replace(/\s+/g, '');
+  if (!base || number == null) return null;
+  return `${base}-${number}`;
 }
 
 async function sendMessageSafe(chatId, text, opts) {
@@ -247,7 +223,7 @@ function verifyTelegramWebAppInitData(initData) {
 }
 
 // =====================
-// Redis (store MRKT_AUTH in Redis + later can store full state)
+// Redis (store MRKT_AUTH in Redis)
 // =====================
 let redis = null;
 const MRKT_AUTH_KEY = 'mrkt:auth:token';
@@ -294,9 +270,6 @@ function getOrCreateUser(userId) {
       minPriceTon: 0,
       maxPriceTon: null,
       state: null,
-      autoBuyEnabled: false,
-      autoBuyFeedLastId: null,
-      autoBuyPausedUntil: 0,
       filters: { gift: '', model: '', backdrop: '' },
       logs: []
     });
@@ -413,13 +386,21 @@ async function mrktSearchLots({ gift, model, backdrop }, minPriceTon, maxPriceTo
       if (model && !sameTrait(modelName, norm(model))) continue;
       if (backdrop && !sameTrait(backdropName, norm(backdrop))) continue;
 
-      const urlTelegram = g.name && String(g.name).includes('-') ? `https://t.me/nft/${g.name}` : 'https://t.me/mrkt';
+      // giftName for Fragment image:
+      // 1) g.name (if exists)
+      // 2) build from collection + number: VictoryMedal-29983, SnakeBox-151365
+      const giftName =
+        g.name ||
+        giftNameFallbackFromCollectionAndNumber(g.collectionTitle || g.collectionName || g.title, g.number) ||
+        null;
+
+      const urlTelegram = giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : 'https://t.me/mrkt';
       const urlMarket = g.id ? mrktLotUrlFromId(g.id) : 'https://t.me/mrkt';
 
       out.push({
         id: g.id,
         name: displayName,
-        giftName: g.name || null, // важно для fragment image
+        giftName,
         priceTon,
         urlTelegram,
         urlMarket,
@@ -449,7 +430,7 @@ async function mrktGetModelsForGift(gift) {
 
   const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/models`, {
     method: 'POST',
-    headers: { ...mrktHeaders(), Authorization: MRKT_AUTH_RUNTIME || '' }, // можно и без, но так стабильнее
+    headers: { ...mrktHeaders(), Authorization: MRKT_AUTH_RUNTIME || '' },
     body: JSON.stringify(body)
   }, MRKT_TIMEOUT_MS).catch(() => null);
 
@@ -535,13 +516,8 @@ async function mrktGetBackdropsForGift(gift) {
 }
 
 // =====================
-// Autopurchase + monitor (коротко, без переписывания всего)
+// Monitor
 // =====================
-async function initAutoBuyBaseline(userId, user) {
-  // baseline делай как раньше (если хочешь — вернём feed listing baseline позже)
-  user.autoBuyFeedLastId = user.autoBuyFeedLastId || null;
-}
-
 async function checkMarketsForAllUsers() {
   if (MODE !== 'real') return;
   if (isChecking) return;
@@ -604,7 +580,7 @@ async function tgApi(method, body) {
 }
 
 bot.onText(/^\/start\b/, async (msg) => {
-  const user = getOrCreateUser(msg.from.id);
+  getOrCreateUser(msg.from.id);
 
   if (WEBAPP_URL) {
     try {
@@ -618,41 +594,67 @@ bot.onText(/^\/start\b/, async (msg) => {
   }
 
   await sendMessageSafe(msg.chat.id, 'Открой кнопку меню “Панель” рядом со строкой ввода.', { reply_markup: MAIN_KEYBOARD });
-
-  if (user.autoBuyEnabled && AUTO_BUY_ONLY_NEW_LISTINGS) {
-    await initAutoBuyBaseline(msg.from.id, user);
-  }
 });
 
 // =====================
-// WebApp HTML/JS
+// WebApp HTML/JS (dark, responsive, horizontal cards)
 // =====================
 const WEBAPP_HTML = `<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>ton-bot panel</title>
 <style>
-  body { font-family: system-ui, Arial; margin: 14px; }
-  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
-  .card { border:1px solid #ddd; border-radius:12px; padding:12px; margin:10px 0; }
-  label { display:block; font-size:12px; opacity:.75; margin-bottom:4px; }
-  input { padding:10px; min-width: 260px; border:1px solid #ddd; border-radius:10px; }
-  button { padding:10px 12px; cursor:pointer; border:1px solid #ddd; border-radius:10px; background:#fff; }
-  button:hover { background:#f6f6f6; }
-  pre { white-space: pre-wrap; word-break: break-word; background:#f7f7f7; padding:10px; border-radius:10px; }
-  #err { display:none; border-color:#c33; }
-  .sug { border:1px solid #eee; border-radius:12px; margin-top:6px; overflow:hidden; max-width: 340px; }
-  .sug .item { width:100%; text-align:left; border:0; background:#fff; padding:10px; display:flex; gap:10px; align-items:center; }
-  .sug .item:hover { background:#f3f3f3; }
-  .thumb { width:36px; height:36px; border-radius:10px; object-fit:cover; background:#eee; }
-  .dot { width:14px; height:14px; border-radius:50%; border:1px solid #ddd; display:inline-block; }
-  .hscroll { display:flex; gap:10px; overflow-x:auto; padding-bottom:6px; }
-  .lot { min-width: 260px; flex: 0 0 auto; border:1px solid #eee; border-radius:14px; padding:10px; }
-  .lot img { width:100%; height:160px; object-fit:contain; background:#fafafa; border-radius:12px; border:1px solid #eee; }
-  .lot .price { font-size:18px; font-weight:700; margin-top:8px; }
-  .muted { opacity:.75; font-size:13px; }
+  :root{
+    --bg:#0b0f14;
+    --card:#111827;
+    --text:#e5e7eb;
+    --muted:#9ca3af;
+    --border:#1f2937;
+    --input:#0f172a;
+    --btn:#1f2937;
+    --btnText:#e5e7eb;
+    --danger:#ef4444;
+  }
+  *{ box-sizing:border-box; }
+  body{ margin:0; padding:14px; background:var(--bg); color:var(--text); font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+  h2{ margin:0 0 10px 0; }
+  .card{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:12px; margin:10px 0; }
+  label{ display:block; font-size:12px; opacity:.85; margin-bottom:4px; color:var(--muted); }
+  input{
+    width: min(320px, 86vw);
+    padding:10px;
+    border:1px solid var(--border);
+    border-radius:12px;
+    background:var(--input);
+    color:var(--text);
+    outline:none;
+  }
+  .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+  button{
+    padding:10px 12px;
+    border:1px solid var(--border);
+    border-radius:12px;
+    background:var(--btn);
+    color:var(--btnText);
+    cursor:pointer;
+  }
+  button:hover{ filter:brightness(1.07); }
+  pre{ white-space: pre-wrap; word-break: break-word; background:rgba(255,255,255,.04); padding:10px; border-radius:12px; border:1px solid var(--border); }
+  #err{ display:none; border-color:var(--danger); color:var(--danger); }
+
+  .sug{ border:1px solid var(--border); border-radius:14px; margin-top:6px; overflow:hidden; max-width: 340px; background:var(--card); }
+  .sug .item{ width:100%; text-align:left; border:0; background:transparent; padding:10px; display:flex; gap:10px; align-items:center; color:var(--text); }
+  .sug .item:hover{ background:rgba(255,255,255,.06); }
+  .thumb{ width:36px; height:36px; border-radius:12px; object-fit:cover; background:rgba(255,255,255,.08); border:1px solid var(--border); }
+  .dot{ width:14px; height:14px; border-radius:50%; border:1px solid var(--border); display:inline-block; }
+
+  .hscroll{ display:flex; gap:10px; overflow-x:auto; padding-bottom:6px; scroll-snap-type:x mandatory; }
+  .lot{ min-width: 260px; max-width: 260px; flex: 0 0 auto; border:1px solid var(--border); border-radius:16px; padding:10px; background:rgba(255,255,255,.02); scroll-snap-align:start; }
+  .lot img{ width:100%; height:160px; object-fit:cover; background:rgba(255,255,255,.03); border-radius:14px; border:1px solid var(--border); }
+  .price{ font-size:18px; font-weight:800; margin-top:8px; }
+  .muted{ color:var(--muted); font-size:13px; }
 </style>
 </head>
 <body>
@@ -662,10 +664,10 @@ const WEBAPP_HTML = `<!doctype html>
 <div id="status" class="card">Загрузка…</div>
 
 <div class="card">
-  <h3>Фильтры</h3>
+  <h3 style="margin:0 0 8px 0">Фильтры</h3>
   <div class="row">
     <div>
-      <label>Gift (collection)</label>
+      <label>Gift</label>
       <input id="gift" placeholder="Начни вводить…" autocomplete="off"/>
       <div id="giftSug" class="sug" style="display:none"></div>
     </div>
@@ -699,7 +701,7 @@ const WEBAPP_HTML = `<!doctype html>
 </div>
 
 <div class="card">
-  <h3>Лоты MRKT (по фильтрам)</h3>
+  <h3 style="margin:0 0 8px 0">Лоты MRKT</h3>
   <div class="row">
     <button id="lotsRefresh">🔄 Обновить</button>
   </div>
@@ -707,8 +709,8 @@ const WEBAPP_HTML = `<!doctype html>
 </div>
 
 <div class="card" id="adminBlock" style="display:none">
-  <h3>Admin</h3>
-  <div class="muted">MRKT token хранится в Redis. Обновление не требует Railway.</div>
+  <h3 style="margin:0 0 8px 0">Admin</h3>
+  <div class="muted">Обнови MRKT токен прямо здесь (хранится в Redis).</div>
   <div class="row" style="margin-top:10px">
     <div>
       <label>Текущий токен (маска)</label>
@@ -723,7 +725,7 @@ const WEBAPP_HTML = `<!doctype html>
 </div>
 
 <div class="card">
-  <h3>Логи</h3>
+  <h3 style="margin:0 0 8px 0">Логи</h3>
   <button id="logsRefresh">🔄 Обновить</button>
   <div id="logs" style="margin-top:10px"></div>
 </div>
@@ -736,6 +738,20 @@ const WEBAPP_HTML = `<!doctype html>
 const WEBAPP_JS = `(() => {
   const tg = window.Telegram?.WebApp;
   tg?.ready();
+
+  // Apply Telegram theme if available
+  function applyTheme() {
+    const p = tg?.themeParams || {};
+    const root = document.documentElement;
+    if (p.bg_color) root.style.setProperty('--bg', p.bg_color);
+    if (p.secondary_bg_color) root.style.setProperty('--card', p.secondary_bg_color);
+    if (p.text_color) root.style.setProperty('--text', p.text_color);
+    if (p.hint_color) root.style.setProperty('--muted', p.hint_color);
+    if (p.button_color) root.style.setProperty('--btn', p.button_color);
+    if (p.button_text_color) root.style.setProperty('--btnText', p.button_text_color);
+  }
+  applyTheme();
+  tg?.onEvent?.('themeChanged', applyTheme);
 
   const initData = tg?.initData || '';
   const el = (id) => document.getElementById(id);
@@ -772,7 +788,7 @@ const WEBAPP_JS = `(() => {
     const b = el(id);
     if (!items || !items.length) { hideSug(id); return; }
     b.innerHTML = items.map((x) => {
-      const thumb = x.imgUrl ? '<img class="thumb" src="' + x.imgUrl + '"/>' : '<div class="thumb"></div>';
+      const thumb = x.imgUrl ? '<img class="thumb" src="' + x.imgUrl + '" referrerpolicy="no-referrer"/>' : '<div class="thumb"></div>';
       const dot = x.colorHex ? '<span class="dot" style="background:' + x.colorHex + '"></span>' : '';
       const right = '<div style="display:flex;flex-direction:column;gap:2px">' +
         '<div>' + (dot ? dot + '&nbsp;' : '') + x.label + '</div>' +
@@ -816,7 +832,7 @@ const WEBAPP_JS = `(() => {
   function renderLots(resp) {
     const box = el('lots');
     if (resp.ok === false) {
-      box.innerHTML = '<div style="color:#c33"><b>MRKT ошибка:</b> ' + (resp.reason || 'unknown') + '</div>';
+      box.innerHTML = '<div style="color:#ef4444"><b>MRKT ошибка:</b> ' + (resp.reason || 'unknown') + '</div>';
       return;
     }
     const lots = resp.lots || [];
@@ -825,10 +841,13 @@ const WEBAPP_JS = `(() => {
       return;
     }
     box.innerHTML = lots.map(x => {
-      const img = x.imgUrl ? ('<img src="' + x.imgUrl + '"/>') : '<div style="height:160px;background:#fafafa;border:1px solid #eee;border-radius:12px"></div>';
       const dot = x.backdropColorHex ? '<span class="dot" style="background:' + x.backdropColorHex + '"></span>' : '';
       const model = x.model ? ('<div class="muted">Model: ' + x.model + '</div>') : '';
       const backdrop = x.backdrop ? ('<div class="muted">Backdrop: ' + dot + ' ' + x.backdrop + '</div>') : '';
+      const img = x.imgUrl
+        ? ('<img src="' + x.imgUrl + '" referrerpolicy="no-referrer" loading="lazy"/>')
+        : ('<div style="height:160px;border:1px solid rgba(255,255,255,.08);border-radius:14px"></div>');
+
       return (
         '<div class="lot">' +
           img +
@@ -889,7 +908,7 @@ const WEBAPP_JS = `(() => {
         const r = await api('/api/mrkt/suggest?kind=model&gift=' + encodeURIComponent(gift) + '&q=' + encodeURIComponent(q));
         renderSug('modelSug', r.items || [], (v) => { el('model').value = v; el('backdrop').value=''; });
       } catch { hideSug('modelSug'); }
-    }, 220);
+    }, 200);
   });
 
   // Backdrop suggest from API
@@ -904,7 +923,7 @@ const WEBAPP_JS = `(() => {
         const r = await api('/api/mrkt/suggest?kind=backdrop&gift=' + encodeURIComponent(gift) + '&q=' + encodeURIComponent(q));
         renderSug('backdropSug', r.items || [], (v) => { el('backdrop').value = v; });
       } catch { hideSug('backdropSug'); }
-    }, 240);
+    }, 220);
   });
 
   document.addEventListener('click', (e) => {
@@ -1014,6 +1033,24 @@ function startWebServer() {
   function isAdmin(userId) {
     return ADMIN_USER_ID && Number(userId) === Number(ADMIN_USER_ID);
   }
+
+  // PROXY: gift image from fragment (fixes WebView issues)
+  app.get('/img/gift', async (req, res) => {
+    const name = String(req.query.name || '').trim();
+    if (!name) return res.status(400).send('no name');
+
+    const url = fragmentGiftRemoteUrl(name);
+    const r = await fetchWithTimeout(url, { method: 'GET' }, 8000).catch(() => null);
+    if (!r || !r.ok) return res.status(404).send('not found');
+
+    const ct = r.headers.get('content-type') || 'image/jpeg';
+    res.setHeader('Content-Type', ct);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+
+    // stream body
+    const nodeStream = Readable.fromWeb(r.body);
+    nodeStream.pipe(res);
+  });
 
   app.get('/api/meta/collections', auth, (req, res) => {
     res.json({ ok: true, collections: MRKT_COLLECTIONS });
@@ -1135,9 +1172,7 @@ function startWebServer() {
       .slice(0, WEBAPP_LOTS_LIMIT)
       .map((x) => {
         const b = x.attrs?.backdrop ? backMap.get(norm(x.attrs.backdrop)) : null;
-
-        // 1) full gift img from fragment (лучше всего)
-        const imgUrl = x.giftName ? fragmentGiftImgUrl(x.giftName) : null;
+        const imgUrl = x.giftName ? (`/img/gift?name=${encodeURIComponent(x.giftName)}`) : null;
 
         return {
           id: x.id,
@@ -1156,7 +1191,7 @@ function startWebServer() {
     res.json({ ok: true, lots });
   });
 
-  // Admin: update MRKT_AUTH in Redis (no Railway needed)
+  // Admin: update MRKT_AUTH in Redis (no Railway)
   app.post('/api/admin/mrkt_auth', auth, async (req, res) => {
     if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
 
@@ -1164,10 +1199,8 @@ function startWebServer() {
     if (!t) return res.status(400).json({ ok: false, reason: 'EMPTY_TOKEN' });
 
     MRKT_AUTH_RUNTIME = t;
-    try {
-      await saveMrktAuthToRedis(t);
-    } catch {}
-    // сброс кэшей фильтров (на всякий)
+    try { await saveMrktAuthToRedis(t); } catch {}
+
     modelsCache.clear();
     backdropsCache.clear();
 
@@ -1186,10 +1219,6 @@ startWebServer();
 setInterval(() => {
   checkMarketsForAllUsers().catch((e) => console.error('monitor error:', e));
 }, CHECK_INTERVAL_MS);
-
-setInterval(() => {
-  // подписки пока не добавлял в эту v5 (можно вернуть из прошлой версии)
-}, SUBS_CHECK_INTERVAL_MS);
 
 (async () => {
   if (REDIS_URL) {
