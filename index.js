@@ -1424,4 +1424,31 @@ setInterval(() => {
     if (redis) await loadState();
   }
   console.log('Бот запущен. /start');
+  // =====================
+// WEB server (Railway domain / WebApp base)
+// =====================
+const express = require('express');
+const path = require('path');
+
+function startWebServer() {
+  const app = express();
+
+  // пока просто healthcheck + статика
+  app.get('/health', (req, res) => res.status(200).send('ok'));
+
+  // если потом создашь папку public — будет отдавать панель
+  app.use(express.static(path.join(__dirname, 'public')));
+
+  // главная страница (чтобы не было 404)
+  app.get('/', (req, res) => {
+    res.status(200).send('WebApp placeholder. Bot is running.');
+  });
+
+  const port = Number(process.env.PORT || 3000);
+  app.listen(port, '0.0.0.0', () => {
+    console.log('Web server listening on port', port);
+  });
+}
+
+startWebServer();
 })();
