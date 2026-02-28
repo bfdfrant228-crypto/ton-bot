@@ -1,6 +1,6 @@
 /**
  * ton-bot MRKT + WebApp Panel (single-file)
- * version: 2026-02-28-webapp-suggest-lots-fix401-v3
+ * version: 2026-02-28-webapp-pretty-filters-fragment-img-token-redis-v5
  */
 
 const TelegramBot = require('node-telegram-bot-api');
@@ -22,19 +22,31 @@ const MODE = process.env.MODE || 'real';
 const WEBAPP_URL = process.env.WEBAPP_URL || null;
 const WEBAPP_AUTH_MAX_AGE_SEC = Number(process.env.WEBAPP_AUTH_MAX_AGE_SEC || 86400);
 
-// Redis (optional)
+// Admin
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID ? Number(process.env.ADMIN_USER_ID) : null;
+
+// Redis (optional but recommended)
 const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL || null;
 
 // MRKT
 const MRKT_API_URL = 'https://api.tgmrkt.io/api/v1';
-const MRKT_AUTH = (process.env.MRKT_AUTH || '').trim() || null;
+const MRKT_CDN_BASE = (process.env.MRKT_CDN_BASE || 'https://cdn.tgmrkt.io/').trim();
+const FRAGMENT_GIFT_IMG_BASE = (process.env.FRAGMENT_GIFT_IMG_BASE || 'https://nft.fragment.com/gift/').trim();
 
-const MRKT_COUNT = Number(process.env.MRKT_COUNT || 50);
-const MRKT_PAGES = Number(process.env.MRKT_PAGES || 6);
+let MRKT_AUTH_RUNTIME = (process.env.MRKT_AUTH || '').trim() || null;
 
 // monitor
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5000);
 const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 8000);
+
+// WebApp lots/suggest
+const WEBAPP_LOTS_LIMIT = Number(process.env.WEBAPP_LOTS_LIMIT || 25);
+const WEBAPP_LOTS_PAGES = Number(process.env.WEBAPP_LOTS_PAGES || 1);
+const WEBAPP_SUGGEST_LIMIT = Number(process.env.WEBAPP_SUGGEST_LIMIT || 18);
+
+// MRKT settings
+const MRKT_COUNT = Number(process.env.MRKT_COUNT || 50);
+const MRKT_PAGES = Number(process.env.MRKT_PAGES || 6);
 const MRKT_PAGES_MONITOR = Number(process.env.MRKT_PAGES_MONITOR || 1);
 const ONLY_CHEAPEST_PER_CHECK = String(process.env.ONLY_CHEAPEST_PER_CHECK || '1') !== '0';
 const SEND_DELAY_MS = Number(process.env.SEND_DELAY_MS || 80);
@@ -55,49 +67,40 @@ const MRKT_FEED_NOTIFY_TYPES = new Set(
   MRKT_FEED_NOTIFY_TYPES_RAW.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
 );
 
-// fees
-const MRKT_FEE = Number(process.env.MRKT_FEE || 0);
-
 // ===== AUTO BUY =====
 const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '0') === '1';
 const AUTO_BUY_DRY_RUN = String(process.env.AUTO_BUY_DRY_RUN || '1') !== '0';
 const AUTO_BUY_ONLY_NEW_LISTINGS = String(process.env.AUTO_BUY_ONLY_NEW_LISTINGS || '1') !== '0';
-
-const AUTO_BUY_DISABLE_AFTER_SUCCESS = String(process.env.AUTO_BUY_DISABLE_AFTER_SUCCESS || '0') === '1';
 const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 30_000);
 const AUTO_BUY_MAX_PER_CHECK = Number(process.env.AUTO_BUY_MAX_PER_CHECK || 1);
 const AUTO_BUY_NO_FUNDS_PAUSE_MS = Number(process.env.AUTO_BUY_NO_FUNDS_PAUSE_MS || 10 * 60 * 1000);
 
-// WebApp lots/suggest
-const WEBAPP_LOTS_LIMIT = Number(process.env.WEBAPP_LOTS_LIMIT || 25);
-const WEBAPP_LOTS_PAGES = Number(process.env.WEBAPP_LOTS_PAGES || 1);
-const WEBAPP_SUGGEST_LIMIT = Number(process.env.WEBAPP_SUGGEST_LIMIT || 20);
-const WEBAPP_BACKDROP_SCAN_PAGES = Number(process.env.WEBAPP_BACKDROP_SCAN_PAGES || 3);
-
+// collections for gift suggest
 const MRKT_COLLECTIONS = String(process.env.MRKT_COLLECTIONS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
 
-console.log('Bot version 2026-02-28-webapp-suggest-lots-fix401-v3');
+console.log('Bot version 2026-02-28-webapp-pretty-filters-fragment-img-token-redis-v5');
 console.log('MODE=', MODE);
 console.log('WEBAPP_URL=', WEBAPP_URL || 'not set');
+console.log('ADMIN_USER_ID=', ADMIN_USER_ID || 'not set');
 console.log('REDIS_URL=', REDIS_URL ? 'set' : 'not set');
-console.log('MRKT_AUTH=', MRKT_AUTH ? 'set' : 'not set');
+console.log('MRKT_AUTH_RUNTIME=', MRKT_AUTH_RUNTIME ? 'set' : 'not set');
+console.log('MRKT_CDN_BASE=', MRKT_CDN_BASE);
+console.log('FRAGMENT_GIFT_IMG_BASE=', FRAGMENT_GIFT_IMG_BASE);
 console.log('MRKT_COLLECTIONS=', MRKT_COLLECTIONS.length ? MRKT_COLLECTIONS.length : 'not set');
-console.log('AUTO_BUY_GLOBAL=', AUTO_BUY_GLOBAL, 'AUTO_BUY_DRY_RUN=', AUTO_BUY_DRY_RUN, 'ONLY_NEW=', AUTO_BUY_ONLY_NEW_LISTINGS);
 
 const bot = new TelegramBot(token, { polling: true });
 
 // =====================
-// UI (Telegram)
+// Telegram UI
 // =====================
 const MAIN_KEYBOARD = {
   keyboard: [
     [{ text: '🔍 Запустить поиск' }, { text: '⏹ Остановить поиск' }],
     [{ text: '💰 Макс. цена' }, { text: '💵 Мин. цена' }],
-    [{ text: '🤖 Автопокупка' }, { text: '📡 Подписки' }],
-    [{ text: '📌 Статус' }]
+    [{ text: '🤖 Автопокупка' }, { text: '📌 Статус' }]
   ],
   resize_keyboard: true,
 };
@@ -117,10 +120,10 @@ const autoBuyRecentAttempts = new Map();
 
 const mrktAuthState = { ok: null, lastOkAt: 0, lastFailAt: 0, lastFailCode: null };
 
-// caches for suggest
-const modelsCache = new Map();   // gift -> { time, items:[{name, rarityPerMille}] }
-const backdropsCache = new Map(); // key gift|model -> { time, items:[string] }
-const CACHE_TTL_MS = 3 * 60_000;
+// caches
+const CACHE_TTL_MS = 5 * 60_000;
+const modelsCache = new Map();    // gift -> { time, items:[{name, rarityPerMille, thumbKey}] }
+const backdropsCache = new Map(); // gift -> { time, items:[{name, rarityPerMille, centerHex}] }
 
 // =====================
 // Helpers
@@ -142,21 +145,6 @@ function sameTrait(actual, expectedLower) {
   if (!expectedLower) return true;
   return normTraitName(actual) === normTraitName(expectedLower);
 }
-function pad2(x) { return String(x).padStart(2, '0'); }
-function pad3(x) { return String(x).padStart(3, '0'); }
-function fmtClockMsUTC(d) {
-  const x = (d instanceof Date) ? d : new Date(d);
-  return `${pad2(x.getUTCHours())}:${pad2(x.getUTCMinutes())}:${pad2(x.getUTCSeconds())}.${pad3(x.getUTCMilliseconds())} UTC`;
-}
-function fmtIsoMs(d) {
-  const x = (d instanceof Date) ? d : new Date(d);
-  return x.toISOString();
-}
-function mrktLotUrlFromId(id) {
-  if (!id) return 'https://t.me/mrkt';
-  const appId = String(id).replace(/-/g, '');
-  return `https://t.me/mrkt/app?startapp=${appId}`;
-}
 function inRange(price, minPrice, maxPrice) {
   if (!Number.isFinite(price)) return false;
   const min = minPrice != null ? Number(minPrice) : 0;
@@ -171,10 +159,35 @@ function pruneSentDeals() {
     if (now - ts > SENT_TTL_MS) sentDeals.delete(k);
   }
 }
-function percentChange(oldV, newV) {
-  if (!oldV || !Number.isFinite(oldV) || oldV <= 0) return null;
-  return ((newV - oldV) / oldV) * 100;
+function mrktLotUrlFromId(id) {
+  if (!id) return 'https://t.me/mrkt';
+  const appId = String(id).replace(/-/g, '');
+  return `https://t.me/mrkt/app?startapp=${appId}`;
 }
+function joinUrl(base, key) {
+  const b = String(base || '').endsWith('/') ? String(base) : String(base) + '/';
+  const k = String(key || '').startsWith('/') ? String(key).slice(1) : String(key);
+  return b + k;
+}
+function intToHexColor(intVal) {
+  const v = Number(intVal);
+  if (!Number.isFinite(v)) return null;
+  const hex = (v >>> 0).toString(16).padStart(6, '0');
+  return '#' + hex.slice(-6);
+}
+function formatPctFromPermille(perMille) {
+  const v = Number(perMille);
+  if (!Number.isFinite(v)) return null;
+  const pct = v / 10;
+  const s = (pct % 1 === 0) ? pct.toFixed(0) : pct.toFixed(1);
+  return `${s}%`;
+}
+function fragmentGiftImgUrl(giftName) {
+  if (!giftName) return null;
+  // VictoryMedal-29983.medium.jpg
+  return joinUrl(FRAGMENT_GIFT_IMG_BASE, `${encodeURIComponent(String(giftName))}.medium.jpg`);
+}
+
 async function sendMessageSafe(chatId, text, opts) {
   while (true) {
     try {
@@ -234,9 +247,10 @@ function verifyTelegramWebAppInitData(initData) {
 }
 
 // =====================
-// Redis persistence (optional)
+// Redis (store MRKT_AUTH in Redis + later can store full state)
 // =====================
 let redis = null;
+const MRKT_AUTH_KEY = 'mrkt:auth:token';
 
 async function initRedis() {
   if (!REDIS_URL) return;
@@ -252,19 +266,39 @@ async function initRedis() {
   }
 }
 
+async function loadMrktAuthFromRedis() {
+  if (!redis) return;
+  try {
+    const t = await redis.get(MRKT_AUTH_KEY);
+    if (t && String(t).trim()) {
+      MRKT_AUTH_RUNTIME = String(t).trim();
+      console.log('MRKT_AUTH loaded from Redis');
+    }
+  } catch (e) {
+    console.error('loadMrktAuthFromRedis error:', e?.message || e);
+  }
+}
+
+async function saveMrktAuthToRedis(newToken) {
+  if (!redis) return;
+  await redis.set(MRKT_AUTH_KEY, String(newToken || '').trim());
+}
+
+// =====================
+// User state
+// =====================
 function getOrCreateUser(userId) {
   if (!users.has(userId)) {
     users.set(userId, {
       enabled: true,
       minPriceTon: 0,
       maxPriceTon: null,
-      state: null, // awaiting_max | awaiting_min
+      state: null,
       autoBuyEnabled: false,
       autoBuyFeedLastId: null,
       autoBuyPausedUntil: 0,
       filters: { gift: '', model: '', backdrop: '' },
-      subscriptions: [],
-      logs: [],
+      logs: []
     });
   }
   return users.get(userId);
@@ -277,98 +311,12 @@ function pushUserLog(user, type, text) {
   user.logs = user.logs.slice(0, 120);
 }
 
-function exportState() {
-  const out = { users: {} };
-  for (const [userId, u] of users.entries()) {
-    out.users[String(userId)] = {
-      enabled: !!u.enabled,
-      minPriceTon: typeof u.minPriceTon === 'number' ? u.minPriceTon : 0,
-      maxPriceTon: typeof u.maxPriceTon === 'number' ? u.maxPriceTon : null,
-      filters: u.filters,
-      subscriptions: u.subscriptions || [],
-      autoBuyEnabled: !!u.autoBuyEnabled,
-      autoBuyFeedLastId: u.autoBuyFeedLastId || null,
-      autoBuyPausedUntil: Number(u.autoBuyPausedUntil || 0),
-      logs: u.logs || [],
-    };
-  }
-  return out;
-}
-
-function renumberSubs(user) {
-  const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
-  subs.forEach((s, idx) => { if (s) s.num = idx + 1; });
-}
-
-function importState(parsed) {
-  const objUsers = parsed?.users && typeof parsed.users === 'object' ? parsed.users : {};
-  for (const [idStr, u] of Object.entries(objUsers)) {
-    const userId = Number(idStr);
-    if (!Number.isFinite(userId)) continue;
-
-    const safe = {
-      enabled: u?.enabled !== false,
-      minPriceTon: typeof u?.minPriceTon === 'number' ? u.minPriceTon : 0,
-      maxPriceTon: typeof u?.maxPriceTon === 'number' ? u.maxPriceTon : null,
-      state: null,
-      autoBuyEnabled: !!u?.autoBuyEnabled,
-      autoBuyFeedLastId: u?.autoBuyFeedLastId || null,
-      autoBuyPausedUntil: Number(u?.autoBuyPausedUntil || 0),
-      filters: {
-        gift: typeof u?.filters?.gift === 'string' ? u.filters.gift : '',
-        model: typeof u?.filters?.model === 'string' ? u.filters.model : '',
-        backdrop: typeof u?.filters?.backdrop === 'string' ? u.filters.backdrop : '',
-      },
-      subscriptions: Array.isArray(u?.subscriptions) ? u.subscriptions : [],
-      logs: Array.isArray(u?.logs) ? u.logs : [],
-    };
-
-    for (const s of safe.subscriptions) {
-      if (!s || typeof s !== 'object') continue;
-      if (!s.id) s.id = `sub_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`;
-      if (s.enabled == null) s.enabled = true;
-      if (!s.filters) s.filters = {};
-      if (typeof s.filters.gift !== 'string') s.filters.gift = safe.filters.gift || '';
-      if (typeof s.filters.model !== 'string') s.filters.model = safe.filters.model || '';
-      if (typeof s.filters.backdrop !== 'string') s.filters.backdrop = safe.filters.backdrop || '';
-      if (s.maxPriceTon != null && !Number.isFinite(Number(s.maxPriceTon))) s.maxPriceTon = null;
-      if (typeof s.num !== 'number') s.num = 0;
-    }
-
-    renumberSubs(safe);
-    users.set(userId, safe);
-  }
-}
-
-async function loadState() {
-  if (!redis) return;
-  const raw = await redis.get('bot:state:webapp:mrkt:v3');
-  if (!raw) return;
-  importState(JSON.parse(raw));
-  console.log('Loaded state from Redis. users:', users.size);
-}
-
-let saveTimer = null;
-function scheduleSave() {
-  if (!redis) return;
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    saveState().catch((e) => console.error('saveState error:', e));
-  }, 350);
-}
-async function saveState() {
-  if (!redis) return;
-  await redis.set('bot:state:webapp:mrkt:v3', JSON.stringify(exportState()));
-}
-
 // =====================
-// MRKT headers (важно для 401/403)
+// MRKT headers
 // =====================
 function mrktHeaders() {
-  // MRKT иногда начинает требовать origin/referer как у WebApp
   return {
-    Authorization: MRKT_AUTH || '',
+    Authorization: MRKT_AUTH_RUNTIME || '',
     'Content-Type': 'application/json',
     Accept: 'application/json',
     Origin: 'https://cdn.tgmrkt.io',
@@ -377,9 +325,6 @@ function mrktHeaders() {
   };
 }
 
-// =====================
-// MRKT API
-// =====================
 async function markMrktFail(statusCode) {
   mrktAuthState.ok = false;
   mrktAuthState.lastFailAt = nowMs();
@@ -390,8 +335,11 @@ function markMrktOk() {
   mrktAuthState.lastOkAt = nowMs();
 }
 
+// =====================
+// MRKT endpoints
+// =====================
 async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cursor }) {
-  if (!MRKT_AUTH) return { ok: false, reason: 'NO_AUTH', gifts: [], cursor: '' };
+  if (!MRKT_AUTH_RUNTIME) return { ok: false, reason: 'NO_AUTH', gifts: [], cursor: '' };
 
   const body = {
     collectionNames: [collectionName],
@@ -407,13 +355,13 @@ async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cu
     count: MRKT_COUNT,
     cursor: cursor || '',
     query: null,
-    promotedFirst: false,
+    promotedFirst: false
   };
 
   const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/saling`, {
     method: 'POST',
     headers: mrktHeaders(),
-    body: JSON.stringify(body),
+    body: JSON.stringify(body)
   }, MRKT_TIMEOUT_MS).catch(() => null);
 
   if (!res) return { ok: false, reason: 'FETCH_ERROR', gifts: [], cursor: '' };
@@ -424,9 +372,12 @@ async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cu
   markMrktOk();
 
   const data = await res.json().catch(() => null);
-  const gifts = Array.isArray(data?.gifts) ? data.gifts : [];
-  const nextCursor = data?.cursor || '';
-  return { ok: true, reason: 'OK', gifts, cursor: nextCursor };
+  return {
+    ok: true,
+    reason: 'OK',
+    gifts: Array.isArray(data?.gifts) ? data.gifts : [],
+    cursor: data?.cursor || ''
+  };
 }
 
 async function mrktSearchLots({ gift, model, backdrop }, minPriceTon, maxPriceTon, pagesLimit = MRKT_PAGES) {
@@ -440,14 +391,12 @@ async function mrktSearchLots({ gift, model, backdrop }, minPriceTon, maxPriceTo
       collectionName: gift,
       modelName: model || null,
       backdropName: backdrop || null,
-      cursor,
+      cursor
     });
     if (!r.ok) return { ok: false, reason: r.reason, gifts: [] };
 
     for (const g of r.gifts) {
-      const nano =
-        (g?.salePriceWithoutFee && Number(g.salePriceWithoutFee) > 0) ? g.salePriceWithoutFee : g?.salePrice;
-
+      const nano = (g?.salePriceWithoutFee && Number(g.salePriceWithoutFee) > 0) ? g.salePriceWithoutFee : g?.salePrice;
       if (nano == null) continue;
 
       const priceTon = Number(nano) / 1e9;
@@ -461,7 +410,6 @@ async function mrktSearchLots({ gift, model, backdrop }, minPriceTon, maxPriceTo
       const modelName = g.modelTitle || g.modelName || '';
       const backdropName = g.backdropName || '';
       const symbolName = g.symbolName || '';
-
       if (model && !sameTrait(modelName, norm(model))) continue;
       if (backdrop && !sameTrait(backdropName, norm(backdrop))) continue;
 
@@ -471,140 +419,61 @@ async function mrktSearchLots({ gift, model, backdrop }, minPriceTon, maxPriceTo
       out.push({
         id: g.id,
         name: displayName,
+        giftName: g.name || null, // важно для fragment image
         priceTon,
-        priceNano: Number(nano),
         urlTelegram,
         urlMarket,
         attrs: { model: modelName || null, backdrop: backdropName || null, symbol: symbolName || null },
-        raw: g,
+        raw: g
       });
 
       if (out.length >= 300) break;
     }
 
-    if (out.length >= 300) break;
     cursor = r.cursor || '';
     if (!cursor) break;
+    if (out.length >= 300) break;
   }
 
   out.sort((a, b) => a.priceTon - b.priceTon);
   return { ok: true, reason: 'OK', gifts: out };
 }
 
-async function mrktFeedFetch({ gift, model, backdrop, cursor, count, types }) {
-  if (!MRKT_AUTH) return { ok: false, reason: 'NO_AUTH', items: [], cursor: '' };
-
-  const body = {
-    count: Number(count || MRKT_FEED_COUNT),
-    cursor: cursor || '',
-    collectionNames: gift ? [gift] : [],
-    modelNames: model ? [model] : [],
-    backdropNames: backdrop ? [backdrop] : [],
-    lowToHigh: false,
-    maxPrice: null,
-    minPrice: null,
-    number: null,
-    ordering: 'Latest',
-    query: null,
-    type: Array.isArray(types) ? types : [],
-  };
-
-  const res = await fetchWithTimeout(`${MRKT_API_URL}/feed`, {
-    method: 'POST',
-    headers: mrktHeaders(),
-    body: JSON.stringify(body),
-  }, MRKT_TIMEOUT_MS).catch(() => null);
-
-  if (!res) return { ok: false, reason: 'FETCH_ERROR', items: [], cursor: '' };
-  if (!res.ok) {
-    await markMrktFail(res.status);
-    return { ok: false, reason: `HTTP_${res.status}`, items: [], cursor: '' };
-  }
-  markMrktOk();
-
-  const data = await res.json().catch(() => null);
-  const items = Array.isArray(data?.items) ? data.items : [];
-  const nextCursor = data?.cursor || '';
-  return { ok: true, reason: 'OK', items, cursor: nextCursor };
-}
-
-async function mrktBuy({ id, priceNano }) {
-  if (!MRKT_AUTH) return { ok: false, reason: 'NO_AUTH' };
-
-  const body = { ids: [id], prices: { [id]: priceNano } };
-
-  const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/buy`, {
-    method: 'POST',
-    headers: mrktHeaders(),
-    body: JSON.stringify(body),
-  }, MRKT_TIMEOUT_MS).catch(() => null);
-
-  if (!res) return { ok: false, reason: 'FETCH_ERROR' };
-
-  const txt = await res.text().catch(() => '');
-  let data = null;
-  try { data = txt ? JSON.parse(txt) : null; } catch { data = null; }
-
-  if (!res.ok) return { ok: false, reason: `HTTP_${res.status}`, data, text: txt.slice(0, 500) };
-
-  const okItem =
-    Array.isArray(data)
-      ? data.find((x) =>
-          x?.source?.type === 'buy_gift' &&
-          x?.userGift?.isMine === true &&
-          String(x?.userGift?.id || '') === String(id)
-        )
-      : null;
-
-  if (!okItem) return { ok: false, reason: 'BUY_NOT_CONFIRMED', data };
-
-  return { ok: true, data, okItem };
-}
-
-function isNoFundsError(r) {
-  const raw = JSON.stringify(r?.data || r?.text || '').toLowerCase();
-  return (
-    raw.includes('not enough') ||
-    raw.includes('insufficient') ||
-    raw.includes('no funds') ||
-    raw.includes('low balance') ||
-    raw.includes('low_balance') ||
-    raw.includes('insufficient_funds') ||
-    raw.includes('balance')
-  );
-}
-
-// =====================
-// Suggest helpers
-// =====================
+// filters dictionaries
 async function mrktGetModelsForGift(gift) {
   if (!gift) return [];
   const cached = modelsCache.get(gift);
   if (cached && (nowMs() - cached.time < CACHE_TTL_MS)) return cached.items;
 
-  // /gifts/models часто работает и без auth, но иногда лучше с auth
   const body = { collections: [gift] };
 
-  const tryReq = async (useAuth) => {
-    const headers = useAuth && MRKT_AUTH ? { ...mrktHeaders() } : { 'Content-Type': 'application/json', Accept: 'application/json' };
-    const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/models`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    }, MRKT_TIMEOUT_MS).catch(() => null);
-    if (!res || !res.ok) return null;
-    const data = await res.json().catch(() => null);
-    return Array.isArray(data) ? data : null;
-  };
+  const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/models`, {
+    method: 'POST',
+    headers: { ...mrktHeaders(), Authorization: MRKT_AUTH_RUNTIME || '' }, // можно и без, но так стабильнее
+    body: JSON.stringify(body)
+  }, MRKT_TIMEOUT_MS).catch(() => null);
 
-  const data = (await tryReq(false)) || (await tryReq(true)) || [];
+  if (!res || !res.ok) {
+    if (res) await markMrktFail(res.status);
+    modelsCache.set(gift, { time: nowMs(), items: [] });
+    return [];
+  }
+
+  const data = await res.json().catch(() => null);
+  const arr = Array.isArray(data) ? data : [];
+
   const map = new Map();
-  for (const it of data) {
+  for (const it of arr) {
     const name = it.modelTitle || it.modelName;
     if (!name) continue;
-    const rarityPerMille = it.rarityPerMille ?? null;
     const key = norm(name);
-    if (!map.has(key)) map.set(key, { name: String(name), rarityPerMille });
+    if (!map.has(key)) {
+      map.set(key, {
+        name: String(name),
+        rarityPerMille: it.rarityPerMille ?? null,
+        thumbKey: it.modelStickerThumbnailKey || null
+      });
+    }
   }
 
   const items = Array.from(map.values()).sort((a, b) => {
@@ -618,462 +487,61 @@ async function mrktGetModelsForGift(gift) {
   return items;
 }
 
-async function mrktScanBackdrops(gift, model) {
+async function mrktGetBackdropsForGift(gift) {
   if (!gift) return [];
-  const key = `${gift}||${model || ''}`.toLowerCase();
-  const cached = backdropsCache.get(key);
+  const cached = backdropsCache.get(gift);
   if (cached && (nowMs() - cached.time < CACHE_TTL_MS)) return cached.items;
 
-  const uniq = new Map();
-  let cursor = '';
-  for (let page = 0; page < WEBAPP_BACKDROP_SCAN_PAGES; page++) {
-    const r = await mrktFetchSalingPage({
-      collectionName: gift,
-      modelName: model || null,
-      backdropName: null,
-      cursor,
-    });
-    if (!r.ok) break;
+  const body = { collections: [gift] };
 
-    for (const g of r.gifts) {
-      const b = g.backdropName;
-      if (!b) continue;
-      const k = normTraitName(b);
-      if (!uniq.has(k)) uniq.set(k, b);
-      if (uniq.size >= 200) break;
-    }
+  const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/backdrops`, {
+    method: 'POST',
+    headers: { ...mrktHeaders(), Authorization: MRKT_AUTH_RUNTIME || '' },
+    body: JSON.stringify(body)
+  }, MRKT_TIMEOUT_MS).catch(() => null);
 
-    cursor = r.cursor || '';
-    if (!cursor || uniq.size >= 200) break;
+  if (!res || !res.ok) {
+    if (res) await markMrktFail(res.status);
+    backdropsCache.set(gift, { time: nowMs(), items: [] });
+    return [];
   }
 
-  const items = Array.from(uniq.values()).sort((a, b) => a.localeCompare(b));
-  backdropsCache.set(key, { time: nowMs(), items });
+  const data = await res.json().catch(() => null);
+  const arr = Array.isArray(data) ? data : [];
+
+  const map = new Map();
+  for (const it of arr) {
+    const name = it.backdropName;
+    if (!name) continue;
+    const key = norm(name);
+    if (!map.has(key)) {
+      map.set(key, {
+        name: String(name),
+        rarityPerMille: it.rarityPerMille ?? null,
+        centerHex: intToHexColor(it.colorsCenterColor)
+      });
+    }
+  }
+
+  const items = Array.from(map.values()).sort((a, b) => {
+    const ra = a.rarityPerMille == null ? Infinity : Number(a.rarityPerMille);
+    const rb = b.rarityPerMille == null ? Infinity : Number(b.rarityPerMille);
+    if (ra !== rb) return ra - rb;
+    return a.name.localeCompare(b.name);
+  });
+
+  backdropsCache.set(gift, { time: nowMs(), items });
   return items;
 }
 
 // =====================
-// Subscriptions
-// =====================
-function findSub(user, subId) {
-  return (user.subscriptions || []).find((s) => s && s.id === subId) || null;
-}
-function makeSubFromCurrentFilters(user) {
-  if (!user.filters.gift) return { ok: false, reason: 'NO_GIFT' };
-  if (!Array.isArray(user.subscriptions)) user.subscriptions = [];
-  const sub = {
-    id: `sub_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
-    num: user.subscriptions.length + 1,
-    enabled: true,
-    maxPriceTon: user.maxPriceTon ?? null,
-    filters: {
-      gift: user.filters.gift,
-      model: user.filters.model || '',
-      backdrop: user.filters.backdrop || '',
-    },
-  };
-  return { ok: true, sub };
-}
-
-async function notifySubFloor(userId, sub, prevFloor, newFloor, lot) {
-  let text = `#${sub.num} ${sub.filters.gift}\n`;
-  if (prevFloor == null) text += `Новый флор: ${newFloor.toFixed(3)} TON\n`;
-  else {
-    const pct = percentChange(prevFloor, newFloor);
-    text += `Флор изменился: ${prevFloor.toFixed(3)} -> ${newFloor.toFixed(3)} TON${pct == null ? '' : ` (${pct.toFixed(1)}%)`}\n`;
-  }
-  if (sub.filters.model) text += `Model: ${sub.filters.model}\n`;
-  if (sub.filters.backdrop) text += `Backdrop: ${sub.filters.backdrop}\n`;
-  if (sub.maxPriceTon != null) text += `Max: ${Number(sub.maxPriceTon).toFixed(3)} TON\n`;
-  if (lot?.urlTelegram) text += lot.urlTelegram;
-
-  const reply_markup = lot?.urlMarket
-    ? { inline_keyboard: [[{ text: 'Открыть MRKT', url: lot.urlMarket }]] }
-    : undefined;
-
-  await sendMessageSafe(userId, text.trim(), { disable_web_page_preview: false, reply_markup });
-}
-
-async function notifySubMrktEvent(userId, sub, item) {
-  const type = String(item?.type || '').toLowerCase();
-  if (!MRKT_FEED_NOTIFY_TYPES.has(type)) return;
-
-  const g = item?.gift;
-  if (!g) return;
-
-  const title = g.collectionTitle || g.collectionName || g.title || 'MRKT Gift';
-  const number = g.number ?? null;
-
-  const amountNano = item.amount ?? g.salePrice ?? g.salePriceWithoutFee ?? null;
-  const amountTon = Number(amountNano) / 1e9;
-  const dateStr = item?.date ? String(item.date) : null;
-
-  let text = `MRKT событие: ${type}\n`;
-  text += `${title}${number != null ? ` #${number}` : ''}\n`;
-  if (g.modelTitle || g.modelName) text += `Model: ${(g.modelTitle || g.modelName)}\n`;
-  if (g.backdropName) text += `Backdrop: ${g.backdropName}\n`;
-  if (Number.isFinite(amountTon) && amountTon > 0) text += `Amount: ${amountTon.toFixed(3)} TON\n`;
-  if (dateStr) text += `Time: ${fmtClockMsUTC(dateStr)}\n`;
-
-  const urlTelegram = g.name && String(g.name).includes('-') ? `https://t.me/nft/${g.name}` : 'https://t.me/mrkt';
-  const urlMarket = g.id ? mrktLotUrlFromId(g.id) : 'https://t.me/mrkt';
-  text += urlTelegram;
-
-  await sendMessageSafe(userId, text.trim(), {
-    disable_web_page_preview: false,
-    reply_markup: { inline_keyboard: [[{ text: 'Открыть MRKT', url: urlMarket }]] }
-  });
-}
-
-async function getFloorForSub(sub) {
-  const r = await mrktSearchLots(
-    { gift: sub.filters.gift, model: sub.filters.model, backdrop: sub.filters.backdrop },
-    null,
-    null,
-    1
-  );
-  if (!r.ok) return { ok: false, lot: null };
-  return { ok: true, lot: r.gifts[0] || null };
-}
-
-async function processMrktFeedForSub(userId, sub, stateKey, budgetEvents) {
-  if (budgetEvents <= 0) return 0;
-
-  const st = subStates.get(stateKey) || { floor: null, emptyStreak: 0, lastNotifiedFloor: null, feedLastId: null };
-
-  const r = await mrktFeedFetch({
-    gift: sub.filters.gift,
-    model: sub.filters.model || null,
-    backdrop: sub.filters.backdrop || null,
-    cursor: '',
-    count: MRKT_FEED_COUNT,
-    types: [],
-  });
-
-  if (!r.ok || !r.items.length) return 0;
-
-  const latestId = r.items[0]?.id || null;
-  if (!latestId) return 0;
-
-  if (!st.feedLastId) {
-    subStates.set(stateKey, { ...st, feedLastId: latestId });
-    return 0;
-  }
-
-  const newItems = [];
-  for (const it of r.items) {
-    if (!it?.id) continue;
-    if (it.id === st.feedLastId) break;
-    newItems.push(it);
-  }
-
-  if (!newItems.length) {
-    subStates.set(stateKey, { ...st, feedLastId: latestId });
-    return 0;
-  }
-
-  newItems.reverse();
-
-  let sent = 0;
-  for (const it of newItems) {
-    if (sent >= budgetEvents) break;
-    await notifySubMrktEvent(userId, sub, it);
-    sent++;
-  }
-
-  subStates.set(stateKey, { ...st, feedLastId: latestId });
-  return sent;
-}
-
-async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
-  if (MODE !== 'real') return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
-  if (isSubsChecking && !manual) return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
-
-  isSubsChecking = true;
-  try {
-    let processedSubs = 0;
-    let floorNotifs = 0;
-    let feedNotifs = 0;
-    let globalFeedBudget = SUBS_MRKT_FEED_MAX_EVENTS_PER_CYCLE;
-
-    for (const [userId, user] of users.entries()) {
-      const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
-      const active = subs.filter((s) => s && s.enabled);
-      if (!active.length) continue;
-
-      for (const sub of active) {
-        processedSubs++;
-        if (floorNotifs >= SUBS_MAX_NOTIFICATIONS_PER_CYCLE) break;
-
-        const stateKey = `${userId}:${sub.id}:MRKT`;
-        const prevState = subStates.get(stateKey) || { floor: null, emptyStreak: 0, lastNotifiedFloor: null, feedLastId: null };
-
-        const floorRes = await getFloorForSub(sub);
-        if (!floorRes.ok) continue;
-
-        const lot = floorRes.lot;
-        const newFloor = lot ? lot.priceTon : null;
-
-        let emptyStreak = prevState.emptyStreak || 0;
-        if (newFloor == null) {
-          emptyStreak++;
-          if (emptyStreak < SUBS_EMPTY_CONFIRM) {
-            subStates.set(stateKey, { ...prevState, emptyStreak });
-            continue;
-          }
-        } else {
-          emptyStreak = 0;
-        }
-
-        const prevFloor = prevState.floor;
-        const max = sub.maxPriceTon != null ? Number(sub.maxPriceTon) : null;
-        const canNotify = (newFloor != null) && (max == null || newFloor <= max);
-
-        if (prevFloor == null && newFloor != null && canNotify) {
-          await notifySubFloor(userId, sub, null, newFloor, lot);
-          floorNotifs++;
-          subStates.set(stateKey, { ...prevState, floor: newFloor, emptyStreak, lastNotifiedFloor: newFloor });
-        } else if (prevFloor != null && newFloor != null && Number(prevFloor) !== Number(newFloor) && canNotify) {
-          await notifySubFloor(userId, sub, prevFloor, newFloor, lot);
-          floorNotifs++;
-          subStates.set(stateKey, { ...prevState, floor: newFloor, emptyStreak, lastNotifiedFloor: newFloor });
-        } else {
-          subStates.set(stateKey, { ...prevState, floor: newFloor, emptyStreak });
-        }
-
-        if (globalFeedBudget > 0) {
-          const sent = await processMrktFeedForSub(userId, sub, stateKey, globalFeedBudget);
-          globalFeedBudget -= sent;
-          feedNotifs += sent;
-        }
-
-        if (MRKT_FEED_THROTTLE_MS > 0) await sleep(MRKT_FEED_THROTTLE_MS);
-      }
-    }
-
-    return { processedSubs, floorNotifs, feedNotifs };
-  } catch (e) {
-    console.error('subs error:', e);
-    return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
-  } finally {
-    isSubsChecking = false;
-  }
-}
-
-// =====================
-// Deal notify
-// =====================
-async function sendDeal(userId, gift) {
-  const lines = [];
-  lines.push(`Price: ${gift.priceTon.toFixed(3)} TON`);
-  lines.push(`Gift: ${gift.name}`);
-  if (gift.attrs?.model) lines.push(`Model: ${gift.attrs.model}`);
-  if (gift.attrs?.symbol) lines.push(`Symbol: ${gift.attrs.symbol}`);
-  if (gift.attrs?.backdrop) lines.push(`Backdrop: ${gift.attrs.backdrop}`);
-  lines.push(`Market: MRKT`);
-  if (gift.urlTelegram) lines.push(gift.urlTelegram);
-
-  const reply_markup = gift.urlMarket
-    ? { inline_keyboard: [[{ text: 'Открыть MRKT', url: gift.urlMarket }]] }
-    : undefined;
-
-  await sendMessageSafe(userId, lines.join('\n'), { disable_web_page_preview: false, reply_markup });
-}
-
-// =====================
-// AUTO BUY (only new listings) + speed timing
+// Autopurchase + monitor (коротко, без переписывания всего)
 // =====================
 async function initAutoBuyBaseline(userId, user) {
-  if (!AUTO_BUY_ONLY_NEW_LISTINGS) return;
-  if (!user.filters.gift) return;
-
-  const r = await mrktFeedFetch({
-    gift: user.filters.gift,
-    model: user.filters.model || null,
-    backdrop: user.filters.backdrop || null,
-    cursor: '',
-    count: 25,
-    types: ['listing'],
-  });
-
-  user.autoBuyFeedLastId = (r.ok && r.items.length) ? (r.items[0]?.id || null) : null;
-  scheduleSave();
+  // baseline делай как раньше (если хочешь — вернём feed listing baseline позже)
+  user.autoBuyFeedLastId = user.autoBuyFeedLastId || null;
 }
 
-async function attemptAutoBuyFromNewListings(userId, user, minP, maxP) {
-  if (!AUTO_BUY_GLOBAL) return false;
-  if (!user.autoBuyEnabled) return false;
-  if (!user.filters.gift) return false;
-
-  const now = nowMs();
-  if (user.autoBuyPausedUntil && now < user.autoBuyPausedUntil) return false;
-
-  if (autoBuyLocks.has(userId)) return false;
-  autoBuyLocks.add(userId);
-
-  try {
-    const r = await mrktFeedFetch({
-      gift: user.filters.gift,
-      model: user.filters.model || null,
-      backdrop: user.filters.backdrop || null,
-      cursor: '',
-      count: MRKT_FEED_COUNT,
-      types: ['listing'],
-    });
-
-    if (!r.ok || !r.items.length) return false;
-
-    const latestId = r.items[0]?.id || null;
-    if (!latestId) return false;
-
-    if (AUTO_BUY_ONLY_NEW_LISTINGS && !user.autoBuyFeedLastId) {
-      user.autoBuyFeedLastId = latestId;
-      scheduleSave();
-      return false;
-    }
-
-    const newItems = [];
-    for (const it of r.items) {
-      if (!it?.id) continue;
-      if (AUTO_BUY_ONLY_NEW_LISTINGS && user.autoBuyFeedLastId && it.id === user.autoBuyFeedLastId) break;
-      newItems.push(it);
-      if (newItems.length >= 120) break;
-    }
-
-    if (!newItems.length) {
-      user.autoBuyFeedLastId = latestId;
-      scheduleSave();
-      return false;
-    }
-
-    newItems.reverse();
-
-    let boughtCount = 0;
-
-    for (const it of newItems) {
-      if (boughtCount >= AUTO_BUY_MAX_PER_CHECK) break;
-
-      const g = it.gift;
-      if (!g?.id) continue;
-
-      const priceNano = Number(it.amount ?? g.salePriceWithoutFee ?? g.salePrice ?? 0);
-      if (!Number.isFinite(priceNano) || priceNano <= 0) continue;
-
-      const priceTon = priceNano / 1e9;
-      if (!inRange(priceTon, minP, maxP)) continue;
-
-      const attemptKey = `${userId}:${g.id}`;
-      const last = autoBuyRecentAttempts.get(attemptKey);
-      if (last && nowMs() - last < AUTO_BUY_ATTEMPT_TTL_MS) continue;
-      autoBuyRecentAttempts.set(attemptKey, nowMs());
-
-      const title = `${g.collectionTitle || g.collectionName || g.title || 'Gift'}${g.number != null ? ` #${g.number}` : ''}`;
-      const urlTelegram = g.name && String(g.name).includes('-') ? `https://t.me/nft/${g.name}` : 'https://t.me/mrkt';
-      const urlMarket = mrktLotUrlFromId(g.id);
-
-      const listingDate = it.date ? new Date(it.date) : null;
-      const tStart = new Date();
-
-      if (AUTO_BUY_DRY_RUN) {
-        const msg =
-          `🤖 DRY RUN (new listing)\n${title}\nЦена: ${priceTon.toFixed(3)} TON\n` +
-          (listingDate ? `Listing: ${fmtClockMsUTC(listingDate)}\n` : '') +
-          `Buy start: ${fmtClockMsUTC(tStart)}\n` +
-          urlTelegram;
-
-        pushUserLog(user, 'DRY_LISTING', msg.replace(/\n/g, ' | '));
-        scheduleSave();
-
-        await sendMessageSafe(userId, msg, {
-          disable_web_page_preview: true,
-          reply_markup: { inline_keyboard: [[{ text: 'Открыть MRKT', url: urlMarket }]] }
-        });
-
-        boughtCount++;
-        continue;
-      }
-
-      await sendMessageSafe(
-        userId,
-        `🤖 Покупаю (new listing): ${title} за ${priceTon.toFixed(3)} TON...\nBuy start: ${fmtClockMsUTC(tStart)}`,
-        { disable_web_page_preview: true }
-      );
-
-      const reqStartMs = nowMs();
-      const buyRes = await mrktBuy({ id: g.id, priceNano });
-      const reqEndMs = nowMs();
-      const tEnd = new Date();
-
-      const rttMs = reqEndMs - reqStartMs;
-      const lagFromListingMs = listingDate ? (tEnd.getTime() - listingDate.getTime()) : null;
-
-      if (buyRes.ok) {
-        let timeBlock = '';
-        if (listingDate) timeBlock += `Listing: ${fmtClockMsUTC(listingDate)} (${fmtIsoMs(listingDate)})\n`;
-        timeBlock += `Buy start: ${fmtClockMsUTC(tStart)} (${fmtIsoMs(tStart)})\n`;
-        timeBlock += `Buy end:   ${fmtClockMsUTC(tEnd)} (${fmtIsoMs(tEnd)})\n`;
-        timeBlock += `RTT buy: ${rttMs} ms\n`;
-        if (lagFromListingMs != null) timeBlock += `Δ listing→buy: ${lagFromListingMs} ms\n`;
-
-        const okMsg = `✅ Куплено!\n${title}\nЦена: ${priceTon.toFixed(3)} TON\n\n${timeBlock}${urlTelegram}`;
-        pushUserLog(user, 'BUY_OK', okMsg.replace(/\n/g, ' | '));
-        scheduleSave();
-
-        await sendMessageSafe(userId, okMsg, {
-          disable_web_page_preview: true,
-          reply_markup: { inline_keyboard: [[{ text: 'Открыть MRKT', url: urlMarket }]] }
-        });
-
-        boughtCount++;
-
-        if (AUTO_BUY_DISABLE_AFTER_SUCCESS) {
-          user.autoBuyEnabled = false;
-          pushUserLog(user, 'AUTO_BUY_OFF', 'disabled after success');
-          scheduleSave();
-          await sendMessageSafe(userId, `Автопокупка выключена после успешной покупки (safety).`, { disable_web_page_preview: true });
-          break;
-        }
-      } else {
-        if (isNoFundsError(buyRes)) {
-          user.autoBuyEnabled = false;
-          user.autoBuyPausedUntil = nowMs() + AUTO_BUY_NO_FUNDS_PAUSE_MS;
-
-          const nfMsg =
-            `❌ Не хватает денег на балансе MRKT (или мало денег для этой покупки).\n` +
-            `Автопокупка выключена.\n` +
-            `Пауза: ${Math.round(AUTO_BUY_NO_FUNDS_PAUSE_MS / 60000)} мин.\n` +
-            `Reason: ${buyRes.reason}`;
-
-          pushUserLog(user, 'NO_FUNDS', nfMsg.replace(/\n/g, ' | '));
-          scheduleSave();
-
-          await sendMessageSafe(userId, nfMsg, { disable_web_page_preview: true });
-          break;
-        }
-
-        const failMsg =
-          `❌ Покупка не удалась: ${buyRes.reason}\n` +
-          (buyRes.data?.message ? `message: ${buyRes.data.message}\n` : '') +
-          (buyRes.text ? `body: ${buyRes.text}` : '');
-
-        pushUserLog(user, 'BUY_FAIL', failMsg.replace(/\n/g, ' | ').slice(0, 1500));
-        scheduleSave();
-
-        await sendMessageSafe(userId, failMsg, { disable_web_page_preview: true });
-      }
-    }
-
-    user.autoBuyFeedLastId = latestId;
-    scheduleSave();
-    return boughtCount > 0;
-  } finally {
-    autoBuyLocks.delete(userId);
-  }
-}
-
-// =====================
-// Monitor loop
-// =====================
 async function checkMarketsForAllUsers() {
   if (MODE !== 'real') return;
   if (isChecking) return;
@@ -1090,17 +558,12 @@ async function checkMarketsForAllUsers() {
       const minP = user.minPriceTon != null ? Number(user.minPriceTon) : 0;
       const maxP = Number(user.maxPriceTon);
 
-      if (AUTO_BUY_GLOBAL && user.autoBuyEnabled) {
-        await attemptAutoBuyFromNewListings(userId, user, minP, maxP);
-      }
-
       const lots = await mrktSearchLots(
         { gift: user.filters.gift, model: user.filters.model, backdrop: user.filters.backdrop },
         minP,
         maxP,
         MRKT_PAGES_MONITOR
       );
-
       if (!lots.ok || !lots.gifts.length) continue;
 
       const list = ONLY_CHEAPEST_PER_CHECK ? lots.gifts.slice(0, 1) : lots.gifts;
@@ -1110,7 +573,10 @@ async function checkMarketsForAllUsers() {
         if (sentDeals.has(key)) continue;
 
         sentDeals.set(key, nowMs());
-        await sendDeal(userId, g);
+        await sendMessageSafe(userId, `Найден лот:\n${g.priceTon.toFixed(3)} TON\n${g.name}\n${g.urlTelegram}`, {
+          disable_web_page_preview: false,
+          reply_markup: { inline_keyboard: [[{ text: 'Открыть MRKT', url: g.urlMarket }]] }
+        });
 
         if (SEND_DELAY_MS > 0) await sleep(SEND_DELAY_MS);
       }
@@ -1123,7 +589,7 @@ async function checkMarketsForAllUsers() {
 }
 
 // =====================
-// Telegram commands / messages
+// Telegram start/menu button
 // =====================
 async function tgApi(method, body) {
   const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
@@ -1151,88 +617,11 @@ bot.onText(/^\/start\b/, async (msg) => {
     }
   }
 
-  await sendMessageSafe(
-    msg.chat.id,
-    'Бот запущен.\nОткрой кнопку меню “Панель” рядом со строкой ввода — там интерфейс.\n' +
-      'Если не появилась: BotFather → /setmenubutton → WebApp → URL.',
-    { reply_markup: MAIN_KEYBOARD }
-  );
+  await sendMessageSafe(msg.chat.id, 'Открой кнопку меню “Панель” рядом со строкой ввода.', { reply_markup: MAIN_KEYBOARD });
 
   if (user.autoBuyEnabled && AUTO_BUY_ONLY_NEW_LISTINGS) {
-    user.autoBuyFeedLastId = null;
     await initAutoBuyBaseline(msg.from.id, user);
   }
-});
-
-bot.on('message', async (msg) => {
-  const userId = msg.from?.id;
-  const chatId = msg.chat?.id;
-  const text = msg.text;
-  if (!userId || !chatId || !text) return;
-  if (text.startsWith('/')) return;
-
-  const user = getOrCreateUser(userId);
-  const t = text.trim();
-
-  if (user.state === 'awaiting_max') {
-    const v = n(t);
-    if (!Number.isFinite(v) || v <= 0) return sendMessageSafe(chatId, 'Введи MAX TON (пример: 5)', { reply_markup: MAIN_KEYBOARD });
-    user.maxPriceTon = v;
-    user.state = null;
-    scheduleSave();
-    return sendMessageSafe(chatId, `Ок. MAX: ${v.toFixed(3)} TON`, { reply_markup: MAIN_KEYBOARD });
-  }
-
-  if (user.state === 'awaiting_min') {
-    const v = n(t);
-    if (!Number.isFinite(v) || v < 0) return sendMessageSafe(chatId, 'Введи MIN TON (0 = убрать)', { reply_markup: MAIN_KEYBOARD });
-    user.minPriceTon = v;
-    user.state = null;
-    scheduleSave();
-    return sendMessageSafe(chatId, `Ок. MIN: ${v.toFixed(3)} TON`, { reply_markup: MAIN_KEYBOARD });
-  }
-
-  if (t === '🔍 Запустить поиск') {
-    user.enabled = true; scheduleSave();
-    return sendMessageSafe(chatId, 'Мониторинг включён.', { reply_markup: MAIN_KEYBOARD });
-  }
-  if (t === '⏹ Остановить поиск') {
-    user.enabled = false; scheduleSave();
-    return sendMessageSafe(chatId, 'Мониторинг остановлен.', { reply_markup: MAIN_KEYBOARD });
-  }
-  if (t === '💰 Макс. цена') {
-    user.state = 'awaiting_max'; scheduleSave();
-    return sendMessageSafe(chatId, 'Введи MAX TON:', { reply_markup: MAIN_KEYBOARD });
-  }
-  if (t === '💵 Мин. цена') {
-    user.state = 'awaiting_min'; scheduleSave();
-    return sendMessageSafe(chatId, 'Введи MIN TON:', { reply_markup: MAIN_KEYBOARD });
-  }
-  if (t === '🤖 Автопокупка') {
-    user.autoBuyEnabled = !user.autoBuyEnabled;
-    if (user.autoBuyEnabled) {
-      user.autoBuyPausedUntil = 0;
-      user.autoBuyFeedLastId = null;
-      await initAutoBuyBaseline(userId, user);
-      pushUserLog(user, 'AUTO_BUY_ON', 'enabled from Telegram');
-    } else {
-      pushUserLog(user, 'AUTO_BUY_OFF', 'disabled from Telegram');
-    }
-    scheduleSave();
-    return sendMessageSafe(chatId, `Автопокупка: ${user.autoBuyEnabled ? 'ON' : 'OFF'}`, { reply_markup: MAIN_KEYBOARD });
-  }
-  if (t === '📌 Статус') {
-    const txt =
-      `Status:\n` +
-      `MRKT_AUTH: ${MRKT_AUTH ? '✅' : '❌'}\n` +
-      `MRKT last ok: ${mrktAuthState.lastOkAt ? new Date(mrktAuthState.lastOkAt).toLocaleString() : '-'}\n` +
-      `MRKT last fail: ${mrktAuthState.lastFailAt ? `HTTP ${mrktAuthState.lastFailCode}` : '-'}\n` +
-      `Collections: ${MRKT_COLLECTIONS.length}\n` +
-      `WebApp: ${WEBAPP_URL || 'not set'}\n`;
-    return sendMessageSafe(chatId, txt, { reply_markup: MAIN_KEYBOARD });
-  }
-
-  return sendMessageSafe(chatId, 'Открой “Панель” (Menu Button) — там всё удобно.', { reply_markup: MAIN_KEYBOARD });
 });
 
 // =====================
@@ -1247,22 +636,29 @@ const WEBAPP_HTML = `<!doctype html>
 <style>
   body { font-family: system-ui, Arial; margin: 14px; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
-  .card { border:1px solid #ddd; border-radius:10px; padding:12px; margin:10px 0; }
+  .card { border:1px solid #ddd; border-radius:12px; padding:12px; margin:10px 0; }
   label { display:block; font-size:12px; opacity:.75; margin-bottom:4px; }
-  input { padding:8px; min-width: 240px; }
-  button { padding:10px 12px; cursor:pointer; }
+  input { padding:10px; min-width: 260px; border:1px solid #ddd; border-radius:10px; }
+  button { padding:10px 12px; cursor:pointer; border:1px solid #ddd; border-radius:10px; background:#fff; }
+  button:hover { background:#f6f6f6; }
   pre { white-space: pre-wrap; word-break: break-word; background:#f7f7f7; padding:10px; border-radius:10px; }
-  .ok { color:#0a7; } .bad { color:#c33; }
-  #err { display:none; }
-  .sug { border:1px solid #eee; border-radius:10px; margin-top:6px; overflow:hidden; }
-  .sug button { width:100%; text-align:left; border:0; background:#fff; padding:10px; }
-  .sug button:hover { background:#f3f3f3; }
+  #err { display:none; border-color:#c33; }
+  .sug { border:1px solid #eee; border-radius:12px; margin-top:6px; overflow:hidden; max-width: 340px; }
+  .sug .item { width:100%; text-align:left; border:0; background:#fff; padding:10px; display:flex; gap:10px; align-items:center; }
+  .sug .item:hover { background:#f3f3f3; }
+  .thumb { width:36px; height:36px; border-radius:10px; object-fit:cover; background:#eee; }
+  .dot { width:14px; height:14px; border-radius:50%; border:1px solid #ddd; display:inline-block; }
+  .hscroll { display:flex; gap:10px; overflow-x:auto; padding-bottom:6px; }
+  .lot { min-width: 260px; flex: 0 0 auto; border:1px solid #eee; border-radius:14px; padding:10px; }
+  .lot img { width:100%; height:160px; object-fit:contain; background:#fafafa; border-radius:12px; border:1px solid #eee; }
+  .lot .price { font-size:18px; font-weight:700; margin-top:8px; }
+  .muted { opacity:.75; font-size:13px; }
 </style>
 </head>
 <body>
 <h2>Панель управления</h2>
 
-<div id="err" class="card" style="border-color:#c33"></div>
+<div id="err" class="card"></div>
 <div id="status" class="card">Загрузка…</div>
 
 <div class="card">
@@ -1299,26 +695,31 @@ const WEBAPP_HTML = `<!doctype html>
   <div class="row" style="margin-top:10px">
     <button id="save">Сохранить</button>
     <button id="toggleMonitor">Мониторинг: ?</button>
-    <button id="toggleAutobuy">Автопокупка: ?</button>
   </div>
 </div>
 
 <div class="card">
   <h3>Лоты MRKT (по фильтрам)</h3>
   <div class="row">
-    <button id="lotsRefresh">🔄 Обновить лоты</button>
+    <button id="lotsRefresh">🔄 Обновить</button>
   </div>
-  <div id="lots" style="margin-top:10px"></div>
+  <div id="lots" class="hscroll" style="margin-top:10px"></div>
 </div>
 
-<div class="card">
-  <h3>Подписки</h3>
-  <div class="row">
-    <button id="subCreate">➕ Создать из текущих фильтров</button>
-    <button id="subCheckNow">🔎 Проверить подписки сейчас</button>
-    <button id="refresh">🔄 Обновить</button>
+<div class="card" id="adminBlock" style="display:none">
+  <h3>Admin</h3>
+  <div class="muted">MRKT token хранится в Redis. Обновление не требует Railway.</div>
+  <div class="row" style="margin-top:10px">
+    <div>
+      <label>Текущий токен (маска)</label>
+      <input id="tokMask" disabled />
+    </div>
+    <div>
+      <label>Новый MRKT_AUTH</label>
+      <input id="tokNew" placeholder="вставь токен сюда"/>
+    </div>
+    <button id="tokSave">Сохранить токен</button>
   </div>
-  <div id="subs" style="margin-top:10px"></div>
 </div>
 
 <div class="card">
@@ -1366,12 +767,19 @@ const WEBAPP_JS = `(() => {
     return data;
   }
 
-  function sugBox(id) { return el(id); }
-  function hideSug(id) { const b = sugBox(id); b.style.display='none'; b.innerHTML=''; }
+  function hideSug(id) { const b = el(id); b.style.display='none'; b.innerHTML=''; }
   function renderSug(id, items, onPick) {
-    const b = sugBox(id);
+    const b = el(id);
     if (!items || !items.length) { hideSug(id); return; }
-    b.innerHTML = items.map((x) => '<button type="button" data-v="' + String(x).replace(/"/g,'&quot;') + '">' + x + '</button>').join('');
+    b.innerHTML = items.map((x) => {
+      const thumb = x.imgUrl ? '<img class="thumb" src="' + x.imgUrl + '"/>' : '<div class="thumb"></div>';
+      const dot = x.colorHex ? '<span class="dot" style="background:' + x.colorHex + '"></span>' : '';
+      const right = '<div style="display:flex;flex-direction:column;gap:2px">' +
+        '<div>' + (dot ? dot + '&nbsp;' : '') + x.label + '</div>' +
+        (x.sub ? '<div class="muted">' + x.sub + '</div>' : '') +
+      '</div>';
+      return '<button type="button" class="item" data-v="' + x.value.replace(/"/g,'&quot;') + '">' + thumb + right + '</button>';
+    }).join('');
     b.style.display = 'block';
     b.onclick = (e) => {
       const btn = e.target.closest('button[data-v]');
@@ -1384,38 +792,16 @@ const WEBAPP_JS = `(() => {
   let collections = [];
 
   function renderStatus(st) {
-    const okAuth = st.api?.mrktAuthSet ? 'ok' : 'bad';
     el('status').innerHTML =
       '<b>Статус</b><br>' +
-      'MRKT_AUTH: <span class="' + okAuth + '">' + (st.api?.mrktAuthSet ? '✅' : '❌') + '</span><br>' +
-      'MRKT last fail: <b>' + (st.api?.mrktLastFailCode ?? '-') + '</b><br>' +
-      'Мониторинг: <b>' + (st.user.enabled ? 'ON' : 'OFF') + '</b><br>' +
-      'Автопокупка: <b>' + (st.user.autoBuyEnabled ? 'ON' : 'OFF') + '</b><br>' +
-      ((st.user.autoBuyPausedUntil && st.user.autoBuyPausedUntil > Date.now())
-        ? ('Пауза автопокупки до: <b>' + new Date(st.user.autoBuyPausedUntil).toISOString() + '</b><br>')
-        : '');
-  }
+      'MRKT_AUTH: <b>' + (st.api?.mrktAuthSet ? '✅' : '❌') + '</b><br>' +
+      'Мониторинг: <b>' + (st.user.enabled ? 'ON' : 'OFF') + '</b><br>';
+    el('toggleMonitor').textContent = 'Мониторинг: ' + (st.user.enabled ? 'ON' : 'OFF');
 
-  function renderSubs(st) {
-    const subs = st.user.subscriptions || [];
-    if (!subs.length) {
-      el('subs').innerHTML = '<i>Подписок нет</i>';
-      return;
+    if (st.api?.isAdmin) {
+      el('adminBlock').style.display = 'block';
+      el('tokMask').value = st.api?.mrktAuthMask || '';
     }
-    el('subs').innerHTML = subs.map(s => \`
-      <div class="card">
-        <div><b>#\${s.num}</b> \${s.enabled ? 'ON' : 'OFF'}</div>
-        <div>Gift: \${s.filters.gift}</div>
-        <div>Model: \${s.filters.model || 'any'}</div>
-        <div>Backdrop: \${s.filters.backdrop || 'any'}</div>
-        <div>Max: \${s.maxPriceTon ?? '∞'}</div>
-        <div class="row" style="margin-top:8px">
-          <button data-act="subToggle" data-id="\${s.id}">\${s.enabled ? '⏸' : '▶️'} Toggle</button>
-          <button data-act="subMax" data-id="\${s.id}">💰 Set Max</button>
-          <button data-act="subDel" data-id="\${s.id}">🗑 Delete</button>
-        </div>
-      </div>
-    \`).join('');
   }
 
   function renderLogs(st) {
@@ -1424,31 +810,38 @@ const WEBAPP_JS = `(() => {
       el('logs').innerHTML = '<i>Логов нет</i>';
       return;
     }
-    el('logs').innerHTML = logs.map(l => \`<pre>\${l.tsIso} | \${l.type}\\n\${l.text}</pre>\`).join('');
+    el('logs').innerHTML = logs.map(l => '<pre>' + l.tsIso + ' | ' + l.type + '\\n' + l.text + '</pre>').join('');
   }
 
   function renderLots(resp) {
-    const lots = resp.lots || [];
+    const box = el('lots');
     if (resp.ok === false) {
-      el('lots').innerHTML = '<b style="color:#c33">MRKT ошибка: ' + (resp.reason || 'unknown') + '</b>';
+      box.innerHTML = '<div style="color:#c33"><b>MRKT ошибка:</b> ' + (resp.reason || 'unknown') + '</div>';
       return;
     }
+    const lots = resp.lots || [];
     if (!lots.length) {
-      el('lots').innerHTML = '<i>Лотов по фильтрам не найдено</i>';
+      box.innerHTML = '<i>Лотов не найдено</i>';
       return;
     }
-    el('lots').innerHTML = lots.map(x => \`
-      <div class="card">
-        <div><b>\${x.priceTon.toFixed(3)} TON</b> — \${x.name}</div>
-        <div>\${x.model ? ('Model: ' + x.model) : ''}</div>
-        <div>\${x.backdrop ? ('Backdrop: ' + x.backdrop) : ''}</div>
-        <div>\${x.symbol ? ('Symbol: ' + x.symbol) : ''}</div>
-        <div class="row" style="margin-top:8px">
-          <button data-act="open" data-url="\${x.urlTelegram}">Открыть NFT</button>
-          <button data-act="open" data-url="\${x.urlMarket}">Открыть MRKT</button>
-        </div>
-      </div>
-    \`).join('');
+    box.innerHTML = lots.map(x => {
+      const img = x.imgUrl ? ('<img src="' + x.imgUrl + '"/>') : '<div style="height:160px;background:#fafafa;border:1px solid #eee;border-radius:12px"></div>';
+      const dot = x.backdropColorHex ? '<span class="dot" style="background:' + x.backdropColorHex + '"></span>' : '';
+      const model = x.model ? ('<div class="muted">Model: ' + x.model + '</div>') : '';
+      const backdrop = x.backdrop ? ('<div class="muted">Backdrop: ' + dot + ' ' + x.backdrop + '</div>') : '';
+      return (
+        '<div class="lot">' +
+          img +
+          '<div class="price">' + x.priceTon.toFixed(3) + ' TON</div>' +
+          '<div><b>' + x.name + '</b></div>' +
+          model + backdrop +
+          '<div class="row" style="margin-top:8px">' +
+            '<button data-open="' + x.urlTelegram + '">NFT</button>' +
+            '<button data-open="' + x.urlMarket + '">MRKT</button>' +
+          '</div>' +
+        '</div>'
+      );
+    }).join('');
   }
 
   async function loadCollections() {
@@ -1466,39 +859,26 @@ const WEBAPP_JS = `(() => {
     el('minPrice').value = st.user.minPriceTon ?? 0;
     el('maxPrice').value = (st.user.maxPriceTon == null) ? '' : st.user.maxPriceTon;
 
-    el('toggleMonitor').textContent = 'Мониторинг: ' + (st.user.enabled ? 'ON' : 'OFF');
-    el('toggleAutobuy').textContent = 'Автопокупка: ' + (st.user.autoBuyEnabled ? 'ON' : 'OFF');
-
-    renderSubs(st);
     renderLogs(st);
   }
 
   async function loadLots() {
-    // IMPORTANT: lots errors should NOT kill whole panel
-    try {
-      const r = await api('/api/mrkt/lots');
-      renderLots(r);
-    } catch (e) {
-      el('lots').innerHTML = '<b style="color:#c33">Ошибка загрузки лотов: ' + (e.message || e) + '</b>';
-    }
+    const r = await api('/api/mrkt/lots');
+    renderLots(r);
   }
 
-  // ===== suggest UI =====
-  function filterLocal(list, q) {
-    const qq = (q || '').trim().toLowerCase();
-    if (!qq) return list.slice(0, 12);
-    return list.filter(x => String(x).toLowerCase().includes(qq)).slice(0, 12);
-  }
-
-  let modelTimer = null;
-  let backdropTimer = null;
-
+  // Gift suggest local
   el('gift').addEventListener('input', () => {
-    const q = el('gift').value;
-    const items = filterLocal(collections, q);
-    renderSug('giftSug', items, (v) => { el('gift').value = v; });
+    const q = el('gift').value.trim().toLowerCase();
+    const items = collections
+      .filter(x => !q || x.toLowerCase().includes(q))
+      .slice(0, 12)
+      .map(x => ({ label: x, value: x }));
+    renderSug('giftSug', items, (v) => { el('gift').value = v; el('model').value=''; el('backdrop').value=''; });
   });
 
+  // Model suggest from API
+  let modelTimer = null;
   el('model').addEventListener('input', () => {
     if (modelTimer) clearTimeout(modelTimer);
     modelTimer = setTimeout(async () => {
@@ -1507,36 +887,33 @@ const WEBAPP_JS = `(() => {
       if (!gift) { hideSug('modelSug'); return; }
       try {
         const r = await api('/api/mrkt/suggest?kind=model&gift=' + encodeURIComponent(gift) + '&q=' + encodeURIComponent(q));
-        renderSug('modelSug', (r.items || []).map(x => x.label), (v) => { el('model').value = v; });
+        renderSug('modelSug', r.items || [], (v) => { el('model').value = v; el('backdrop').value=''; });
       } catch { hideSug('modelSug'); }
-    }, 250);
+    }, 220);
   });
 
+  // Backdrop suggest from API
+  let backdropTimer = null;
   el('backdrop').addEventListener('input', () => {
     if (backdropTimer) clearTimeout(backdropTimer);
     backdropTimer = setTimeout(async () => {
       const gift = el('gift').value.trim();
-      const model = el('model').value.trim();
       const q = el('backdrop').value.trim();
       if (!gift) { hideSug('backdropSug'); return; }
       try {
-        const url = '/api/mrkt/suggest?kind=backdrop&gift=' + encodeURIComponent(gift) +
-          '&model=' + encodeURIComponent(model) + '&q=' + encodeURIComponent(q);
-        const r = await api(url);
-        renderSug('backdropSug', (r.items || []).map(x => x.label), (v) => { el('backdrop').value = v; });
+        const r = await api('/api/mrkt/suggest?kind=backdrop&gift=' + encodeURIComponent(gift) + '&q=' + encodeURIComponent(q));
+        renderSug('backdropSug', r.items || [], (v) => { el('backdrop').value = v; });
       } catch { hideSug('backdropSug'); }
-    }, 300);
+    }, 240);
   });
 
   document.addEventListener('click', (e) => {
-    // close suggest when click outside inputs
-    const isInp = e.target.closest('#gift,#model,#backdrop,.sug');
-    if (!isInp) {
+    if (!e.target.closest('#gift,#model,#backdrop,.sug')) {
       hideSug('giftSug'); hideSug('modelSug'); hideSug('backdropSug');
     }
   });
 
-  // actions
+  // buttons
   el('save').onclick = async () => {
     hideErr();
     try {
@@ -1565,69 +942,36 @@ const WEBAPP_JS = `(() => {
     } catch (e) { showErr(String(e.message || e)); }
   };
 
-  el('toggleAutobuy').onclick = async () => {
-    hideErr();
-    try {
-      await api('/api/action', { method: 'POST', body: JSON.stringify({ action: 'toggleAutoBuy' }) });
-      await loadState();
-    } catch (e) { showErr(String(e.message || e)); }
-  };
-
-  el('subCreate').onclick = async () => {
-    hideErr();
-    try {
-      await api('/api/sub/create', { method: 'POST' });
-      await loadState();
-    } catch (e) { showErr(String(e.message || e)); }
-  };
-
-  el('subCheckNow').onclick = async () => {
-    hideErr();
-    try {
-      const r = await api('/api/sub/checknow', { method: 'POST' });
-      alert('Готово: subs=' + r.processedSubs + ', floorNotifs=' + r.floorNotifs + ', feedNotifs=' + r.feedNotifs);
-      await loadState();
-    } catch (e) { showErr(String(e.message || e)); }
-  };
-
-  el('refresh').onclick = async () => { hideErr(); await loadState().catch(e => showErr(e.message)); };
+  el('lotsRefresh').onclick = async () => { hideErr(); await loadLots().catch(e => showErr(e.message)); };
   el('logsRefresh').onclick = async () => { hideErr(); await loadState().catch(e => showErr(e.message)); };
-  el('lotsRefresh').onclick = async () => { hideErr(); await loadLots(); };
 
-  document.body.addEventListener('click', async (e) => {
-    const openBtn = e.target.closest('button[data-act="open"]');
-    if (openBtn) {
-      const url = openBtn.getAttribute('data-url');
-      if (url) tg?.openTelegramLink ? tg.openTelegramLink(url) : window.open(url, '_blank');
-      return;
-    }
-
-    const btn = e.target.closest('button[data-act]');
-    if (!btn) return;
-    const act = btn.dataset.act;
-    const id = btn.dataset.id;
-    if (!id) return;
-
-    hideErr();
-    try {
-      if (act === 'subToggle') {
-        await api('/api/sub/toggle', { method: 'POST', body: JSON.stringify({ id }) });
-      } else if (act === 'subDel') {
-        await api('/api/sub/delete', { method: 'POST', body: JSON.stringify({ id }) });
-      } else if (act === 'subMax') {
-        const v = prompt('MAX TON для подписки:', '5');
-        if (v == null) return;
-        await api('/api/sub/setmax', { method: 'POST', body: JSON.stringify({ id, maxPriceTon: Number(v) }) });
+  // admin token save
+  const tokSave = el('tokSave');
+  if (tokSave) {
+    tokSave.onclick = async () => {
+      hideErr();
+      try {
+        const t = el('tokNew').value.trim();
+        if (!t) return showErr('Вставь токен.');
+        await api('/api/admin/mrkt_auth', { method: 'POST', body: JSON.stringify({ token: t }) });
+        el('tokNew').value = '';
+        await loadState();
+      } catch (e) {
+        showErr(String(e.message || e));
       }
-      await loadState();
-    } catch (e2) {
-      showErr(String(e2.message || e2));
-    }
+    };
+  }
+
+  document.body.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-open]');
+    if (!btn) return;
+    const url = btn.getAttribute('data-open');
+    if (url) tg?.openTelegramLink ? tg.openTelegramLink(url) : window.open(url, '_blank');
   });
 
   (async () => {
     if (!initData) {
-      showErr('Открой панель из Telegram (Menu Button). В браузере без Telegram initData API не работает.');
+      showErr('Открой панель из Telegram (Menu Button). В браузере без initData API не работает.');
       return;
     }
     try {
@@ -1635,17 +979,17 @@ const WEBAPP_JS = `(() => {
       await loadState();
       await loadLots();
     } catch (e) {
-      showErr('Панель не может подключиться к API: ' + (e.message || e));
+      showErr('Панель не может подключиться: ' + (e.message || e));
     }
   })();
 })();`;
 
 // =====================
-// Web server (WebApp + API)
+// Web server + API
 // =====================
 function startWebServer() {
   const app = express();
-  app.use(express.json({ limit: '300kb' }));
+  app.use(express.json({ limit: '600kb' }));
 
   app.get('/health', (req, res) => res.status(200).send('ok'));
 
@@ -1667,101 +1011,32 @@ function startWebServer() {
     next();
   }
 
+  function isAdmin(userId) {
+    return ADMIN_USER_ID && Number(userId) === Number(ADMIN_USER_ID);
+  }
+
   app.get('/api/meta/collections', auth, (req, res) => {
     res.json({ ok: true, collections: MRKT_COLLECTIONS });
   });
 
   app.get('/api/state', auth, (req, res) => {
     const u = getOrCreateUser(req.userId);
+    const mask = MRKT_AUTH_RUNTIME ? (MRKT_AUTH_RUNTIME.slice(0, 4) + '…' + MRKT_AUTH_RUNTIME.slice(-4)) : '';
     res.json({
       ok: true,
       api: {
-        mrktAuthSet: !!MRKT_AUTH,
-        mrktLastFailCode: mrktAuthState.lastFailCode ?? null,
+        mrktAuthSet: !!MRKT_AUTH_RUNTIME,
+        isAdmin: isAdmin(req.userId),
+        mrktAuthMask: mask
       },
       user: {
         enabled: !!u.enabled,
         minPriceTon: u.minPriceTon ?? 0,
         maxPriceTon: u.maxPriceTon ?? null,
         filters: u.filters,
-        autoBuyEnabled: !!u.autoBuyEnabled,
-        autoBuyPausedUntil: Number(u.autoBuyPausedUntil || 0),
-        subscriptions: u.subscriptions || [],
-        logs: u.logs || [],
+        logs: u.logs || []
       }
     });
-  });
-
-  // lots for panel: never throw 502 to UI, return ok:false in body instead
-  app.get('/api/mrkt/lots', auth, async (req, res) => {
-    const u = getOrCreateUser(req.userId);
-    if (!MRKT_AUTH) return res.json({ ok: false, reason: 'MRKT_AUTH_NOT_SET', lots: [] });
-    if (!u.filters.gift) return res.json({ ok: true, lots: [] });
-
-    const minP = u.minPriceTon != null ? Number(u.minPriceTon) : 0;
-    const maxP = u.maxPriceTon != null ? Number(u.maxPriceTon) : null;
-
-    const r = await mrktSearchLots(
-      { gift: u.filters.gift, model: u.filters.model, backdrop: u.filters.backdrop },
-      minP,
-      maxP,
-      WEBAPP_LOTS_PAGES
-    );
-
-    if (!r.ok) return res.json({ ok: false, reason: r.reason, lots: [] });
-
-    const lots = (r.gifts || [])
-      .slice(0, WEBAPP_LOTS_LIMIT)
-      .map((x) => ({
-        id: x.id,
-        name: x.name,
-        priceTon: x.priceTon,
-        urlTelegram: x.urlTelegram,
-        urlMarket: x.urlMarket,
-        model: x.attrs?.model || null,
-        backdrop: x.attrs?.backdrop || null,
-        symbol: x.attrs?.symbol || null,
-      }));
-
-    res.json({ ok: true, lots });
-  });
-
-  // suggest endpoint for UI dropdowns
-  app.get('/api/mrkt/suggest', auth, async (req, res) => {
-    const kind = String(req.query.kind || '');
-    const gift = String(req.query.gift || '').trim();
-    const model = String(req.query.model || '').trim();
-    const q = String(req.query.q || '').trim().toLowerCase();
-
-    if (kind === 'gift') {
-      const items = MRKT_COLLECTIONS
-        .filter((x) => !q || x.toLowerCase().includes(q))
-        .slice(0, WEBAPP_SUGGEST_LIMIT)
-        .map((x) => ({ label: x }));
-      return res.json({ ok: true, items });
-    }
-
-    if (kind === 'model') {
-      if (!gift) return res.json({ ok: true, items: [] });
-      const models = await mrktGetModelsForGift(gift);
-      const items = models
-        .filter((m) => !q || m.name.toLowerCase().includes(q))
-        .slice(0, WEBAPP_SUGGEST_LIMIT)
-        .map((m) => ({ label: m.name }));
-      return res.json({ ok: true, items });
-    }
-
-    if (kind === 'backdrop') {
-      if (!gift) return res.json({ ok: true, items: [] });
-      const backs = await mrktScanBackdrops(gift, model || null);
-      const items = backs
-        .filter((b) => !q || String(b).toLowerCase().includes(q))
-        .slice(0, WEBAPP_SUGGEST_LIMIT)
-        .map((b) => ({ label: b }));
-      return res.json({ ok: true, items });
-    }
-
-    res.status(400).json({ ok: false, reason: 'BAD_KIND' });
   });
 
   app.post('/api/state/patch', auth, async (req, res) => {
@@ -1773,23 +1048,13 @@ function startWebServer() {
       u.maxPriceTon = b.maxPriceTon == null ? null : Number(b.maxPriceTon);
     }
 
-    let filtersChanged = false;
-
     if (b.filters && typeof b.filters === 'object') {
-      u.filters = u.filters || { gift: '', model: '', backdrop: '' };
-      if (typeof b.filters.gift === 'string') { u.filters.gift = b.filters.gift.trim(); filtersChanged = true; }
-      if (typeof b.filters.model === 'string') { u.filters.model = b.filters.model.trim(); filtersChanged = true; }
-      if (typeof b.filters.backdrop === 'string') { u.filters.backdrop = b.filters.backdrop.trim(); filtersChanged = true; }
+      if (typeof b.filters.gift === 'string') u.filters.gift = b.filters.gift.trim();
+      if (typeof b.filters.model === 'string') u.filters.model = b.filters.model.trim();
+      if (typeof b.filters.backdrop === 'string') u.filters.backdrop = b.filters.backdrop.trim();
     }
 
-    if (filtersChanged && u.autoBuyEnabled && AUTO_BUY_ONLY_NEW_LISTINGS) {
-      u.autoBuyFeedLastId = null;
-      await initAutoBuyBaseline(req.userId, u).catch(() => {});
-    }
-
-    pushUserLog(u, 'STATE_PATCH', `gift=${u.filters.gift} model=${u.filters.model} backdrop=${u.filters.backdrop} min=${u.minPriceTon} max=${u.maxPriceTon}`);
-    scheduleSave?.();
-
+    pushUserLog(u, 'STATE', `gift=${u.filters.gift} model=${u.filters.model} backdrop=${u.filters.backdrop} min=${u.minPriceTon} max=${u.maxPriceTon}`);
     res.json({ ok: true });
   });
 
@@ -1800,77 +1065,113 @@ function startWebServer() {
     if (action === 'toggleMonitor') {
       u.enabled = !u.enabled;
       pushUserLog(u, 'MONITOR', `enabled=${u.enabled}`);
-      scheduleSave?.();
-      return res.json({ ok: true });
-    }
-
-    if (action === 'toggleAutoBuy') {
-      u.autoBuyEnabled = !u.autoBuyEnabled;
-      if (u.autoBuyEnabled) {
-        u.autoBuyPausedUntil = 0;
-        u.autoBuyFeedLastId = null;
-        pushUserLog(u, 'AUTO_BUY_ON', 'enabled from WebApp');
-        await initAutoBuyBaseline(req.userId, u).catch(() => {});
-      } else {
-        pushUserLog(u, 'AUTO_BUY_OFF', 'disabled from WebApp');
-      }
-      scheduleSave?.();
       return res.json({ ok: true });
     }
 
     res.status(400).json({ ok: false, reason: 'UNKNOWN_ACTION' });
   });
 
-  // subs
-  app.post('/api/sub/create', auth, (req, res) => {
-    const u = getOrCreateUser(req.userId);
-    const r = makeSubFromCurrentFilters(u);
-    if (!r.ok) return res.status(400).json({ ok: false, reason: r.reason });
-    u.subscriptions.push(r.sub);
-    renumberSubs(u);
-    pushUserLog(u, 'SUB_CREATE', `#${r.sub.num} gift=${r.sub.filters.gift}`);
-    scheduleSave?.();
-    res.json({ ok: true });
+  // Suggest: model/backdrop
+  app.get('/api/mrkt/suggest', auth, async (req, res) => {
+    const kind = String(req.query.kind || '');
+    const gift = String(req.query.gift || '').trim();
+    const q = String(req.query.q || '').trim().toLowerCase();
+
+    if (kind === 'model') {
+      if (!gift) return res.json({ ok: true, items: [] });
+      const models = await mrktGetModelsForGift(gift);
+      const items = models
+        .filter((m) => !q || m.name.toLowerCase().includes(q))
+        .slice(0, WEBAPP_SUGGEST_LIMIT)
+        .map((m) => ({
+          label: m.name,
+          value: m.name,
+          imgUrl: m.thumbKey ? joinUrl(MRKT_CDN_BASE, m.thumbKey) : null,
+          sub: m.rarityPerMille != null ? formatPctFromPermille(m.rarityPerMille) : null
+        }));
+      return res.json({ ok: true, items });
+    }
+
+    if (kind === 'backdrop') {
+      if (!gift) return res.json({ ok: true, items: [] });
+      const backs = await mrktGetBackdropsForGift(gift);
+      const items = backs
+        .filter((b) => !q || b.name.toLowerCase().includes(q))
+        .slice(0, WEBAPP_SUGGEST_LIMIT)
+        .map((b) => ({
+          label: b.name,
+          value: b.name,
+          imgUrl: null,
+          colorHex: b.centerHex || null,
+          sub: b.rarityPerMille != null ? formatPctFromPermille(b.rarityPerMille) : null
+        }));
+      return res.json({ ok: true, items });
+    }
+
+    res.status(400).json({ ok: false, reason: 'BAD_KIND' });
   });
 
-  app.post('/api/sub/toggle', auth, (req, res) => {
+  // Lots (cards)
+  app.get('/api/mrkt/lots', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
-    const id = req.body?.id;
-    const s = findSub(u, id);
-    if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
-    s.enabled = !s.enabled;
-    pushUserLog(u, 'SUB_TOGGLE', `#${s.num} enabled=${s.enabled}`);
-    scheduleSave?.();
-    res.json({ ok: true });
+    if (!MRKT_AUTH_RUNTIME) return res.json({ ok: false, reason: 'MRKT_AUTH_NOT_SET', lots: [] });
+    if (!u.filters.gift) return res.json({ ok: true, lots: [] });
+
+    const minP = u.minPriceTon != null ? Number(u.minPriceTon) : 0;
+    const maxP = u.maxPriceTon != null ? Number(u.maxPriceTon) : null;
+
+    const r = await mrktSearchLots(
+      { gift: u.filters.gift, model: u.filters.model, backdrop: u.filters.backdrop },
+      minP,
+      maxP,
+      WEBAPP_LOTS_PAGES
+    );
+    if (!r.ok) return res.json({ ok: false, reason: r.reason, lots: [] });
+
+    const backs = await mrktGetBackdropsForGift(u.filters.gift);
+    const backMap = new Map(backs.map(b => [norm(b.name), b]));
+
+    const lots = (r.gifts || [])
+      .slice(0, WEBAPP_LOTS_LIMIT)
+      .map((x) => {
+        const b = x.attrs?.backdrop ? backMap.get(norm(x.attrs.backdrop)) : null;
+
+        // 1) full gift img from fragment (лучше всего)
+        const imgUrl = x.giftName ? fragmentGiftImgUrl(x.giftName) : null;
+
+        return {
+          id: x.id,
+          name: x.name,
+          priceTon: x.priceTon,
+          urlTelegram: x.urlTelegram,
+          urlMarket: x.urlMarket,
+          model: x.attrs?.model || null,
+          backdrop: x.attrs?.backdrop || null,
+          symbol: x.attrs?.symbol || null,
+          imgUrl,
+          backdropColorHex: b?.centerHex || null
+        };
+      });
+
+    res.json({ ok: true, lots });
   });
 
-  app.post('/api/sub/delete', auth, (req, res) => {
-    const u = getOrCreateUser(req.userId);
-    const id = req.body?.id;
-    const before = (u.subscriptions || []).length;
-    u.subscriptions = (u.subscriptions || []).filter(x => x && x.id !== id);
-    renumberSubs(u);
-    pushUserLog(u, 'SUB_DELETE', `before=${before} after=${u.subscriptions.length}`);
-    scheduleSave?.();
-    res.json({ ok: true });
-  });
+  // Admin: update MRKT_AUTH in Redis (no Railway needed)
+  app.post('/api/admin/mrkt_auth', auth, async (req, res) => {
+    if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
 
-  app.post('/api/sub/setmax', auth, (req, res) => {
-    const u = getOrCreateUser(req.userId);
-    const id = req.body?.id;
-    const v = Number(req.body?.maxPriceTon);
-    const s = findSub(u, id);
-    if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
-    if (!Number.isFinite(v) || v <= 0) return res.status(400).json({ ok: false, reason: 'BAD_MAX' });
-    s.maxPriceTon = v;
-    pushUserLog(u, 'SUB_MAX', `#${s.num} max=${v}`);
-    scheduleSave?.();
-    res.json({ ok: true });
-  });
+    const t = String(req.body?.token || '').trim();
+    if (!t) return res.status(400).json({ ok: false, reason: 'EMPTY_TOKEN' });
 
-  app.post('/api/sub/checknow', auth, async (req, res) => {
-    const st = await checkSubscriptionsForAllUsers({ manual: true });
-    res.json(st);
+    MRKT_AUTH_RUNTIME = t;
+    try {
+      await saveMrktAuthToRedis(t);
+    } catch {}
+    // сброс кэшей фильтров (на всякий)
+    modelsCache.clear();
+    backdropsCache.clear();
+
+    res.json({ ok: true });
   });
 
   const port = Number(process.env.PORT || 3000);
@@ -1887,13 +1188,13 @@ setInterval(() => {
 }, CHECK_INTERVAL_MS);
 
 setInterval(() => {
-  checkSubscriptionsForAllUsers().catch((e) => console.error('subs error:', e));
+  // подписки пока не добавлял в эту v5 (можно вернуть из прошлой версии)
 }, SUBS_CHECK_INTERVAL_MS);
 
 (async () => {
   if (REDIS_URL) {
     await initRedis();
-    if (redis) await loadState();
+    if (redis) await loadMrktAuthFromRedis();
   }
   console.log('Bot started. /start');
 })();
