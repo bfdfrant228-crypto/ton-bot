@@ -430,13 +430,48 @@ async function throttledSatelliteFetch(url, opts) {
   satelliteNextAllowedAt = nowMs() + SATELLITE_THROTTLE_MS;
   return fetch(url, opts);
 }
+const SATELLITE_TIMEOUT_MS = Number(process.env.SATELLITE_TIMEOUT_MS || 8000);
+
 async function satelliteFetchJson(url) {
-  const res = await throttledSatelliteFetch(url, { method: 'GET', headers: satelliteHeaders() }).catch(() => null);
-  if (!res) return { ok: false, status: null, data: null, text: 'fetch error' };
+  // ловим кривой SATELLITE_BASE (например без https://)
+  try {
+    new URL(url);
+  } catch (e) {
+    return { ok: false, status: null, data: null, text: `bad url: ${e.message}` };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SATELLITE_TIMEOUT_MS);
+
+  let res;
+  try {
+    res = await throttledSatelliteFetch(url, {
+      method: 'GET',
+      headers: satelliteHeaders(),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    return {
+      ok: false,
+      status: null,
+      data: null,
+      text: `fetch error: ${e?.name || 'Error'} ${e?.message || String(e)}`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+
   const txt = await res.text().catch(() => '');
   let data = null;
-  try { data = txt ? JSON.parse(txt) : null; } catch { data = null; }
+  try {
+    data = txt ? JSON.parse(txt) : null;
+  } catch {
+    data = null;
+  }
+
   return { ok: res.ok, status: res.status, data, text: txt };
+}
 }
 async function satelliteProbe() {
   if (!SATELLITE_ENABLED) return { ok: false, status: null, note: 'SATELLITE_DISABLED', bodyStart: '' };
