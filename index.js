@@ -1,6 +1,6 @@
 /**
  * ton-bot MRKT + WebApp Panel (single-file)
- * version: 2026-02-28-webapp-menu-subs-logs-autobuy-speed-v1
+ * version: 2026-02-28-webapp-lots-subs-checknow-v2
  */
 
 const TelegramBot = require('node-telegram-bot-api');
@@ -68,12 +68,16 @@ const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 30
 const AUTO_BUY_MAX_PER_CHECK = Number(process.env.AUTO_BUY_MAX_PER_CHECK || 1);
 const AUTO_BUY_NO_FUNDS_PAUSE_MS = Number(process.env.AUTO_BUY_NO_FUNDS_PAUSE_MS || 10 * 60 * 1000);
 
+// WebApp lots list
+const WEBAPP_LOTS_LIMIT = Number(process.env.WEBAPP_LOTS_LIMIT || 25);
+const WEBAPP_LOTS_PAGES = Number(process.env.WEBAPP_LOTS_PAGES || 1);
+
 const MRKT_COLLECTIONS = String(process.env.MRKT_COLLECTIONS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
 
-console.log('Bot version 2026-02-28-webapp-menu-subs-logs-autobuy-speed-v1');
+console.log('Bot version 2026-02-28-webapp-lots-subs-checknow-v2');
 console.log('MODE=', MODE);
 console.log('WEBAPP_URL=', WEBAPP_URL || 'not set');
 console.log('REDIS_URL=', REDIS_URL ? 'set' : 'not set');
@@ -268,7 +272,7 @@ function pushUserLog(user, type, text) {
   const entry = { ts: Date.now(), tsIso: new Date().toISOString(), type, text };
   if (!Array.isArray(user.logs)) user.logs = [];
   user.logs.unshift(entry);
-  user.logs = user.logs.slice(0, 80);
+  user.logs = user.logs.slice(0, 120);
 }
 
 function exportState() {
@@ -336,7 +340,7 @@ function importState(parsed) {
 
 async function loadState() {
   if (!redis) return;
-  const raw = await redis.get('bot:state:webapp:mrkt:v1');
+  const raw = await redis.get('bot:state:webapp:mrkt:v2');
   if (!raw) return;
   importState(JSON.parse(raw));
   console.log('Loaded state from Redis. users:', users.size);
@@ -353,7 +357,7 @@ function scheduleSave() {
 }
 async function saveState() {
   if (!redis) return;
-  await redis.set('bot:state:webapp:mrkt:v1', JSON.stringify(exportState()));
+  await redis.set('bot:state:webapp:mrkt:v2', JSON.stringify(exportState()));
 }
 
 // =====================
@@ -449,26 +453,25 @@ async function mrktSearchLots({ gift, model, backdrop }, minPriceTon, maxPriceTo
 
       out.push({
         id: g.id,
-        market: 'MRKT',
         name: displayName,
         priceTon,
+        priceNano: Number(nano),
         urlTelegram,
         urlMarket,
         attrs: { model: modelName || null, backdrop: backdropName || null, symbol: symbolName || null },
         raw: g,
       });
 
-      if (out.length >= 120) break;
+      if (out.length >= 200) break;
     }
 
-    if (out.length >= 120) break;
-
+    if (out.length >= 200) break;
     cursor = r.cursor || '';
     if (!cursor) break;
   }
 
   out.sort((a, b) => a.priceTon - b.priceTon);
-  return { ok: true, reason: 'OK', gifts: out.slice(0, 120) };
+  return { ok: true, reason: 'OK', gifts: out };
 }
 
 async function mrktFeedFetch({ gift, model, backdrop, cursor, count, types }) {
@@ -651,7 +654,7 @@ async function processMrktFeedForSub(userId, sub, stateKey, budgetEvents) {
     backdrop: sub.filters.backdrop || null,
     cursor: '',
     count: MRKT_FEED_COUNT,
-    types: [], // all
+    types: [],
   });
 
   if (!r.ok || !r.items.length) return 0;
@@ -690,12 +693,14 @@ async function processMrktFeedForSub(userId, sub, stateKey, budgetEvents) {
 }
 
 async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
-  if (MODE !== 'real') return;
-  if (isSubsChecking && !manual) return;
+  if (MODE !== 'real') return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
+  if (isSubsChecking && !manual) return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
 
   isSubsChecking = true;
   try {
+    let processedSubs = 0;
     let floorNotifs = 0;
+    let feedNotifs = 0;
     let globalFeedBudget = SUBS_MRKT_FEED_MAX_EVENTS_PER_CYCLE;
 
     for (const [userId, user] of users.entries()) {
@@ -704,12 +709,12 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
       if (!active.length) continue;
 
       for (const sub of active) {
+        processedSubs++;
         if (floorNotifs >= SUBS_MAX_NOTIFICATIONS_PER_CYCLE) break;
 
         const stateKey = `${userId}:${sub.id}:MRKT`;
         const prevState = subStates.get(stateKey) || { floor: null, emptyStreak: 0, lastNotifiedFloor: null, feedLastId: null };
 
-        // floor
         const floorRes = await getFloorForSub(sub);
         if (!floorRes.ok) continue;
 
@@ -743,17 +748,20 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
           subStates.set(stateKey, { ...prevState, floor: newFloor, emptyStreak });
         }
 
-        // feed events
         if (globalFeedBudget > 0) {
           const sent = await processMrktFeedForSub(userId, sub, stateKey, globalFeedBudget);
           globalFeedBudget -= sent;
+          feedNotifs += sent;
         }
 
         if (MRKT_FEED_THROTTLE_MS > 0) await sleep(MRKT_FEED_THROTTLE_MS);
       }
     }
+
+    return { processedSubs, floorNotifs, feedNotifs };
   } catch (e) {
     console.error('subs error:', e);
+    return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
   } finally {
     isSubsChecking = false;
   }
@@ -825,7 +833,6 @@ async function attemptAutoBuyFromNewListings(userId, user, minP, maxP) {
     const latestId = r.items[0]?.id || null;
     if (!latestId) return false;
 
-    // first enable: don't buy old
     if (AUTO_BUY_ONLY_NEW_LISTINGS && !user.autoBuyFeedLastId) {
       user.autoBuyFeedLastId = latestId;
       scheduleSave();
@@ -846,7 +853,7 @@ async function attemptAutoBuyFromNewListings(userId, user, minP, maxP) {
       return false;
     }
 
-    newItems.reverse(); // old -> new
+    newItems.reverse();
 
     let boughtCount = 0;
 
@@ -872,9 +879,7 @@ async function attemptAutoBuyFromNewListings(userId, user, minP, maxP) {
       const urlMarket = mrktLotUrlFromId(g.id);
 
       const listingDate = it.date ? new Date(it.date) : null;
-
       const tStart = new Date();
-      pushUserLog(user, 'BUY_START', `${title} | price=${priceTon.toFixed(3)} | start=${fmtIsoMs(tStart)}`);
 
       if (AUTO_BUY_DRY_RUN) {
         const msg =
@@ -930,13 +935,12 @@ async function attemptAutoBuyFromNewListings(userId, user, minP, maxP) {
 
         if (AUTO_BUY_DISABLE_AFTER_SUCCESS) {
           user.autoBuyEnabled = false;
-          pushUserLog(user, 'AUTO_BUY_OFF', 'disabled after success (AUTO_BUY_DISABLE_AFTER_SUCCESS=1)');
+          pushUserLog(user, 'AUTO_BUY_OFF', 'disabled after success');
           scheduleSave();
           await sendMessageSafe(userId, `Автопокупка выключена после успешной покупки (safety).`, { disable_web_page_preview: true });
           break;
         }
       } else {
-        // no funds -> stop & pause
         if (isNoFundsError(buyRes)) {
           user.autoBuyEnabled = false;
           user.autoBuyPausedUntil = nowMs() + AUTO_BUY_NO_FUNDS_PAUSE_MS;
@@ -993,12 +997,10 @@ async function checkMarketsForAllUsers() {
       const minP = user.minPriceTon != null ? Number(user.minPriceTon) : 0;
       const maxP = Number(user.maxPriceTon);
 
-      // 1) AutoBuy: only new listing
       if (AUTO_BUY_GLOBAL && user.autoBuyEnabled) {
         await attemptAutoBuyFromNewListings(userId, user, minP, maxP);
       }
 
-      // 2) Cheap-lots notify
       const lots = await mrktSearchLots(
         { gift: user.filters.gift, model: user.filters.model, backdrop: user.filters.backdrop },
         minP,
@@ -1045,16 +1047,11 @@ async function tgApi(method, body) {
 bot.onText(/^\/start\b/, async (msg) => {
   const user = getOrCreateUser(msg.from.id);
 
-  // set menu button
   if (WEBAPP_URL) {
     try {
       await tgApi('setChatMenuButton', {
         chat_id: msg.chat.id,
-        menu_button: {
-          type: 'web_app',
-          text: 'Панель',
-          web_app: { url: WEBAPP_URL }
-        }
+        menu_button: { type: 'web_app', text: 'Панель', web_app: { url: WEBAPP_URL } }
       });
     } catch (e) {
       console.error('setChatMenuButton error:', e?.message || e);
@@ -1063,12 +1060,11 @@ bot.onText(/^\/start\b/, async (msg) => {
 
   await sendMessageSafe(
     msg.chat.id,
-    'Бот запущен.\n\nОткрой кнопку меню “Панель” рядом со строкой ввода — там удобный интерфейс.\n\n' +
-      'Если панель не появилась: BotFather → /setmenubutton → WebApp → URL.',
+    'Бот запущен.\nОткрой кнопку меню “Панель” рядом со строкой ввода — там интерфейс.\n' +
+      'Если не появилась: BotFather → /setmenubutton → WebApp → URL.',
     { reply_markup: MAIN_KEYBOARD }
   );
 
-  // if autobuy enabled and only-new — refresh baseline
   if (user.autoBuyEnabled && AUTO_BUY_ONLY_NEW_LISTINGS) {
     user.autoBuyFeedLastId = null;
     await initAutoBuyBaseline(msg.from.id, user);
@@ -1134,7 +1130,7 @@ bot.on('message', async (msg) => {
   }
   if (t === '📡 Подписки') {
     const count = (user.subscriptions || []).length;
-    return sendMessageSafe(chatId, `Подписок: ${count}\nОткрывай “Панель” — там управление подписками.`, { reply_markup: MAIN_KEYBOARD });
+    return sendMessageSafe(chatId, `Подписок: ${count}\nУправление — в “Панели”.`, { reply_markup: MAIN_KEYBOARD });
   }
   if (t === '📌 Статус') {
     const txt =
@@ -1214,9 +1210,18 @@ const WEBAPP_HTML = `<!doctype html>
 </div>
 
 <div class="card">
+  <h3>Лоты MRKT (по фильтрам)</h3>
+  <div class="row">
+    <button id="lotsRefresh">🔄 Обновить лоты</button>
+  </div>
+  <div id="lots" style="margin-top:10px"></div>
+</div>
+
+<div class="card">
   <h3>Подписки</h3>
   <div class="row">
     <button id="subCreate">➕ Создать из текущих фильтров</button>
+    <button id="subCheckNow">🔎 Проверить подписки сейчас</button>
     <button id="refresh">🔄 Обновить</button>
   </div>
   <div id="subs" style="margin-top:10px"></div>
@@ -1238,7 +1243,6 @@ const WEBAPP_JS = `(() => {
   tg?.ready();
 
   const initData = tg?.initData || '';
-
   const el = (id) => document.getElementById(id);
 
   function showErr(msg) {
@@ -1311,6 +1315,26 @@ const WEBAPP_JS = `(() => {
     el('logs').innerHTML = logs.map(l => \`<pre>\${l.tsIso} | \${l.type}\\n\${l.text}</pre>\`).join('');
   }
 
+  function renderLots(resp) {
+    const lots = resp.lots || [];
+    if (!lots.length) {
+      el('lots').innerHTML = '<i>Лотов по фильтрам не найдено</i>';
+      return;
+    }
+    el('lots').innerHTML = lots.map(x => \`
+      <div class="card">
+        <div><b>\${x.priceTon.toFixed(3)} TON</b> — \${x.name}</div>
+        <div>\${x.model ? ('Model: ' + x.model) : ''}</div>
+        <div>\${x.backdrop ? ('Backdrop: ' + x.backdrop) : ''}</div>
+        <div>\${x.symbol ? ('Symbol: ' + x.symbol) : ''}</div>
+        <div class="row" style="margin-top:8px">
+          <button data-act="openTg" data-url="\${x.urlTelegram}">Открыть NFT</button>
+          <button data-act="openMrkt" data-url="\${x.urlMarket}">Открыть MRKT</button>
+        </div>
+      </div>
+    \`).join('');
+  }
+
   async function loadCollections() {
     const meta = await api('/api/meta/collections');
     const sel = el('gift');
@@ -1334,6 +1358,11 @@ const WEBAPP_JS = `(() => {
     renderLogs(st);
   }
 
+  async function loadLots() {
+    const r = await api('/api/mrkt/lots');
+    renderLots(r);
+  }
+
   el('save').onclick = async () => {
     hideErr();
     try {
@@ -1350,6 +1379,7 @@ const WEBAPP_JS = `(() => {
         })
       });
       await loadState();
+      await loadLots();
     } catch (e) { showErr(String(e.message || e)); }
   };
 
@@ -1377,15 +1407,32 @@ const WEBAPP_JS = `(() => {
     } catch (e) { showErr(String(e.message || e)); }
   };
 
+  el('subCheckNow').onclick = async () => {
+    hideErr();
+    try {
+      const r = await api('/api/sub/checknow', { method: 'POST' });
+      alert('Готово: subs=' + r.processedSubs + ', floorNotifs=' + r.floorNotifs + ', feedNotifs=' + r.feedNotifs);
+      await loadState();
+    } catch (e) { showErr(String(e.message || e)); }
+  };
+
   el('refresh').onclick = async () => { hideErr(); await loadState().catch(e => showErr(e.message)); };
   el('logsRefresh').onclick = async () => { hideErr(); await loadState().catch(e => showErr(e.message)); };
+  el('lotsRefresh').onclick = async () => { hideErr(); await loadLots().catch(e => showErr(e.message)); };
 
   document.body.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-act]');
     if (!btn) return;
 
-    hideErr();
     const act = btn.dataset.act;
+    const url = btn.dataset.url;
+
+    if (act === 'openTg' || act === 'openMrkt') {
+      if (url) tg?.openTelegramLink ? tg.openTelegramLink(url) : window.open(url, '_blank');
+      return;
+    }
+
+    hideErr();
     const id = btn.dataset.id;
 
     try {
@@ -1412,6 +1459,7 @@ const WEBAPP_JS = `(() => {
     try {
       await loadCollections();
       await loadState();
+      await loadLots();
     } catch (e) {
       showErr('Панель не может подключиться к API. ' + (e.message || e));
     }
@@ -1467,7 +1515,42 @@ function startWebServer() {
     });
   });
 
-  app.post('/api/state/patch', auth, (req, res) => {
+  // NEW: lots list for panel
+  app.get('/api/mrkt/lots', auth, async (req, res) => {
+    const u = getOrCreateUser(req.userId);
+    if (!MRKT_AUTH) return res.status(400).json({ ok: false, reason: 'NO_MRKT_AUTH' });
+    if (!u.filters.gift) return res.json({ ok: true, lots: [] });
+
+    const minP = u.minPriceTon != null ? Number(u.minPriceTon) : 0;
+    const maxP = u.maxPriceTon != null ? Number(u.maxPriceTon) : null;
+
+    const r = await mrktSearchLots(
+      { gift: u.filters.gift, model: u.filters.model, backdrop: u.filters.backdrop },
+      minP,
+      maxP,
+      WEBAPP_LOTS_PAGES
+    );
+
+    if (!r.ok) return res.status(502).json({ ok: false, reason: r.reason });
+
+    const lots = (r.gifts || [])
+      .sort((a, b) => a.priceTon - b.priceTon)
+      .slice(0, WEBAPP_LOTS_LIMIT)
+      .map((x) => ({
+        id: x.id,
+        name: x.name,
+        priceTon: x.priceTon,
+        urlTelegram: x.urlTelegram,
+        urlMarket: x.urlMarket,
+        model: x.attrs?.model || null,
+        backdrop: x.attrs?.backdrop || null,
+        symbol: x.attrs?.symbol || null,
+      }));
+
+    res.json({ ok: true, lots });
+  });
+
+  app.post('/api/state/patch', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
     const b = req.body || {};
 
@@ -1476,11 +1559,18 @@ function startWebServer() {
       u.maxPriceTon = b.maxPriceTon == null ? null : Number(b.maxPriceTon);
     }
 
+    let filtersChanged = false;
+
     if (b.filters && typeof b.filters === 'object') {
       u.filters = u.filters || { gift: '', model: '', backdrop: '' };
-      if (typeof b.filters.gift === 'string') u.filters.gift = b.filters.gift.trim();
-      if (typeof b.filters.model === 'string') u.filters.model = b.filters.model.trim();
-      if (typeof b.filters.backdrop === 'string') u.filters.backdrop = b.filters.backdrop.trim();
+      if (typeof b.filters.gift === 'string') { u.filters.gift = b.filters.gift.trim(); filtersChanged = true; }
+      if (typeof b.filters.model === 'string') { u.filters.model = b.filters.model.trim(); filtersChanged = true; }
+      if (typeof b.filters.backdrop === 'string') { u.filters.backdrop = b.filters.backdrop.trim(); filtersChanged = true; }
+    }
+
+    if (filtersChanged && u.autoBuyEnabled && AUTO_BUY_ONLY_NEW_LISTINGS) {
+      u.autoBuyFeedLastId = null;
+      await initAutoBuyBaseline(req.userId, u).catch(() => {});
     }
 
     pushUserLog(u, 'STATE_PATCH', `gift=${u.filters.gift} model=${u.filters.model} backdrop=${u.filters.backdrop} min=${u.minPriceTon} max=${u.maxPriceTon}`);
@@ -1562,6 +1652,12 @@ function startWebServer() {
     pushUserLog(u, 'SUB_MAX', `#${s.num} max=${v}`);
     scheduleSave?.();
     res.json({ ok: true });
+  });
+
+  // NEW: check subs now from panel
+  app.post('/api/sub/checknow', auth, async (req, res) => {
+    const st = await checkSubscriptionsForAllUsers({ manual: true });
+    res.json(st);
   });
 
   const port = Number(process.env.PORT || 3000);
