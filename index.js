@@ -8,6 +8,7 @@ if (!token) {
   console.error('TELEGRAM_TOKEN not set');
   process.exit(1);
 }
+
 const MODE = process.env.MODE || 'real';
 
 // Redis (optional)
@@ -16,25 +17,29 @@ const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL || null
 // MRKT
 const MRKT_API_URL = 'https://api.tgmrkt.io/api/v1';
 const MRKT_AUTH = process.env.MRKT_AUTH || null;
+
 const MRKT_COUNT = Number(process.env.MRKT_COUNT || 50);
 const MRKT_PAGES = Number(process.env.MRKT_PAGES || 6);
 
-// UI/search
-const MAX_SEARCH_RESULTS = Number(process.env.MAX_SEARCH_RESULTS || 10);
-
-// monitor
+// Monitoring speed
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 7000);
 const MAX_NOTIFICATIONS_PER_CHECK = Number(process.env.MAX_NOTIFICATIONS_PER_CHECK || 60);
 const MAX_PER_MARKET = Number(process.env.MAX_PER_MARKET || 120);
 const SEND_DELAY_MS = Number(process.env.SEND_DELAY_MS || 80);
 const SENT_TTL_MS = Number(process.env.SENT_TTL_MS || 24 * 60 * 60 * 1000);
 
-// subscriptions
+// Timeouts / fast mode
+const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 8000);
+const MRKT_PAGES_MONITOR = Number(process.env.MRKT_PAGES_MONITOR || 1);
+const ONLY_CHEAPEST_PER_CHECK = String(process.env.ONLY_CHEAPEST_PER_CHECK || '1') !== '0';
+
+// UI
+const MAX_SEARCH_RESULTS = Number(process.env.MAX_SEARCH_RESULTS || 10);
+
+// Subscriptions
 const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 9000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 8);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
-
-// MRKT feed events in subs
 const SUBS_MRKT_FEED_MAX_EVENTS_PER_CYCLE = Number(process.env.SUBS_MRKT_FEED_MAX_EVENTS_PER_CYCLE || 12);
 
 // MRKT feed/history
@@ -51,26 +56,29 @@ const MRKT_FEED_NOTIFY_TYPES = new Set(
 
 const MRKT_AUTH_NOTIFY_COOLDOWN_MS = Number(process.env.MRKT_AUTH_NOTIFY_COOLDOWN_MS || 60 * 60 * 1000);
 
-// fees
+// Fees
 const MRKT_FEE = Number(process.env.MRKT_FEE || 0);
 
-// ===== AUTO BUY =====
+// AutoBuy
 const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '0') === '1';
 const AUTO_BUY_DRY_RUN = String(process.env.AUTO_BUY_DRY_RUN || '1') !== '0';
 const AUTO_BUY_MAX_PER_CHECK = Number(process.env.AUTO_BUY_MAX_PER_CHECK || 1);
 const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 30_000);
 
-// Collections list for UI
+// Collections list (for gift picker)
 const MRKT_COLLECTIONS = String(process.env.MRKT_COLLECTIONS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
 
-console.log('Bot version 2026-02-28-mrkt-full-ui-autobuy-v1');
+console.log('Bot version 2026-02-28-mrkt-full-ui-autobuy-fast-v2');
 console.log('MODE=', MODE);
 console.log('REDIS_URL=', REDIS_URL ? 'set' : 'not set');
 console.log('MRKT_AUTH=', MRKT_AUTH ? 'set' : 'not set');
-console.log('MRKT_COLLECTIONS=', MRKT_COLLECTIONS.length ? `${MRKT_COLLECTIONS.length} items` : 'not set');
+console.log('MRKT_COLLECTIONS=', MRKT_COLLECTIONS.length ? MRKT_COLLECTIONS.length : 'not set');
+console.log('MRKT_TIMEOUT_MS=', MRKT_TIMEOUT_MS);
+console.log('MRKT_PAGES_MONITOR=', MRKT_PAGES_MONITOR);
+console.log('ONLY_CHEAPEST_PER_CHECK=', ONLY_CHEAPEST_PER_CHECK);
 console.log('AUTO_BUY_GLOBAL=', AUTO_BUY_GLOBAL);
 console.log('AUTO_BUY_DRY_RUN=', AUTO_BUY_DRY_RUN);
 
@@ -95,7 +103,7 @@ const MAIN_KEYBOARD = {
 // =====================
 const users = new Map();
 const sentDeals = new Map();
-const subStates = new Map(); // `${userId}:${subId}:MRKT` -> { floor, emptyStreak, lastNotifiedFloor, feedLastId }
+const subStates = new Map();
 
 let isChecking = false;
 let isSubsChecking = false;
@@ -103,12 +111,16 @@ let isSubsChecking = false;
 const autoBuyRecentAttempts = new Map(); // `${userId}:${giftId}` -> ts
 const autoBuyLocks = new Set(); // userId
 
-// MRKT auth status
-const mrktAuthState = { ok: null, lastOkAt: 0, lastFailAt: 0, lastFailCode: null, lastNotifiedAt: 0 };
-
-// history cache
 const historyCache = new Map();
 const HISTORY_CACHE_TTL_MS = 60_000;
+
+const mrktAuthState = {
+  ok: null,
+  lastOkAt: 0,
+  lastFailAt: 0,
+  lastFailCode: null,
+  lastNotifiedAt: 0,
+};
 
 // =====================
 // Helpers
@@ -126,8 +138,15 @@ function norm(s) {
 function capWords(str) {
   return String(str || '').replace(/\w+(?:'\w+)?/g, (w) => (w ? w[0].toUpperCase() + w.slice(1) : w));
 }
+function shorten(s, max = 32) {
+  const t = String(s || '');
+  return t.length <= max ? t : t.slice(0, max - 1) + '…';
+}
 function normTraitName(s) {
-  return norm(s).replace(/\s*\([^)]*%[^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+  return norm(s)
+    .replace(/\s*\([^)]*%[^)]*\)\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 function sameTrait(actual, expectedLower) {
   if (!expectedLower) return true;
@@ -158,10 +177,6 @@ function clearUserSentDeals(userId) {
     if (k.startsWith(prefix)) sentDeals.delete(k);
   }
 }
-function shorten(s, max = 32) {
-  const t = String(s || '');
-  return t.length <= max ? t : t.slice(0, max - 1) + '…';
-}
 function mrktLotUrlFromId(id) {
   if (!id) return 'https://t.me/mrkt';
   const appId = String(id).replace(/-/g, '');
@@ -170,7 +185,7 @@ function mrktLotUrlFromId(id) {
 function formatPercentFromPermille(perMille) {
   const v = Number(perMille);
   if (!Number.isFinite(v)) return '';
-  const pct = v / 10; // 30 per mille => 3.0%
+  const pct = v / 10;
   const s = pct % 1 === 0 ? String(pct.toFixed(0)) : String(pct.toFixed(1));
   return `${s}%`;
 }
@@ -190,6 +205,16 @@ async function sendMessageSafe(chatId, text, opts) {
       }
       throw e;
     }
+  }
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -219,22 +244,18 @@ function getOrCreateUser(userId) {
       minPriceTon: 0,
       maxPriceTon: null,
 
-      // awaiting_max | awaiting_min | awaiting_gift_manual | awaiting_model_manual | awaiting_backdrop_manual | awaiting_sub_max:<id>
+      // awaiting_max | awaiting_min
       // awaiting_gift_search | awaiting_model_search | awaiting_backdrop_search
+      // awaiting_sub_max:<id>
       state: null,
 
       autoBuyEnabled: false,
 
-      filters: { gift: '', model: '', backdrop: '' }, // exact MRKT strings
+      filters: { gift: '', model: '', backdrop: '' },
 
       subscriptions: [],
 
-      // temp options for inline keyboards
-      tmp: {
-        giftOptions: [],
-        modelOptions: [],
-        backdropOptions: [],
-      },
+      tmp: { giftOptions: [], modelOptions: [], backdropOptions: [] },
     });
   }
   return users.get(userId);
@@ -300,7 +321,7 @@ function importState(parsed) {
 
 async function loadState() {
   if (!redis) return;
-  const raw = await redis.get('bot:state:mrkt:full:v1');
+  const raw = await redis.get('bot:state:mrkt:fullfast:v1');
   if (!raw) return;
   importState(JSON.parse(raw));
   console.log('Loaded state from Redis. users:', users.size);
@@ -317,7 +338,7 @@ function scheduleSave() {
 }
 async function saveState() {
   if (!redis) return;
-  await redis.set('bot:state:mrkt:full:v1', JSON.stringify(exportState()));
+  await redis.set('bot:state:mrkt:fullfast:v1', JSON.stringify(exportState()));
 }
 
 // =====================
@@ -342,7 +363,7 @@ async function markMrktFailIfAuth(statusCode) {
 }
 
 // =====================
-// MRKT API (lots / models / feed / buy)
+// MRKT API
 // =====================
 async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cursor }) {
   if (!MRKT_AUTH) return { ok: false, reason: 'NO_AUTH', gifts: [], cursor: '' };
@@ -364,11 +385,11 @@ async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cu
     promotedFirst: false,
   };
 
-  const res = await fetch(`${MRKT_API_URL}/gifts/saling`, {
+  const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/saling`, {
     method: 'POST',
     headers: { Authorization: MRKT_AUTH, 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body),
-  }).catch(() => null);
+  }, MRKT_TIMEOUT_MS).catch(() => null);
 
   if (!res) return { ok: false, reason: 'FETCH_ERROR', gifts: [], cursor: '' };
   if (!res.ok) {
@@ -383,13 +404,13 @@ async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cu
   return { ok: true, reason: 'OK', gifts, cursor: nextCursor };
 }
 
-async function mrktSearchLots({ gift, model, backdrop }, minPriceTon, maxPriceTon) {
+async function mrktSearchLots({ gift, model, backdrop }, minPriceTon, maxPriceTon, pagesLimit = MRKT_PAGES) {
   if (!gift) return { ok: false, reason: 'NO_GIFT', gifts: [] };
 
   let cursor = '';
   const out = [];
 
-  for (let page = 0; page < MRKT_PAGES; page++) {
+  for (let page = 0; page < pagesLimit; page++) {
     const r = await mrktFetchSalingPage({
       collectionName: gift,
       modelName: model || null,
@@ -399,7 +420,10 @@ async function mrktSearchLots({ gift, model, backdrop }, minPriceTon, maxPriceTo
     if (!r.ok) return { ok: false, reason: r.reason, gifts: [] };
 
     for (const g of r.gifts) {
-      const nano = (g?.salePriceWithoutFee && Number(g.salePriceWithoutFee) > 0) ? g.salePriceWithoutFee : g?.salePrice;
+      const nano = (g?.salePriceWithoutFee && Number(g.salePriceWithoutFee) > 0)
+        ? g.salePriceWithoutFee
+        : g?.salePrice;
+
       if (nano == null) continue;
 
       const priceTon = Number(nano) / 1e9;
@@ -430,45 +454,43 @@ async function mrktSearchLots({ gift, model, backdrop }, minPriceTon, maxPriceTo
         attrs: { model: modelName || null, backdrop: backdropName || null, symbol: symbolName || null },
         raw: g,
       });
+
+      if (out.length >= MAX_PER_MARKET) break;
     }
+
+    if (out.length >= MAX_PER_MARKET) break;
 
     cursor = r.cursor || '';
     if (!cursor) break;
-    if (out.length >= MAX_PER_MARKET) break;
   }
 
   out.sort((a, b) => a.priceTon - b.priceTon);
   return { ok: true, reason: 'OK', gifts: out.slice(0, MAX_PER_MARKET) };
 }
 
-// models list + rarity (%)
 async function mrktFetchModelsForCollection(collectionName) {
-  // endpoint который у тебя работал: /api/v1/gifts/models  body: { collections: ["Snake Box"] }
   const body = { collections: [collectionName] };
 
-  const res = await fetch(`${MRKT_API_URL}/gifts/models`, {
+  const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/models`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body),
-  }).catch(() => null);
+  }, MRKT_TIMEOUT_MS).catch(() => null);
 
   if (!res || !res.ok) return { ok: false, models: [] };
 
   const data = await res.json().catch(() => null);
   if (!Array.isArray(data)) return { ok: false, models: [] };
 
-  // group by modelTitle
   const map = new Map();
   for (const it of data) {
     const name = it.modelTitle || it.modelName;
     if (!name) continue;
     const rarityPerMille = it.rarityPerMille ?? null;
-    if (!map.has(name)) {
-      map.set(name, { name, rarityPerMille });
-    }
+    if (!map.has(name)) map.set(name, { name, rarityPerMille });
   }
+
   const arr = Array.from(map.values());
-  // sort by rarity asc (rarer first) if exists
   arr.sort((a, b) => {
     const ra = a.rarityPerMille == null ? Infinity : Number(a.rarityPerMille);
     const rb = b.rarityPerMille == null ? Infinity : Number(b.rarityPerMille);
@@ -479,9 +501,8 @@ async function mrktFetchModelsForCollection(collectionName) {
   return { ok: true, models: arr };
 }
 
-// backdrops list: derive from listings (quick scan)
 async function mrktScanBackdrops({ gift, model }, maxUnique = 60) {
-  const uniq = new Map(); // lower -> display
+  const uniq = new Map();
   let cursor = '';
 
   for (let page = 0; page < Math.min(4, MRKT_PAGES); page++) {
@@ -506,8 +527,7 @@ async function mrktScanBackdrops({ gift, model }, maxUnique = 60) {
     if (!cursor) break;
   }
 
-  const out = Array.from(uniq.values()).sort((a, b) => a.localeCompare(b));
-  return out;
+  return Array.from(uniq.values()).sort((a, b) => a.localeCompare(b));
 }
 
 async function mrktFeedFetch({ gift, model, backdrop, cursor, count, types }) {
@@ -528,11 +548,11 @@ async function mrktFeedFetch({ gift, model, backdrop, cursor, count, types }) {
     type: Array.isArray(types) ? types : [],
   };
 
-  const res = await fetch(`${MRKT_API_URL}/feed`, {
+  const res = await fetchWithTimeout(`${MRKT_API_URL}/feed`, {
     method: 'POST',
     headers: { Authorization: MRKT_AUTH, 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body),
-  }).catch(() => null);
+  }, MRKT_TIMEOUT_MS).catch(() => null);
 
   if (!res) return { ok: false, reason: 'FETCH_ERROR', items: [], cursor: '' };
   if (!res.ok) {
@@ -596,6 +616,7 @@ async function mrktHistorySalesEstimate({ gift, model, backdrop }) {
     cursor = r.cursor || '';
     pages++;
     if (!cursor) break;
+
     if (MRKT_FEED_THROTTLE_MS > 0) await sleep(MRKT_FEED_THROTTLE_MS);
   }
 
@@ -605,7 +626,6 @@ async function mrktHistorySalesEstimate({ gift, model, backdrop }) {
   return out;
 }
 
-// smart fallback: exact -> no backdrop -> gift only
 async function mrktSmartHistory({ gift, model, backdrop }) {
   let h = await mrktHistorySalesEstimate({ gift, model, backdrop });
   if (h.ok && h.median != null) return { ...h, level: 'gift+model+backdrop' };
@@ -624,16 +644,13 @@ async function mrktSmartHistory({ gift, model, backdrop }) {
 async function mrktBuy({ id, priceNano }) {
   if (!MRKT_AUTH) return { ok: false, reason: 'NO_AUTH' };
 
-  const body = {
-    ids: [id],
-    prices: { [id]: priceNano },
-  };
+  const body = { ids: [id], prices: { [id]: priceNano } };
 
-  const res = await fetch(`${MRKT_API_URL}/gifts/buy`, {
+  const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/buy`, {
     method: 'POST',
     headers: { Authorization: MRKT_AUTH, 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body),
-  }).catch(() => null);
+  }, MRKT_TIMEOUT_MS).catch(() => null);
 
   if (!res) return { ok: false, reason: 'FETCH_ERROR' };
 
@@ -646,7 +663,7 @@ async function mrktBuy({ id, priceNano }) {
 }
 
 // =====================
-// Inline options helpers (safe callback_data)
+// tmp options (inline picks)
 // =====================
 function setTmpOptions(user, type, arr) {
   if (!user.tmp) user.tmp = { giftOptions: [], modelOptions: [], backdropOptions: [] };
@@ -654,7 +671,6 @@ function setTmpOptions(user, type, arr) {
   if (type === 'model') user.tmp.modelOptions = arr;
   if (type === 'backdrop') user.tmp.backdropOptions = arr;
 }
-
 function getTmpOption(user, type, idx) {
   const i = Number(idx);
   if (!Number.isFinite(i) || i < 0) return null;
@@ -663,7 +679,6 @@ function getTmpOption(user, type, idx) {
   if (type === 'backdrop') return user.tmp?.backdropOptions?.[i] ?? null;
   return null;
 }
-
 function buildOptionsKeyboard(type, arr, labelFn) {
   const inline_keyboard = [];
   for (let i = 0; i < arr.length; i++) {
@@ -690,9 +705,10 @@ async function attemptAutoBuyMrkt(userId, gift, user) {
     if (last && nowMs() - last < AUTO_BUY_ATTEMPT_TTL_MS) return false;
     autoBuyRecentAttempts.set(k, nowMs());
 
-    const priceNanoRaw = (gift.raw?.salePriceWithoutFee && Number(gift.raw.salePriceWithoutFee) > 0)
-      ? gift.raw.salePriceWithoutFee
-      : gift.raw?.salePrice;
+    const priceNanoRaw =
+      (gift.raw?.salePriceWithoutFee && Number(gift.raw.salePriceWithoutFee) > 0)
+        ? gift.raw.salePriceWithoutFee
+        : gift.raw?.salePrice;
 
     const priceNano = priceNanoRaw != null ? Number(priceNanoRaw) : null;
     if (!priceNano || !Number.isFinite(priceNano)) return false;
@@ -726,6 +742,7 @@ async function attemptAutoBuyMrkt(userId, gift, user) {
         (r.text ? `body: ${r.text}` : ''),
       { disable_web_page_preview: true }
     );
+
     return false;
   } finally {
     autoBuyLocks.delete(userId);
@@ -733,7 +750,7 @@ async function attemptAutoBuyMrkt(userId, gift, user) {
 }
 
 // =====================
-// Sellprice (MRKT)
+// Sellprice
 // =====================
 async function sendSellPriceForUser(chatId, user) {
   const gift = user.filters.gift;
@@ -741,7 +758,7 @@ async function sendSellPriceForUser(chatId, user) {
   const backdrop = user.filters.backdrop;
 
   if (!gift) {
-    return sendMessageSafe(chatId, 'Сначала выбери подарок: 🎛 Фильтры → 🎁 Выбрать подарок', { reply_markup: MAIN_KEYBOARD });
+    return sendMessageSafe(chatId, 'Сначала выбери подарок: 🎛 Фильтры → 🎁', { reply_markup: MAIN_KEYBOARD });
   }
 
   let text = 'Оценка цен продажи (MRKT):\n\n';
@@ -749,7 +766,7 @@ async function sendSellPriceForUser(chatId, user) {
   text += `Модель: ${model || 'любая'}\n`;
   text += `Фон: ${backdrop || 'любой'}\n\n`;
 
-  const lots = await mrktSearchLots({ gift, model, backdrop }, null, null);
+  const lots = await mrktSearchLots({ gift, model, backdrop }, null, null, MRKT_PAGES);
   if (lots.ok && lots.gifts.length) {
     const best = lots.gifts[0];
     const net = best.priceTon * (1 - MRKT_FEE);
@@ -770,7 +787,7 @@ async function sendSellPriceForUser(chatId, user) {
 }
 
 // =====================
-// Deal notification
+// Deal notify
 // =====================
 async function sendDeal(userId, gift) {
   const lines = [];
@@ -790,7 +807,42 @@ async function sendDeal(userId, gift) {
 }
 
 // =====================
-// Subscriptions
+// Filters menu
+// =====================
+async function showFiltersMenu(chatId) {
+  const inlineKeyboard = {
+    inline_keyboard: [
+      [{ text: '🎁 Выбрать подарок', callback_data: 'filter_gift' }],
+      [{ text: '🔍 Поиск подарка', callback_data: 'search_gift' }],
+      [{ text: '🎯 Выбрать модель (с %)', callback_data: 'filter_model' }],
+      [{ text: '🔍 Поиск модели', callback_data: 'search_model' }],
+      [{ text: '🎨 Выбрать фон', callback_data: 'filter_backdrop' }],
+      [{ text: '🔍 Поиск фона', callback_data: 'search_backdrop' }],
+      [
+        { text: '♻️ Сбросить модель', callback_data: 'clear_model' },
+        { text: '♻️ Сбросить фон', callback_data: 'clear_backdrop' },
+      ],
+      [{ text: '♻️ Сбросить всё', callback_data: 'clear_all' }],
+      [{ text: 'ℹ️ Показать фильтры', callback_data: 'show_filters' }],
+    ],
+  };
+  await sendMessageSafe(chatId, 'Фильтры MRKT:', { reply_markup: inlineKeyboard });
+}
+
+function currentFiltersText(user) {
+  return (
+    `Фильтры:\n` +
+    `• Подарок: ${user.filters.gift || 'не выбран'}\n` +
+    `• Модель: ${user.filters.model || 'любая'}\n` +
+    `• Фон: ${user.filters.backdrop || 'любой'}\n` +
+    `• Автопокупка (user): ${user.autoBuyEnabled ? 'ON' : 'OFF'}\n` +
+    `• Автопокупка (global): ${AUTO_BUY_GLOBAL ? 'ON' : 'OFF'}\n` +
+    `• DRY_RUN: ${AUTO_BUY_DRY_RUN ? 'true' : 'false'}\n`
+  );
+}
+
+// =====================
+// Subscriptions (full menu)
 // =====================
 async function showSubsMenu(chatId) {
   const inlineKeyboard = {
@@ -829,7 +881,6 @@ function findSub(user, subId) {
 
 function makeSubFromCurrentFilters(user) {
   if (!user.filters.gift) return { ok: false, reason: 'NO_GIFT' };
-
   const sub = {
     id: `sub_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
     num: (user.subscriptions?.length || 0) + 1,
@@ -939,7 +990,8 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         const lots = await mrktSearchLots(
           { gift: sub.filters.gift, model: sub.filters.model, backdrop: sub.filters.backdrop },
           null,
-          null
+          null,
+          MRKT_PAGES_MONITOR
         );
         if (!lots.ok) continue;
 
@@ -1013,13 +1065,15 @@ async function checkMarketsForAllUsers() {
       const minP = user.minPriceTon != null ? Number(user.minPriceTon) : 0;
       const maxP = Number(user.maxPriceTon);
 
-      const r = await mrktSearchLots({ gift, model, backdrop }, minP, maxP);
+      const r = await mrktSearchLots({ gift, model, backdrop }, minP, maxP, MRKT_PAGES_MONITOR);
       if (!r.ok || !r.gifts.length) continue;
+
+      const list = ONLY_CHEAPEST_PER_CHECK ? r.gifts.slice(0, 1) : r.gifts;
 
       let sent = 0;
       let autoBuys = 0;
 
-      for (const g of r.gifts) {
+      for (const g of list) {
         if (sent >= MAX_NOTIFICATIONS_PER_CHECK) break;
         if (autoBuys >= AUTO_BUY_MAX_PER_CHECK) break;
 
@@ -1047,41 +1101,6 @@ async function checkMarketsForAllUsers() {
 }
 
 // =====================
-// Menus / Filters UI
-// =====================
-async function showFiltersMenu(chatId) {
-  const inlineKeyboard = {
-    inline_keyboard: [
-      [{ text: '🎁 Выбрать подарок', callback_data: 'filter_gift' }],
-      [{ text: '🔍 Поиск подарка', callback_data: 'search_gift' }],
-      [{ text: '🎯 Выбрать модель (с %)', callback_data: 'filter_model' }],
-      [{ text: '🔍 Поиск модели', callback_data: 'search_model' }],
-      [{ text: '🎨 Выбрать фон', callback_data: 'filter_backdrop' }],
-      [{ text: '🔍 Поиск фона', callback_data: 'search_backdrop' }],
-      [
-        { text: '♻️ Сбросить модель', callback_data: 'clear_model' },
-        { text: '♻️ Сбросить фон', callback_data: 'clear_backdrop' },
-      ],
-      [{ text: '♻️ Сбросить всё', callback_data: 'clear_all' }],
-      [{ text: 'ℹ️ Показать фильтры', callback_data: 'show_filters' }],
-    ],
-  };
-  await sendMessageSafe(chatId, 'Фильтры MRKT:', { reply_markup: inlineKeyboard });
-}
-
-function currentFiltersText(user) {
-  return (
-    `Фильтры:\n` +
-    `• Подарок: ${user.filters.gift || 'не выбран'}\n` +
-    `• Модель: ${user.filters.model || 'любая'}\n` +
-    `• Фон: ${user.filters.backdrop || 'любой'}\n` +
-    `• Автопокупка (user): ${user.autoBuyEnabled ? 'ON' : 'OFF'}\n` +
-    `• Автопокупка (global): ${AUTO_BUY_GLOBAL ? 'ON' : 'OFF'}\n` +
-    `• DRY_RUN: ${AUTO_BUY_DRY_RUN ? 'true' : 'false'}\n`
-  );
-}
-
-// =====================
 // Commands
 // =====================
 bot.onText(/^\/start\b/, async (msg) => {
@@ -1098,15 +1117,18 @@ bot.onText(/^\/status\b/, async (msg) => {
     `• Gift: ${user.filters.gift || 'не выбран'}\n` +
     `• Model: ${user.filters.model || 'any'}\n` +
     `• Backdrop: ${user.filters.backdrop || 'any'}\n` +
-    `• Автопокупка (user): ${user.autoBuyEnabled ? 'ON' : 'OFF'}\n` +
-    `• Автопокупка (global): ${AUTO_BUY_GLOBAL ? 'ON' : 'OFF'}\n` +
+    `• AutoBuy (user): ${user.autoBuyEnabled ? 'ON' : 'OFF'}\n` +
+    `• AutoBuy (global): ${AUTO_BUY_GLOBAL ? 'ON' : 'OFF'}\n` +
     `• DRY_RUN: ${AUTO_BUY_DRY_RUN ? 'true' : 'false'}\n` +
     `• Redis: ${redis ? '✅' : '❌'}\n\n` +
     `MRKT:\n` +
     `• MRKT_AUTH: ${MRKT_AUTH ? '✅' : '❌'}\n` +
     `• last ok: ${mrktAuthState.lastOkAt ? new Date(mrktAuthState.lastOkAt).toLocaleString() : '-'}\n` +
     `• last fail: ${mrktAuthState.lastFailAt ? `HTTP ${mrktAuthState.lastFailCode}` : '-'}\n` +
-    `• MRKT_COLLECTIONS: ${MRKT_COLLECTIONS.length ? MRKT_COLLECTIONS.length : 'not set'}\n`;
+    `• MRKT_COLLECTIONS: ${MRKT_COLLECTIONS.length ? MRKT_COLLECTIONS.length : 'not set'}\n` +
+    `• MRKT_TIMEOUT_MS: ${MRKT_TIMEOUT_MS}\n` +
+    `• MRKT_PAGES_MONITOR: ${MRKT_PAGES_MONITOR}\n` +
+    `• ONLY_CHEAPEST_PER_CHECK: ${ONLY_CHEAPEST_PER_CHECK}\n`;
 
   await sendMessageSafe(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
 });
@@ -1117,7 +1139,7 @@ bot.onText(/^\/sellprice\b/, async (msg) => {
 });
 
 // =====================
-// Message handler (buttons + states)
+// Message handler
 // =====================
 bot.on('message', async (msg) => {
   const userId = msg.from?.id;
@@ -1130,34 +1152,33 @@ bot.on('message', async (msg) => {
   const t = text.trim();
   const q = norm(t);
 
-  // states: prices
   if (user.state === 'awaiting_max') {
+    user.state = null;
     const v = n(t);
     if (!Number.isFinite(v) || v <= 0) return sendMessageSafe(chatId, 'Введи MAX TON (пример: 12)', { reply_markup: MAIN_KEYBOARD });
     user.maxPriceTon = v;
-    user.state = null;
     clearUserSentDeals(userId);
     scheduleSave();
     return sendMessageSafe(chatId, `Ок. MAX: ${v.toFixed(3)} TON`, { reply_markup: MAIN_KEYBOARD });
   }
+
   if (user.state === 'awaiting_min') {
+    user.state = null;
     const v = n(t);
     if (!Number.isFinite(v) || v < 0) return sendMessageSafe(chatId, 'Введи MIN TON (0 = убрать)', { reply_markup: MAIN_KEYBOARD });
     user.minPriceTon = v === 0 ? 0 : v;
-    user.state = null;
     clearUserSentDeals(userId);
     scheduleSave();
     return sendMessageSafe(chatId, `Ок. MIN: ${user.minPriceTon.toFixed(3)} TON`, { reply_markup: MAIN_KEYBOARD });
   }
 
-  // states: search
   if (user.state === 'awaiting_gift_search') {
     user.state = null;
     scheduleSave();
 
     const src = MRKT_COLLECTIONS.length ? MRKT_COLLECTIONS : [];
     const matched = src.filter((x) => norm(x).includes(q)).slice(0, MAX_SEARCH_RESULTS);
-    if (!matched.length) return sendMessageSafe(chatId, 'Ничего не нашёл. Добавь MRKT_COLLECTIONS в Railway или введи вручную.', { reply_markup: MAIN_KEYBOARD });
+    if (!matched.length) return sendMessageSafe(chatId, 'Ничего не нашёл. Проверь MRKT_COLLECTIONS.', { reply_markup: MAIN_KEYBOARD });
 
     setTmpOptions(user, 'gift', matched);
     return sendMessageSafe(chatId, 'Нашёл подарки, выбери:', { reply_markup: buildOptionsKeyboard('gift', matched) });
@@ -1169,7 +1190,7 @@ bot.on('message', async (msg) => {
     if (!user.filters.gift) return sendMessageSafe(chatId, 'Сначала выбери подарок.', { reply_markup: MAIN_KEYBOARD });
 
     const r = await mrktFetchModelsForCollection(user.filters.gift);
-    if (!r.ok || !r.models.length) return sendMessageSafe(chatId, 'Не удалось получить модели (MRKT /gifts/models).', { reply_markup: MAIN_KEYBOARD });
+    if (!r.ok || !r.models.length) return sendMessageSafe(chatId, 'Не удалось получить модели.', { reply_markup: MAIN_KEYBOARD });
 
     const matched = r.models.filter((m) => norm(m.name).includes(q)).slice(0, MAX_SEARCH_RESULTS);
     if (!matched.length) return sendMessageSafe(chatId, 'Модель не найдена.', { reply_markup: MAIN_KEYBOARD });
@@ -1237,7 +1258,6 @@ bot.on('message', async (msg) => {
   }
 
   if (t === '📡 Подписки') return showSubsMenu(chatId);
-
   if (t === '🎛 Фильтры') return showFiltersMenu(chatId);
 
   return sendMessageSafe(chatId, 'Используй кнопки снизу.', { reply_markup: MAIN_KEYBOARD });
@@ -1261,19 +1281,11 @@ bot.on('callback_query', async (q) => {
         setTmpOptions(user, 'gift', list);
         await sendMessageSafe(chatId, 'Выбери подарок:', { reply_markup: buildOptionsKeyboard('gift', list) });
       }
-    }
-
-    else if (data === 'search_gift') {
-      if (!MRKT_COLLECTIONS.length) {
-        await sendMessageSafe(chatId, 'MRKT_COLLECTIONS не задан. Добавь список коллекций, или введи Gift вручную через /status (пока).', { reply_markup: MAIN_KEYBOARD });
-      } else {
-        user.state = 'awaiting_gift_search';
-        scheduleSave();
-        await sendMessageSafe(chatId, 'Напиши часть названия подарка (collection):', { reply_markup: MAIN_KEYBOARD });
-      }
-    }
-
-    else if (data === 'filter_model') {
+    } else if (data === 'search_gift') {
+      user.state = 'awaiting_gift_search';
+      scheduleSave();
+      await sendMessageSafe(chatId, 'Напиши часть названия подарка (collection):', { reply_markup: MAIN_KEYBOARD });
+    } else if (data === 'filter_model') {
       if (!user.filters.gift) {
         await sendMessageSafe(chatId, 'Сначала выбери подарок.', { reply_markup: MAIN_KEYBOARD });
       } else {
@@ -1291,19 +1303,11 @@ bot.on('callback_query', async (q) => {
           });
         }
       }
-    }
-
-    else if (data === 'search_model') {
-      if (!user.filters.gift) {
-        await sendMessageSafe(chatId, 'Сначала выбери подарок.', { reply_markup: MAIN_KEYBOARD });
-      } else {
-        user.state = 'awaiting_model_search';
-        scheduleSave();
-        await sendMessageSafe(chatId, 'Напиши часть названия модели:', { reply_markup: MAIN_KEYBOARD });
-      }
-    }
-
-    else if (data === 'filter_backdrop') {
+    } else if (data === 'search_model') {
+      user.state = 'awaiting_model_search';
+      scheduleSave();
+      await sendMessageSafe(chatId, 'Напиши часть названия модели:', { reply_markup: MAIN_KEYBOARD });
+    } else if (data === 'filter_backdrop') {
       if (!user.filters.gift) {
         await sendMessageSafe(chatId, 'Сначала выбери подарок.', { reply_markup: MAIN_KEYBOARD });
       } else {
@@ -1316,46 +1320,30 @@ bot.on('callback_query', async (q) => {
           await sendMessageSafe(chatId, 'Выбери фон:', { reply_markup: buildOptionsKeyboard('backdrop', limited) });
         }
       }
-    }
-
-    else if (data === 'search_backdrop') {
-      if (!user.filters.gift) {
-        await sendMessageSafe(chatId, 'Сначала выбери подарок.', { reply_markup: MAIN_KEYBOARD });
-      } else {
-        user.state = 'awaiting_backdrop_search';
-        scheduleSave();
-        await sendMessageSafe(chatId, 'Напиши часть названия фона:', { reply_markup: MAIN_KEYBOARD });
-      }
-    }
-
-    else if (data === 'clear_model') {
+    } else if (data === 'search_backdrop') {
+      user.state = 'awaiting_backdrop_search';
+      scheduleSave();
+      await sendMessageSafe(chatId, 'Напиши часть названия фона:', { reply_markup: MAIN_KEYBOARD });
+    } else if (data === 'clear_model') {
       user.filters.model = '';
       clearUserSentDeals(userId);
       scheduleSave();
       await sendMessageSafe(chatId, 'Модель сброшена.', { reply_markup: MAIN_KEYBOARD });
-    }
-
-    else if (data === 'clear_backdrop') {
+    } else if (data === 'clear_backdrop') {
       user.filters.backdrop = '';
       clearUserSentDeals(userId);
       scheduleSave();
       await sendMessageSafe(chatId, 'Фон сброшен.', { reply_markup: MAIN_KEYBOARD });
-    }
-
-    else if (data === 'clear_all') {
+    } else if (data === 'clear_all') {
       user.filters.gift = '';
       user.filters.model = '';
       user.filters.backdrop = '';
       clearUserSentDeals(userId);
       scheduleSave();
       await sendMessageSafe(chatId, 'Фильтры сброшены.', { reply_markup: MAIN_KEYBOARD });
-    }
-
-    else if (data === 'show_filters') {
+    } else if (data === 'show_filters') {
       await sendMessageSafe(chatId, currentFiltersText(user), { reply_markup: MAIN_KEYBOARD });
-    }
-
-    else if (data.startsWith('pick:')) {
+    } else if (data.startsWith('pick:')) {
       const [, type, idx] = data.split(':');
       const picked = getTmpOption(user, type, idx);
 
@@ -1394,13 +1382,9 @@ bot.on('callback_query', async (q) => {
         scheduleSave();
         await sendMessageSafe(chatId, `Подписка создана: #${r.sub.num}`, { reply_markup: MAIN_KEYBOARD });
       }
-    }
-
-    else if (data === 'sub_list') {
+    } else if (data === 'sub_list') {
       await showSubsList(chatId, user);
-    }
-
-    else if (data === 'sub_check_now') {
+    } else if (data === 'sub_check_now') {
       await sendMessageSafe(chatId, 'Ок, проверяю подписки сейчас...', { reply_markup: MAIN_KEYBOARD });
       const st = await checkSubscriptionsForAllUsers({ manual: true });
       await sendMessageSafe(
@@ -1411,26 +1395,20 @@ bot.on('callback_query', async (q) => {
           `• Уведомлений (feed): ${st.feedNotifs}`,
         { reply_markup: MAIN_KEYBOARD }
       );
-    }
-
-    else if (data.startsWith('sub_toggle:')) {
+    } else if (data.startsWith('sub_toggle:')) {
       const subId = data.split(':')[1];
       const sub = findSub(user, subId);
       if (!sub) return sendMessageSafe(chatId, 'Подписка не найдена.', { reply_markup: MAIN_KEYBOARD });
       sub.enabled = !sub.enabled;
       scheduleSave();
       await sendMessageSafe(chatId, `Подписка #${sub.num}: ${sub.enabled ? 'ON' : 'OFF'}`, { reply_markup: MAIN_KEYBOARD });
-    }
-
-    else if (data.startsWith('sub_delete:')) {
+    } else if (data.startsWith('sub_delete:')) {
       const subId = data.split(':')[1];
       user.subscriptions = (user.subscriptions || []).filter((s) => s && s.id !== subId);
       renumberSubs(user);
       scheduleSave();
       await sendMessageSafe(chatId, 'Подписка удалена.', { reply_markup: MAIN_KEYBOARD });
-    }
-
-    else if (data.startsWith('sub_setmax:')) {
+    } else if (data.startsWith('sub_setmax:')) {
       const subId = data.split(':')[1];
       const sub = findSub(user, subId);
       if (!sub) return sendMessageSafe(chatId, 'Подписка не найдена.', { reply_markup: MAIN_KEYBOARD });
@@ -1449,11 +1427,11 @@ bot.on('callback_query', async (q) => {
 // Intervals + bootstrap
 // =====================
 setInterval(() => {
-  checkMarketsForAllUsers().catch((e) => console.error('monitor interval error:', e));
+  checkMarketsForAllUsers().catch((e) => console.error('monitor error:', e));
 }, CHECK_INTERVAL_MS);
 
 setInterval(() => {
-  checkSubscriptionsForAllUsers().catch((e) => console.error('subs interval error:', e));
+  checkSubscriptionsForAllUsers().catch((e) => console.error('subs error:', e));
 }, SUBS_CHECK_INTERVAL_MS);
 
 (async () => {
