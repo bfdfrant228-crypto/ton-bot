@@ -1,8 +1,8 @@
 /**
  * ton-bot MRKT + WebApp Panel (single-file)
- * v9.2: UI fixes (desktop/mobile), better theme contrast, subs notify with photo + NFT/MRKT buttons,
- *       history close + history in Market tab + history sale images
- * version: 2026-03-01-webapp-v9.2
+ * v9.3: force dark theme, fix suggestion opacity, smaller lots cards (2 visible),
+ *       clearer buttons, market manual buy + confirm, subscription notify with t.me/nft preview
+ * version: 2026-03-01-webapp-v9.3
  */
 
 const TelegramBot = require('node-telegram-bot-api');
@@ -18,7 +18,6 @@ if (!token) {
 }
 
 const MODE = process.env.MODE || 'real';
-
 const APP_TITLE = String(process.env.APP_TITLE || 'Панель');
 
 const WEBAPP_URL = process.env.WEBAPP_URL || null;
@@ -41,7 +40,6 @@ const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS
 // requests
 const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 9000);
 const MRKT_COUNT = Number(process.env.MRKT_COUNT || 50);
-const MRKT_PAGES = Number(process.env.MRKT_PAGES || 4);
 const MRKT_FEED_COUNT = Number(process.env.MRKT_FEED_COUNT || 50);
 const MRKT_FEED_THROTTLE_MS = Number(process.env.MRKT_FEED_THROTTLE_MS || 120);
 
@@ -65,7 +63,7 @@ const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 30
 const AUTO_BUY_NO_FUNDS_PAUSE_MS = Number(process.env.AUTO_BUY_NO_FUNDS_PAUSE_MS || 10 * 60 * 1000);
 const MRKT_AUTH_NOTIFY_COOLDOWN_MS = Number(process.env.MRKT_AUTH_NOTIFY_COOLDOWN_MS || 60 * 60 * 1000);
 
-console.log('v9.2 start', {
+console.log('v9.3 start', {
   MODE,
   APP_TITLE,
   WEBAPP_URL: !!WEBAPP_URL,
@@ -84,10 +82,7 @@ const MAIN_KEYBOARD = {
 
 // ===================== State =====================
 const users = new Map(); // userId -> state
-
-// per-sub state: `${userId}:${subId}` -> { floor, emptyStreak, feedLastId, pausedUntil }
-const subStates = new Map();
-
+const subStates = new Map(); // `${userId}:${subId}` -> { floor, emptyStreak, feedLastId, pausedUntil }
 let isSubsChecking = false;
 
 const mrktAuthState = {
@@ -168,39 +163,11 @@ function median(sorted) {
   const L = sorted.length;
   return L % 2 ? sorted[(L - 1) / 2] : (sorted[L / 2 - 1] + sorted[L / 2]) / 2;
 }
-function escapeHtml(s) {
-  return String(s || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
 
 async function sendMessageSafe(chatId, text, opts) {
   while (true) {
     try {
       return await bot.sendMessage(chatId, text, opts);
-    } catch (e) {
-      const retryAfter =
-        e?.response?.body?.parameters?.retry_after ??
-        e?.response?.parameters?.retry_after ??
-        null;
-      if (retryAfter) {
-        await sleep((Number(retryAfter) + 1) * 1000);
-        continue;
-      }
-      throw e;
-    }
-  }
-}
-
-async function sendPhotoSafe(chatId, photoUrl, caption, opts = {}) {
-  while (true) {
-    try {
-      // caption max ~1024, keep short
-      return await bot.sendPhoto(chatId, photoUrl, {
-        caption,
-        ...opts,
-      });
     } catch (e) {
       const retryAfter =
         e?.response?.body?.parameters?.retry_after ??
@@ -296,7 +263,7 @@ async function saveMrktAuthToRedis(t) {
 function getOrCreateUser(userId) {
   if (!users.has(userId)) {
     users.set(userId, {
-      enabled: true, // subscriptions notifications on/off
+      enabled: true,
       filters: { gift: '', giftLabel: '', model: '', backdrop: '' },
       subscriptions: [],
     });
@@ -305,9 +272,7 @@ function getOrCreateUser(userId) {
 }
 function renumberSubs(user) {
   const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
-  subs.forEach((s, idx) => {
-    if (s) s.num = idx + 1;
-  });
+  subs.forEach((s, idx) => { if (s) s.num = idx + 1; });
 }
 function findSub(user, id) {
   return (user.subscriptions || []).find((s) => s && s.id === id) || null;
@@ -319,12 +284,9 @@ function makeSubFromCurrentFilters(user) {
     id: `sub_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
     num: user.subscriptions.length + 1,
     enabled: true,
-    // notify
     maxNotifyTon: null,
-    // autobuy
     autoBuyEnabled: false,
     maxAutoBuyTon: null,
-    // filters
     filters: { gift: user.filters.gift, model: user.filters.model || '', backdrop: user.filters.backdrop || '' },
   };
   return { ok: true, sub };
@@ -382,10 +344,7 @@ async function mrktGetCollections() {
     `${MRKT_API_URL}/gifts/collections`,
     { method: 'GET', headers },
     MRKT_TIMEOUT_MS
-  ).catch((e) => {
-    console.error('MRKT collections fetch error:', e?.message || e);
-    return null;
-  });
+  ).catch(() => null);
 
   if (!res) {
     collectionsCache = { time: now, items: [] };
@@ -600,6 +559,7 @@ async function mrktSearchLots({ gift, model, backdrop }, pagesLimit) {
         name: displayName,
         giftName,
         priceTon,
+        priceNano: Number(nano),
         urlTelegram,
         urlMarket,
         model: modelName || null,
@@ -607,7 +567,6 @@ async function mrktSearchLots({ gift, model, backdrop }, pagesLimit) {
         symbol: g.symbolName || null,
         number: g.number ?? null,
         collectionTitle: g.collectionTitle || g.collectionName || g.title || gift,
-        priceNano: Number(nano),
       });
 
       if (out.length >= 350) break;
@@ -678,11 +637,7 @@ async function mrktBuy({ id, priceNano }) {
 
   const txt = await res.text().catch(() => '');
   let data = null;
-  try {
-    data = txt ? JSON.parse(txt) : null;
-  } catch {
-    data = null;
-  }
+  try { data = txt ? JSON.parse(txt) : null; } catch { data = null; }
 
   if (!res.ok) return { ok: false, reason: `HTTP_${res.status}`, data, text: txt.slice(0, 600) };
 
@@ -701,16 +656,10 @@ async function mrktBuy({ id, priceNano }) {
 
 function isNoFundsError(r) {
   const raw = JSON.stringify(r?.data || r?.text || '').toLowerCase();
-  return (
-    raw.includes('not enough') ||
-    raw.includes('insufficient') ||
-    raw.includes('no funds') ||
-    raw.includes('low balance') ||
-    raw.includes('balance')
-  );
+  return raw.includes('not enough') || raw.includes('insufficient') || raw.includes('no funds') || raw.includes('low balance') || raw.includes('balance');
 }
 
-// ===================== History / Price =====================
+// ===================== History =====================
 async function mrktHistorySales({ gift, model, backdrop }) {
   const key = `hist|${gift}|${model || ''}|${backdrop || ''}`;
   const now = nowMs();
@@ -781,25 +730,21 @@ async function mrktHistorySales({ gift, model, backdrop }) {
 }
 
 async function mrktHistorySmart({ gift, model, backdrop }) {
-  // exact
   let h = await mrktHistorySales({ gift, model, backdrop });
   if (h.median != null && h.count >= 10) return { ...h, level: 'exact' };
 
-  // model
   if (model) {
     const hm = await mrktHistorySales({ gift, model, backdrop: '' });
     if (hm.median != null && hm.count >= 10) return { ...hm, level: 'model' };
     if (hm.count > h.count) h = { ...hm, level: 'model' };
   }
 
-  // backdrop
   if (backdrop) {
     const hb = await mrktHistorySales({ gift, model: '', backdrop });
     if (hb.median != null && hb.count >= 10) return { ...hb, level: 'backdrop' };
     if (hb.count > h.count) h = { ...hb, level: 'backdrop' };
   }
 
-  // collection
   const hc = await mrktHistorySales({ gift, model: '', backdrop: '' });
   if (hc.count > h.count) h = { ...hc, level: 'collection' };
 
@@ -808,24 +753,20 @@ async function mrktHistorySmart({ gift, model, backdrop }) {
 
 // ===================== Telegram notifications (subscriptions) =====================
 async function notifyFloorToUser(userId, sub, lot, prevFloor, newFloor) {
-  // Short + visual: sendPhoto from fragment
-  const photoUrl = lot?.giftName ? fragmentGiftRemoteUrl(lot.giftName) : null;
-
+  // IMPORTANT: to get Telegram NFT preview/animation -> send https://t.me/nft/... as plain text (preview enabled)
   const title = lot?.name || sub?.filters?.gift || 'Gift';
-  const floorLine = `Floor: ${newFloor.toFixed(3)} TON`;
+  const urlTelegram = lot?.urlTelegram || 'https://t.me/mrkt';
+  const urlMarket = lot?.urlMarket || 'https://t.me/mrkt';
 
   const model = lot?.model || sub?.filters?.model || '';
   const backdrop = lot?.backdrop || sub?.filters?.backdrop || '';
-  const symbol = lot?.symbol || '';
 
   const lines = [];
-  lines.push(`<b>${escapeHtml(title)}</b>`);
-  lines.push(escapeHtml(floorLine));
-  if (model) lines.push(`Model: ${escapeHtml(String(model))}`);
-  if (backdrop) lines.push(`Backdrop: ${escapeHtml(String(backdrop))}`);
-  if (symbol) lines.push(`Symbol: ${escapeHtml(String(symbol))}`);
+  lines.push(`Gift: ${title}`);
+  lines.push(`Floor: ${newFloor.toFixed(3)} TON`);
+  if (model) lines.push(`Model: ${model}`);
+  if (backdrop) lines.push(`Backdrop: ${backdrop}`);
 
-  // optional: show delta, small
   if (prevFloor != null && Number.isFinite(prevFloor) && Number(prevFloor) > 0) {
     const diff = newFloor - prevFloor;
     const pct = (diff / prevFloor) * 100;
@@ -834,27 +775,17 @@ async function notifyFloorToUser(userId, sub, lot, prevFloor, newFloor) {
     }
   }
 
-  const caption = lines.join('\n').slice(0, 950);
+  // Put URL on last line so Telegram shows preview.
+  lines.push(urlTelegram);
 
   const reply_markup = {
     inline_keyboard: [[
-      { text: 'NFT', url: lot?.urlTelegram || 'https://t.me/mrkt' },
-      { text: 'MRKT', url: lot?.urlMarket || 'https://t.me/mrkt' },
+      { text: 'NFT', url: urlTelegram },
+      { text: 'MRKT', url: urlMarket },
     ]],
   };
 
-  try {
-    if (photoUrl) {
-      await sendPhotoSafe(userId, photoUrl, caption, { parse_mode: 'HTML', reply_markup });
-      return;
-    }
-  } catch (e) {
-    // fallback below
-    console.error('sendPhoto failed, fallback to sendMessage:', e?.message || e);
-  }
-
-  const fallbackText = `${title}\n${floorLine}\n${lot?.urlTelegram || ''}`.trim();
-  await sendMessageSafe(userId, fallbackText, {
+  await sendMessageSafe(userId, lines.join('\n'), {
     disable_web_page_preview: false,
     reply_markup,
   });
@@ -957,7 +888,6 @@ async function autoBuyCycle() {
         const latestId = r.items[0]?.id || null;
         if (!latestId) continue;
 
-        // baseline (only-new): first time -> don't buy old listings
         if (!st.feedLastId) {
           subStates.set(stateKey, { ...st, feedLastId: latestId });
           continue;
@@ -986,7 +916,6 @@ async function autoBuyCycle() {
 
           const priceTon = priceNano / 1e9;
           const maxBuy = Number(sub.maxAutoBuyTon);
-
           if (!(priceTon <= maxBuy)) continue;
 
           const attemptKey = `${userId}:${g.id}`;
@@ -1002,29 +931,14 @@ async function autoBuyCycle() {
           const buyRes = await mrktBuy({ id: g.id, priceNano });
 
           if (buyRes.ok) {
-            const photoUrl = giftName ? fragmentGiftRemoteUrl(giftName) : null;
-            const caption =
-              `<b>✅ Куплено</b>\n` +
-              `<b>${escapeHtml(title)}</b>\n` +
-              `Price: ${priceTon.toFixed(3)} TON`;
-
-            const reply_markup = { inline_keyboard: [[{ text: 'NFT', url: urlTelegram }, { text: 'MRKT', url: urlMarket }]] };
-
-            try {
-              if (photoUrl) {
-                await sendPhotoSafe(userId, photoUrl, caption, { parse_mode: 'HTML', reply_markup });
-              } else {
-                await sendMessageSafe(userId, `${title}\nКуплено за ${priceTon.toFixed(3)} TON\n${urlTelegram}`, {
-                  disable_web_page_preview: false,
-                  reply_markup,
-                });
-              }
-            } catch {
-              await sendMessageSafe(userId, `${title}\nКуплено за ${priceTon.toFixed(3)} TON\n${urlTelegram}`, {
+            await sendMessageSafe(
+              userId,
+              `✅ Куплено\nGift: ${title}\nPrice: ${priceTon.toFixed(3)} TON\n${urlTelegram}`,
+              {
                 disable_web_page_preview: false,
-                reply_markup,
-              });
-            }
+                reply_markup: { inline_keyboard: [[{ text: 'NFT', url: urlTelegram }, { text: 'MRKT', url: urlMarket }]] },
+              }
+            );
           } else {
             if (isNoFundsError(buyRes)) {
               sub.autoBuyEnabled = false;
@@ -1102,15 +1016,15 @@ const WEBAPP_HTML = `<!doctype html><html lang="ru"><head>
 <style>
 :root{
   --bg:#0b0f14;
-  --card:#111827;
+  --card:#101826;
   --text:#e5e7eb;
   --muted:#9ca3af;
-  --border:#1f2937;
+  --border:#223044;
   --input:#0f172a;
-  --btn:#1f2937;
+  --btn:#182235;
   --btnText:#e5e7eb;
   --danger:#ef4444;
-  --accent:#22c55e
+  --accent:#22c55e;
 }
 *{box-sizing:border-box}
 body{margin:0;padding:14px;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
@@ -1135,9 +1049,10 @@ button{
   cursor:pointer
 }
 button:hover{filter:brightness(1.07)}
-.primary{border-color:var(--accent);color:#052e16;background:var(--accent);font-weight:700}
+.primary{border-color:var(--accent);color:#052e16;background:var(--accent);font-weight:800}
 .primary:hover{filter:brightness(1.02)}
-#err{display:none;border-color:var(--danger);color:var(--danger);white-space:pre-wrap;word-break:break-word}
+.danger{border-color:var(--danger);color:#fff;background:var(--danger);font-weight:700}
+#err{display:none;border-color:var(--danger);color:#ffd1d1;white-space:pre-wrap;word-break:break-word}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
 .field{position:relative;flex:1 1 280px;min-width:220px;max-width:520px}
 .tabs{display:flex;gap:8px;flex-wrap:wrap}
@@ -1147,31 +1062,37 @@ button:hover{filter:brightness(1.07)}
   border:1px solid var(--border);
   border-radius:14px;
   overflow:auto;
-  background:rgba(255,255,255,.02);
+  background:var(--card); /* FIX: not transparent */
   max-height:360px;
   position:absolute;
   top:calc(100% + 6px);
-  left:0;
-  right:0;
-  z-index:9999
+  left:0; right:0;
+  z-index:9999;
+  box-shadow: 0 14px 40px rgba(0,0,0,.45);
 }
 .sug .item{width:100%;text-align:left;border:0;background:transparent;padding:10px;display:flex;gap:10px;align-items:center}
 .sug .item:hover{background:rgba(255,255,255,.06)}
-.thumb{width:54px;height:54px;border-radius:16px;object-fit:contain;background:rgba(255,255,255,.08);border:1px solid var(--border);flex:0 0 auto}
+.thumb{width:54px;height:54px;border-radius:16px;object-fit:contain;background:rgba(255,255,255,.06);border:1px solid var(--border);flex:0 0 auto}
 .thumb.dot{border-radius:50%}
 .badge{padding:4px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted);font-size:12px;flex:0 0 auto}
 .hscroll{display:flex;gap:10px;overflow-x:auto;padding-bottom:6px;scroll-snap-type:x mandatory}
-.lot{min-width:260px;max-width:260px;flex:0 0 auto;border:1px solid var(--border);border-radius:16px;padding:10px;background:rgba(255,255,255,.02);scroll-snap-align:start}
-.lot img{width:100%;height:160px;object-fit:cover;background:rgba(255,255,255,.03);border-radius:14px;border:1px solid var(--border)}
-.price{font-size:18px;font-weight:800;margin-top:8px}
+.lot{
+  min-width:220px; max-width:220px; /* FIX: smaller so 2 cards visible */
+  flex:0 0 auto;border:1px solid var(--border);border-radius:16px;padding:10px;
+  background:rgba(255,255,255,.02);scroll-snap-align:start
+}
+.lot img{width:100%;height:140px;object-fit:cover;background:rgba(255,255,255,.03);border-radius:14px;border:1px solid var(--border)}
+.price{font-size:16px;font-weight:900;margin-top:8px}
 .muted{color:var(--muted);font-size:13px}
 .hr{height:1px;background:var(--border);margin:10px 0}
 .saleRow{display:flex;gap:10px;align-items:stretch}
-.saleImg{width:96px;height:96px;border-radius:14px;border:1px solid var(--border);object-fit:cover;background:rgba(255,255,255,.03);flex:0 0 auto}
+.saleImg{width:88px;height:88px;border-radius:14px;border:1px solid var(--border);object-fit:cover;background:rgba(255,255,255,.03);flex:0 0 auto}
 .saleCard{flex:1;border:1px solid var(--border);border-radius:14px;padding:10px;background:rgba(255,255,255,.02)}
 @media (min-width: 900px){
   body{padding:18px}
   .card{max-width:1200px}
+  .lot{min-width:240px;max-width:240px}
+  .lot img{height:150px}
 }
 </style></head><body>
 <h2>${APP_TITLE}</h2>
@@ -1205,8 +1126,8 @@ button:hover{filter:brightness(1.07)}
 
   <div class="row" style="margin-top:10px">
     <button id="apply" class="primary">Показать</button>
-    <button id="lotsRefresh">🔄 Лоты</button>
-    <button id="marketHistory">📜 История</button>
+    <button id="lotsRefresh">Обновить</button>
+    <button id="marketHistory">История продаж</button>
   </div>
 
   <div id="status" class="muted" style="margin-top:10px"></div>
@@ -1215,7 +1136,7 @@ button:hover{filter:brightness(1.07)}
   <div class="hr"></div>
   <div class="row" style="justify-content:space-between;align-items:center">
     <div><b>История продаж</b> <span class="muted">(по текущим фильтрам)</span></div>
-    <button id="marketHistClear">✖ Закрыть историю</button>
+    <button id="marketHistClear">Закрыть</button>
   </div>
   <div id="marketHistoryBox" class="muted" style="margin-top:10px"></div>
   <div id="marketSales" style="margin-top:10px;display:flex;flex-direction:column;gap:10px"></div>
@@ -1224,15 +1145,15 @@ button:hover{filter:brightness(1.07)}
 <div id="subs" class="card" style="display:none">
   <h3 style="margin:0 0 8px 0">Подписки</h3>
   <div class="row">
-    <button id="subCreate">➕ Создать из текущих фильтров</button>
-    <button id="subCheckNow">🔎 Проверить сейчас</button>
-    <button id="subRefresh">🔄 Обновить</button>
+    <button id="subCreate">Создать из текущих фильтров</button>
+    <button id="subCheckNow">Проверить сейчас</button>
+    <button id="subRefresh">Обновить</button>
   </div>
   <div id="subsList" style="margin-top:10px"></div>
   <div class="hr"></div>
   <div class="row" style="justify-content:space-between;align-items:center">
     <div><b>История продаж</b> <span class="muted">(выбери подписку)</span></div>
-    <button id="histClear">✖ Закрыть историю</button>
+    <button id="histClear">Закрыть</button>
   </div>
   <div id="historyBox" class="muted" style="margin-top:10px"></div>
   <div id="sales" style="margin-top:10px;display:flex;flex-direction:column;gap:10px"></div>
@@ -1240,7 +1161,7 @@ button:hover{filter:brightness(1.07)}
 
 <div id="admin" class="card" style="display:none">
   <h3 style="margin:0 0 8px 0">Admin</h3>
-  <div class="muted">MRKT токен хранится в Redis. Обнови токен без Railway.</div>
+  <div class="muted">MRKT токен хранится в Redis.</div>
   <div class="row" style="margin-top:10px">
     <div class="field"><label>Текущий токен (маска)</label><input id="tokMask" disabled/></div>
     <div class="field"><label>Новый MRKT_AUTH</label><input id="tokNew" placeholder="вставь токен"/></div>
@@ -1254,102 +1175,15 @@ button:hover{filter:brightness(1.07)}
 
 const WEBAPP_JS = `(() => {
   const tg = window.Telegram?.WebApp;
-
   try { tg?.ready(); } catch {}
   try { tg?.expand?.(); } catch {}
 
   const initData = tg?.initData || '';
   const el = (id) => document.getElementById(id);
 
-  function hexToRgb(hex){
-    const h = String(hex||'').trim();
-    if(!h.startsWith('#')) return null;
-    const x = h.slice(1);
-    if(x.length===3){
-      const r=parseInt(x[0]+x[0],16), g=parseInt(x[1]+x[1],16), b=parseInt(x[2]+x[2],16);
-      return {r,g,b};
-    }
-    if(x.length>=6){
-      const r=parseInt(x.slice(0,2),16), g=parseInt(x.slice(2,4),16), b=parseInt(x.slice(4,6),16);
-      if([r,g,b].some(v=>Number.isNaN(v))) return null;
-      return {r,g,b};
-    }
-    return null;
-  }
-  function lum(c){
-    const a = [c.r,c.g,c.b].map(v=>{
-      v/=255;
-      return v<=0.03928 ? v/12.92 : Math.pow((v+0.055)/1.055,2.4);
-    });
-    return 0.2126*a[0]+0.7152*a[1]+0.0722*a[2];
-  }
-  function contrast(hexA, hexB){
-    const A=hexToRgb(hexA), B=hexToRgb(hexB);
-    if(!A||!B) return null;
-    const L1=lum(A)+0.05, L2=lum(B)+0.05;
-    return L1>L2 ? (L1/L2) : (L2/L1);
-  }
-
-  function applyTheme(){
-    const root = document.documentElement;
-
-    // base defaults by scheme
-    const scheme = tg?.colorScheme || 'dark';
-    if(scheme === 'light'){
-      root.style.setProperty('--bg', '#ffffff');
-      root.style.setProperty('--card', '#f3f4f6');
-      root.style.setProperty('--text', '#111827');
-      root.style.setProperty('--muted', '#6b7280');
-      root.style.setProperty('--border', '#e5e7eb');
-      root.style.setProperty('--input', '#ffffff');
-      root.style.setProperty('--btn', '#111827');
-      root.style.setProperty('--btnText', '#ffffff');
-      root.style.setProperty('--accent', '#22c55e');
-    } else {
-      root.style.setProperty('--bg', '#0b0f14');
-      root.style.setProperty('--card', '#111827');
-      root.style.setProperty('--text', '#e5e7eb');
-      root.style.setProperty('--muted', '#9ca3af');
-      root.style.setProperty('--border', '#1f2937');
-      root.style.setProperty('--input', '#0f172a');
-      root.style.setProperty('--btn', '#1f2937');
-      root.style.setProperty('--btnText', '#e5e7eb');
-      root.style.setProperty('--accent', '#22c55e');
-    }
-
-    const p = tg?.themeParams || {};
-    // apply only if exists
-    if (p.bg_color) root.style.setProperty('--bg', p.bg_color);
-    if (p.secondary_bg_color) root.style.setProperty('--card', p.secondary_bg_color);
-    if (p.text_color) root.style.setProperty('--text', p.text_color);
-    if (p.hint_color) root.style.setProperty('--muted', p.hint_color);
-    if (p.button_color) root.style.setProperty('--btn', p.button_color);
-    if (p.button_text_color) root.style.setProperty('--btnText', p.button_text_color);
-
-    // contrast safety (fix "black on black" etc.)
-    const bg = getComputedStyle(root).getPropertyValue('--bg').trim();
-    const text = getComputedStyle(root).getPropertyValue('--text').trim();
-
-    const cr = contrast(bg, text);
-    if (cr != null && cr < 3.0) {
-      // force readable text depending on bg brightness
-      const bgRgb = hexToRgb(bg);
-      if(bgRgb){
-        const bgl = lum(bgRgb);
-        if (bgl < 0.4) root.style.setProperty('--text', '#e5e7eb');
-        else root.style.setProperty('--text', '#111827');
-      } else {
-        root.style.setProperty('--text', '#e5e7eb');
-      }
-    }
-  }
-
-  applyTheme();
-  try { tg?.onEvent?.('themeChanged', applyTheme); } catch {}
-
   if (!initData) {
     document.body.innerHTML = '<div style="padding:16px;font-family:system-ui;color:#fff;background:#0b0f14">' +
-      '<h3>Открой панель из Telegram</h3><p>Она работает только внутри Telegram WebApp (Menu Button “Панель”).</p></div>';
+      '<h3>Открой панель из Telegram</h3><p>Она работает только внутри Telegram WebApp.</p></div>';
     return;
   }
 
@@ -1366,6 +1200,17 @@ const WEBAPP_JS = `(() => {
     try{ data = txt?JSON.parse(txt):null; }catch{ data={raw:txt}; }
     if(!res.ok) throw new Error('HTTP '+res.status+': '+JSON.stringify(data).slice(0,400));
     return data;
+  }
+
+  function confirmBuy(text){
+    return new Promise((resolve) => {
+      if (tg?.showConfirm) {
+        try { tg.showConfirm(text, (ok) => resolve(!!ok)); }
+        catch { resolve(window.confirm(text)); }
+      } else {
+        resolve(window.confirm(text));
+      }
+    });
   }
 
   // Tabs
@@ -1423,6 +1268,19 @@ const WEBAPP_JS = `(() => {
 
   let selectedGiftValue = '';
 
+  async function doBuyLot(id, priceNano, name, priceTon){
+    hideErr();
+    const ok = await confirmBuy('Купить?\\n' + name + '\\nЦена: ' + priceTon.toFixed(3) + ' TON');
+    if(!ok) return;
+
+    try{
+      const r = await api('/api/mrkt/buy', { method:'POST', body: JSON.stringify({ id, priceNano }) });
+      alert('Куплено: ' + r.title + ' за ' + r.priceTon.toFixed(3) + ' TON');
+    }catch(err){
+      showErr(err.message || String(err));
+    }
+  }
+
   function renderLots(resp){
     const box = el('lots');
     if(resp.ok===false){
@@ -1433,7 +1291,7 @@ const WEBAPP_JS = `(() => {
     if(!lots.length){ box.innerHTML = '<i class="muted">Лотов не найдено</i>'; return; }
     box.innerHTML = lots.map(x => {
       const img = x.imgUrl ? '<img src="'+x.imgUrl+'" referrerpolicy="no-referrer" loading="lazy"/>' :
-        '<div style="height:160px;border:1px solid rgba(255,255,255,.08);border-radius:14px"></div>';
+        '<div style="height:140px;border:1px solid rgba(255,255,255,.10);border-radius:14px"></div>';
       const bd = x.backdropColorHex ? '<span class="badge" style="display:inline-flex;align-items:center;gap:8px"><span style="width:14px;height:14px;border-radius:50%;border:1px solid var(--border);background:'+x.backdropColorHex+'"></span>'+x.backdrop+'</span>' : '';
       return '<div class="lot">'+img+
         '<div class="price">'+x.priceTon.toFixed(3)+' TON</div>'+
@@ -1443,6 +1301,7 @@ const WEBAPP_JS = `(() => {
         '<div class="row" style="margin-top:8px">'+
           '<button data-open="'+x.urlTelegram+'">NFT</button>'+
           '<button data-open="'+x.urlMarket+'">MRKT</button>'+
+          '<button class="danger" data-buy="1" data-id="'+x.id+'" data-price="'+x.priceNano+'" data-name="'+(x.name||'')+'" data-ton="'+x.priceTon+'">Купить</button>'+
         '</div></div>';
     }).join('');
   }
@@ -1454,7 +1313,7 @@ const WEBAPP_JS = `(() => {
       return;
     }
     el(containerBoxId).innerHTML =
-      '<div><b>Медиана:</b> '+(resp.median!=null?resp.median.toFixed(3)+' TON':'нет')+' (n='+resp.count+', '+resp.level+')</div>';
+      '<div><b>Оценка цены продажи:</b> '+(resp.median!=null?resp.median.toFixed(3)+' TON':'нет данных')+'</div>';
 
     const list = resp.lastSales || [];
     if(!list.length){ el(containerListId).innerHTML = '<i class="muted">Нет данных</i>'; return; }
@@ -1494,21 +1353,24 @@ const WEBAPP_JS = `(() => {
         return '<div class="card" style="margin:8px 0">'+
           '<div style="display:flex;justify-content:space-between;gap:10px;align-items:center">'+
             '<div><b>#'+s.num+'</b> '+(s.enabled?'ON':'OFF')+'</div>'+
-            '<button data-act="subHistory" data-id="'+s.id+'">📜 История</button>'+
+            '<button data-act="subHistory" data-id="'+s.id+'">История</button>'+
           '</div>'+
           '<div class="muted">Gift: '+s.filters.gift+'</div>'+
           '<div class="muted">Model: '+(s.filters.model||'any')+'</div>'+
           '<div class="muted">Backdrop: '+(s.filters.backdrop||'any')+'</div>'+
           '<div class="hr"></div>'+
-          '<div class="muted">Notify max: '+(s.maxNotifyTon==null?'∞':s.maxNotifyTon)+' TON</div>'+
-          '<div class="muted">AutoBuy: '+(s.autoBuyEnabled?'ON':'OFF')+' | max: '+(s.maxAutoBuyTon==null?'-':s.maxAutoBuyTon)+' TON</div>'+
           '<div class="row" style="margin-top:8px">'+
-            '<button data-act="subToggle" data-id="'+s.id+'">'+(s.enabled?'⏸':'▶️')+'</button>'+
-            '<button data-act="subNotifyMax" data-id="'+s.id+'">🔔 Max</button>'+
-            '<button data-act="subAutoToggle" data-id="'+s.id+'">🤖 Auto</button>'+
-            '<button data-act="subAutoMax" data-id="'+s.id+'">🤖 Max</button>'+
-            '<button data-act="subDel" data-id="'+s.id+'">🗑</button>'+
-          '</div></div>';
+            '<button data-act="subToggle" data-id="'+s.id+'">'+(s.enabled?'Отключить':'Включить')+'</button>'+
+            '<button data-act="subDel" data-id="'+s.id+'">Удалить</button>'+
+          '</div>'+
+          '<div class="row" style="margin-top:8px">'+
+            '<button data-act="subNotifyMax" data-id="'+s.id+'">Max уведомлений</button>'+
+            '<button data-act="subAutoToggle" data-id="'+s.id+'">'+(s.autoBuyEnabled?'AutoBuy: ON':'AutoBuy: OFF')+'</button>'+
+            '<button data-act="subAutoMax" data-id="'+s.id+'">Max AutoBuy</button>'+
+          '</div>'+
+          '<div class="muted" style="margin-top:8px">Notify max: '+(s.maxNotifyTon==null?'∞':s.maxNotifyTon)+' TON</div>'+
+          '<div class="muted">AutoBuy max: '+(s.maxAutoBuyTon==null?'-':s.maxAutoBuyTon)+' TON</div>'+
+        '</div>';
       }).join('');
     }
 
@@ -1580,6 +1442,18 @@ const WEBAPP_JS = `(() => {
     }
   });
 
+  // buy button handler (delegated)
+  document.body.addEventListener('click', async (e) => {
+    const b = e.target.closest('button[data-buy="1"]');
+    if(!b) return;
+    const id = b.getAttribute('data-id');
+    const priceNano = Number(b.getAttribute('data-price'));
+    const name = b.getAttribute('data-name') || 'Gift';
+    const priceTon = Number(b.getAttribute('data-ton'));
+    if(!id || !Number.isFinite(priceNano) || priceNano <= 0) return showErr('Bad lot data');
+    await doBuyLot(id, priceNano, name, priceTon);
+  });
+
   el('apply').onclick = async () => {
     hideErr();
     try{
@@ -1627,7 +1501,7 @@ const WEBAPP_JS = `(() => {
     hideErr();
     try{
       const r = await api('/api/sub/checknow',{method:'POST'});
-      alert('Готово: subs='+r.processedSubs+', floorNotifs='+r.floorNotifs);
+      alert('Готово: subs='+r.processedSubs+', уведомлений='+r.floorNotifs);
     }catch(err){ showErr(err.message||String(err)); }
   };
 
@@ -1711,7 +1585,7 @@ function startWebServer() {
   }
   const isAdmin = (userId) => ADMIN_USER_ID && Number(userId) === Number(ADMIN_USER_ID);
 
-  // Proxy: Fragment gift image (for WebApp)
+  // Proxy: Fragment gift image
   app.get('/img/gift', async (req, res) => {
     const name = String(req.query.name || '').trim();
     if (!name) return res.status(400).send('no name');
@@ -1727,7 +1601,7 @@ function startWebServer() {
     Readable.fromWeb(r.body).pipe(res);
   });
 
-  // Proxy: MRKT CDN image (for WebApp)
+  // Proxy: MRKT CDN image
   app.get('/img/cdn', async (req, res) => {
     const key = String(req.query.key || '').trim();
     if (!key) return res.status(400).send('no key');
@@ -1767,18 +1641,13 @@ function startWebServer() {
     });
   });
 
-  // Collections with images + floor
   app.get('/api/mrkt/collections', auth, async (req, res) => {
     const q = String(req.query.q || '').trim().toLowerCase();
     const all = await mrktGetCollections();
 
     if (!all.length) {
-      if (!MRKT_AUTH_RUNTIME) {
-        return res.status(400).json({ ok: false, reason: 'MRKT_AUTH_NOT_SET', items: [] });
-      }
-      if (mrktAuthState.lastFailAt) {
-        return res.status(502).json({ ok: false, reason: `MRKT_HTTP_${mrktAuthState.lastFailCode}`, items: [] });
-      }
+      if (!MRKT_AUTH_RUNTIME) return res.status(400).json({ ok: false, reason: 'MRKT_AUTH_NOT_SET', items: [] });
+      if (mrktAuthState.lastFailAt) return res.status(502).json({ ok: false, reason: `MRKT_HTTP_${mrktAuthState.lastFailCode}`, items: [] });
       return res.status(502).json({ ok: false, reason: 'MRKT_NO_COLLECTIONS', items: [] });
     }
 
@@ -1847,7 +1716,6 @@ function startWebServer() {
     res.status(400).json({ ok: false, reason: 'BAD_KIND' });
   });
 
-  // Patch state: resolve gift by label if needed
   app.post('/api/state/patch', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
     const b = req.body || {};
@@ -1871,7 +1739,6 @@ function startWebServer() {
     res.json({ ok: true });
   });
 
-  // Lots list
   app.get('/api/mrkt/lots', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
     if (!MRKT_AUTH_RUNTIME) return res.json({ ok: false, reason: 'MRKT_AUTH_NOT_SET', lots: [] });
@@ -1891,6 +1758,7 @@ function startWebServer() {
           id: x.id,
           name: x.name,
           priceTon: x.priceTon,
+          priceNano: x.priceNano,
           urlTelegram: x.urlTelegram,
           urlMarket: x.urlMarket,
           model: x.model,
@@ -1903,7 +1771,6 @@ function startWebServer() {
     res.json({ ok: true, lots });
   });
 
-  // Market history for current filters
   app.get('/api/mrkt/history_current', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
     if (!u.filters.gift) return res.json({ ok: true, median: null, count: 0, level: 'no_gift', lastSales: [] });
@@ -1920,6 +1787,43 @@ function startWebServer() {
     }));
 
     res.json({ ok: true, median: h.median, count: h.count, level: h.level, lastSales });
+  });
+
+  // Manual buy from WebApp
+  app.post('/api/mrkt/buy', auth, async (req, res) => {
+    if (!MRKT_AUTH_RUNTIME) return res.status(400).json({ ok: false, reason: 'MRKT_AUTH_NOT_SET' });
+
+    const id = String(req.body?.id || '').trim();
+    const priceNano = Number(req.body?.priceNano);
+
+    if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
+    if (!Number.isFinite(priceNano) || priceNano <= 0) return res.status(400).json({ ok: false, reason: 'BAD_PRICE' });
+
+    const r = await mrktBuy({ id, priceNano });
+    if (!r.ok) {
+      return res.status(502).json({ ok: false, reason: r.reason, data: r.data || null, text: r.text || null });
+    }
+
+    const g = r.okItem?.userGift || null;
+    const title = `${g?.collectionTitle || g?.collectionName || g?.title || 'Gift'}${g?.number != null ? ` #${g.number}` : ''}`;
+    const priceTon = Number(priceNano) / 1e9;
+    const giftName = g?.name || null;
+    const urlTelegram = giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : 'https://t.me/mrkt';
+    const urlMarket = mrktLotUrlFromId(id);
+
+    // notify in chat (optional)
+    try {
+      await sendMessageSafe(
+        req.userId,
+        `✅ Куплено (ручная покупка)\nGift: ${title}\nPrice: ${priceTon.toFixed(3)} TON\n${urlTelegram}`,
+        {
+          disable_web_page_preview: false,
+          reply_markup: { inline_keyboard: [[{ text: 'NFT', url: urlTelegram }, { text: 'MRKT', url: urlMarket }]] },
+        }
+      );
+    } catch {}
+
+    res.json({ ok: true, title, priceTon });
   });
 
   // Subscriptions
@@ -1970,7 +1874,6 @@ function startWebServer() {
 
     s.autoBuyEnabled = !s.autoBuyEnabled;
 
-    // reset baseline for only-new
     const stateKey = `${req.userId}:${s.id}`;
     const st = subStates.get(stateKey) || { floor: null, emptyStreak: 0, feedLastId: null, pausedUntil: 0 };
     subStates.set(stateKey, { ...st, feedLastId: null, pausedUntil: 0 });
@@ -2023,7 +1926,6 @@ function startWebServer() {
     MRKT_AUTH_RUNTIME = t;
     try { await saveMrktAuthToRedis(t); } catch {}
 
-    // drop caches
     collectionsCache = { time: 0, items: [] };
     modelsCache.clear();
     backdropsCache.clear();
