@@ -1,8 +1,17 @@
 /**
  * MRKT Panel + Bot (single file)
- * v9.6: clear buttons per input + clear all, offers highlight + auto, open sub via web_app,
- *       number prefix search, nicer lot modal (contain image, centered), mobile grid fix
- * 2026-03-01 v9.6
+ * v9.7:
+ * - nicer clear buttons (small, centered)
+ * - offers pill less aggressive
+ * - styled dark scrollbars
+ * - lot buy UI as bottom-sheet (slide-up) with contain image + compact buttons
+ * - open sub in Telegram WebApp via inline web_app button
+ * - numberPrefix search (startsWith) for lots + history + subscriptions
+ * - if no Gift selected: show ALL collections listings (feed listing ordered by Price, lowToHigh)
+ * - allow subscription by numberPrefix only (no gift)
+ * - Profile tab + purchase history persisted in Redis
+ *
+ * 2026-03-01 v9.7
  */
 
 const TelegramBot = require('node-telegram-bot-api');
@@ -10,6 +19,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { Readable } = require('stream');
 
+// ===================== ENV =====================
 const token = process.env.TELEGRAM_TOKEN;
 if (!token) {
   console.error('TELEGRAM_TOKEN not set');
@@ -18,6 +28,7 @@ if (!token) {
 
 const MODE = process.env.MODE || 'real';
 const APP_TITLE = String(process.env.APP_TITLE || 'Панель');
+
 const WEBAPP_URL = process.env.WEBAPP_URL || null;
 const WEBAPP_AUTH_MAX_AGE_SEC = Number(process.env.WEBAPP_AUTH_MAX_AGE_SEC || 86400);
 
@@ -31,33 +42,41 @@ const FRAGMENT_GIFT_IMG_BASE = (process.env.FRAGMENT_GIFT_IMG_BASE || 'https://n
 
 let MRKT_AUTH_RUNTIME = (process.env.MRKT_AUTH || '').trim() || null;
 
+// intervals
 const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 9000);
+
+// requests
 const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 9000);
 const MRKT_COUNT = Number(process.env.MRKT_COUNT || 50);
-const MRKT_FEED_COUNT = Number(process.env.MRKT_FEED_COUNT || 50);
+const MRKT_FEED_COUNT = Number(process.env.MRKT_FEED_COUNT || 60);
 const MRKT_FEED_THROTTLE_MS = Number(process.env.MRKT_FEED_THROTTLE_MS || 120);
 
+// offers/orders
 const MRKT_ORDERS_COUNT = Number(process.env.MRKT_ORDERS_COUNT || 30);
 
-const WEBAPP_LOTS_LIMIT = Number(process.env.WEBAPP_LOTS_LIMIT || 36);
+// UI limits
+const WEBAPP_LOTS_LIMIT = Number(process.env.WEBAPP_LOTS_LIMIT || 40);
 const WEBAPP_LOTS_PAGES = Number(process.env.WEBAPP_LOTS_PAGES || 1);
 const WEBAPP_SUGGEST_LIMIT = Number(process.env.WEBAPP_SUGGEST_LIMIT || 80);
 
+// subs behavior
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 8);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
 
+// history
 const HISTORY_TARGET_SALES = Number(process.env.HISTORY_TARGET_SALES || 60);
 const HISTORY_MAX_PAGES = Number(process.env.HISTORY_MAX_PAGES || 40);
 const HISTORY_COUNT_PER_PAGE = Number(process.env.HISTORY_COUNT_PER_PAGE || 50);
 const HISTORY_TIME_BUDGET_MS = Number(process.env.HISTORY_TIME_BUDGET_MS || 15000);
 
+// notify throttling
 const MRKT_AUTH_NOTIFY_COOLDOWN_MS = Number(process.env.MRKT_AUTH_NOTIFY_COOLDOWN_MS || 60 * 60 * 1000);
 
 // Redis keys
 const REDIS_KEY_MRKT_AUTH = 'mrkt:auth:token';
-const REDIS_KEY_STATE = 'bot:state:v9_6';
+const REDIS_KEY_STATE = 'bot:state:v9_7';
 
-console.log('v9.6 start', {
+console.log('v9.7 start', {
   MODE,
   APP_TITLE,
   WEBAPP_URL: !!WEBAPP_URL,
@@ -66,6 +85,7 @@ console.log('v9.6 start', {
   MRKT_AUTH: !!MRKT_AUTH_RUNTIME,
 });
 
+// ===================== Telegram bot =====================
 const bot = new TelegramBot(token, { polling: true });
 
 const MAIN_KEYBOARD = {
@@ -73,8 +93,8 @@ const MAIN_KEYBOARD = {
   resize_keyboard: true,
 };
 
-// ===== State
-const users = new Map();
+// ===================== State =====================
+const users = new Map(); // userId -> state
 const subStates = new Map(); // `${userId}:${subId}` -> { floor, emptyStreak }
 let isSubsChecking = false;
 
@@ -88,9 +108,9 @@ const mrktAuthState = {
 
 // caches
 const CACHE_TTL_MS = 5 * 60_000;
-let collectionsCache = { time: 0, items: [] };
-const modelsCache = new Map();
-const backdropsCache = new Map();
+let collectionsCache = { time: 0, items: [] }; // [{name,title,thumbKey,floorNano}]
+const modelsCache = new Map(); // gift -> { time, items }
+const backdropsCache = new Map(); // gift -> { time, items }
 
 const historyCache = new Map();
 const HISTORY_CACHE_TTL_MS = 30_000;
@@ -98,7 +118,7 @@ const HISTORY_CACHE_TTL_MS = 30_000;
 const offersCache = new Map();
 const OFFERS_CACHE_TTL_MS = 15_000;
 
-// ===== Helpers
+// ===================== Helpers =====================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const nowMs = () => Date.now();
 
@@ -154,9 +174,8 @@ function median(sorted) {
   const L = sorted.length;
   return L % 2 ? sorted[(L - 1) / 2] : (sorted[L / 2 - 1] + sorted[L / 2]) / 2;
 }
-function cleanDigitsPrefix(v, maxLen = 10) {
-  const s = String(v || '').replace(/\D/g, '').slice(0, maxLen);
-  return s;
+function cleanDigitsPrefix(v, maxLen = 12) {
+  return String(v || '').replace(/\D/g, '').slice(0, maxLen);
 }
 function formatMsk(ts) {
   const d = new Date(ts);
@@ -230,10 +249,10 @@ function verifyTelegramWebAppInitData(initData) {
   const userId = user?.id;
   if (!userId) return { ok: false, reason: 'NO_USER' };
 
-  return { ok: true, userId };
+  return { ok: true, userId, user };
 }
 
-// ===== Redis persistence
+// ===================== Redis persistence =====================
 let redis = null;
 
 async function initRedis() {
@@ -249,6 +268,7 @@ async function initRedis() {
     redis = null;
   }
 }
+
 async function loadMrktAuthFromRedis() {
   if (!redis) return;
   try {
@@ -268,14 +288,17 @@ function exportState() {
       enabled: u?.enabled !== false,
       filters: u?.filters || { gift: '', giftLabel: '', model: '', backdrop: '', numberPrefix: '' },
       subscriptions: Array.isArray(u?.subscriptions) ? u.subscriptions : [],
+      purchases: Array.isArray(u?.purchases) ? u.purchases : [],
     };
   }
   return out;
 }
+
 function renumberSubs(user) {
   const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
   subs.forEach((s, idx) => { if (s) s.num = idx + 1; });
 }
+
 function importState(parsed) {
   const objUsers = parsed?.users && typeof parsed.users === 'object' ? parsed.users : {};
   for (const [idStr, u] of Object.entries(objUsers)) {
@@ -292,6 +315,7 @@ function importState(parsed) {
         numberPrefix: cleanDigitsPrefix(u?.filters?.numberPrefix || u?.filters?.number || ''),
       },
       subscriptions: Array.isArray(u?.subscriptions) ? u.subscriptions : [],
+      purchases: Array.isArray(u?.purchases) ? u.purchases : [],
     };
 
     safe.subscriptions = safe.subscriptions
@@ -310,11 +334,23 @@ function importState(parsed) {
           numberPrefix: cleanDigitsPrefix(s?.filters?.numberPrefix || s?.filters?.number || ''),
         },
       }));
-
     renumberSubs(safe);
+
+    safe.purchases = safe.purchases
+      .filter((p) => p && typeof p === 'object')
+      .slice(0, 200)
+      .map((p) => ({
+        ts: p.ts || Date.now(),
+        title: String(p.title || ''),
+        priceTon: Number(p.priceTon || 0),
+        urlTelegram: String(p.urlTelegram || ''),
+        urlMarket: String(p.urlMarket || ''),
+      }));
+
     users.set(userId, safe);
   }
 }
+
 async function loadState() {
   if (!redis) return;
   try {
@@ -322,8 +358,11 @@ async function loadState() {
     if (!raw) return;
     importState(JSON.parse(raw));
     console.log('Loaded state users=', users.size);
-  } catch {}
+  } catch (e) {
+    console.error('loadState error:', e?.message || e);
+  }
 }
+
 let saveTimer = null;
 function scheduleSave() {
   if (!redis) return;
@@ -331,20 +370,29 @@ function scheduleSave() {
   saveTimer = setTimeout(() => {
     saveTimer = null;
     saveState().catch(() => {});
-  }, 400);
+  }, 300);
 }
 async function saveState() {
   if (!redis) return;
   await redis.set(REDIS_KEY_STATE, JSON.stringify(exportState()));
 }
+async function persistNow() {
+  if (!redis) return;
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  await saveState();
+}
 
-// ===== user state
+// ===================== User state =====================
 function getOrCreateUser(userId) {
   if (!users.has(userId)) {
     users.set(userId, {
       enabled: true,
       filters: { gift: '', giftLabel: '', model: '', backdrop: '', numberPrefix: '' },
       subscriptions: [],
+      purchases: [],
     });
   }
   return users.get(userId);
@@ -353,7 +401,11 @@ function findSub(user, id) {
   return (user.subscriptions || []).find((s) => s && s.id === id) || null;
 }
 function makeSubFromCurrentFilters(user) {
-  if (!user.filters.gift) return { ok: false, reason: 'NO_GIFT' };
+  const hasGift = !!user.filters.gift;
+  const hasNum = !!cleanDigitsPrefix(user.filters.numberPrefix);
+
+  if (!hasGift && !hasNum) return { ok: false, reason: 'NO_GIFT_AND_NO_NUMBER' };
+
   if (!Array.isArray(user.subscriptions)) user.subscriptions = [];
   const sub = {
     id: `sub_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
@@ -363,7 +415,7 @@ function makeSubFromCurrentFilters(user) {
     autoBuyEnabled: false,
     maxAutoBuyTon: null,
     filters: {
-      gift: user.filters.gift,
+      gift: user.filters.gift || '', // can be empty if numberPrefix set
       model: user.filters.model || '',
       backdrop: user.filters.backdrop || '',
       numberPrefix: cleanDigitsPrefix(user.filters.numberPrefix || ''),
@@ -372,7 +424,19 @@ function makeSubFromCurrentFilters(user) {
   return { ok: true, sub };
 }
 
-// ===== MRKT auth state
+function pushPurchase(user, entry) {
+  if (!user.purchases) user.purchases = [];
+  user.purchases.unshift({
+    ts: entry.ts || Date.now(),
+    title: entry.title || '',
+    priceTon: entry.priceTon || 0,
+    urlTelegram: entry.urlTelegram || '',
+    urlMarket: entry.urlMarket || '',
+  });
+  user.purchases = user.purchases.slice(0, 200);
+}
+
+// ===================== MRKT auth state =====================
 function mrktHeaders() {
   return {
     Authorization: MRKT_AUTH_RUNTIME || '',
@@ -409,21 +473,16 @@ async function markMrktFail(status, bodyText = null) {
   if (status === 401 || status === 403) await notifyAdminMrktAuthExpired(status);
 }
 
-// ===== MRKT API caches
+// ===================== MRKT API caches =====================
 async function mrktGetCollections() {
   const now = nowMs();
   if (collectionsCache.items.length && now - collectionsCache.time < CACHE_TTL_MS) return collectionsCache.items;
 
   const headers = MRKT_AUTH_RUNTIME ? { ...mrktHeaders(), Accept: 'application/json' } : { Accept: 'application/json' };
   const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/collections`, { method: 'GET', headers }, MRKT_TIMEOUT_MS).catch(() => null);
-  if (!res) { collectionsCache = { time: now, items: [] }; return []; }
 
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    await markMrktFail(res.status, txt);
-    collectionsCache = { time: now, items: [] };
-    return [];
-  }
+  if (!res) { collectionsCache = { time: now, items: [] }; return []; }
+  if (!res.ok) { const txt = await res.text().catch(() => ''); await markMrktFail(res.status, txt); collectionsCache = { time: now, items: [] }; return []; }
 
   markMrktOk();
   const data = await res.json().catch(() => null);
@@ -455,8 +514,8 @@ async function mrktGetModelsForGift(giftName) {
 
   if (!res) return [];
   if (!res.ok) { const txt = await res.text().catch(() => ''); await markMrktFail(res.status, txt); return []; }
-  markMrktOk();
 
+  markMrktOk();
   const data = await res.json().catch(() => null);
   const arr = Array.isArray(data) ? data : [];
   const map = new Map();
@@ -464,14 +523,12 @@ async function mrktGetModelsForGift(giftName) {
     const name = it.modelTitle || it.modelName;
     if (!name) continue;
     const key = norm(name);
-    if (!map.has(key)) {
-      map.set(key, {
-        name: String(name),
-        rarityPerMille: it.rarityPerMille ?? null,
-        thumbKey: it.modelStickerThumbnailKey || null,
-        floorNano: it.floorPriceNanoTons ?? null,
-      });
-    }
+    if (!map.has(key)) map.set(key, {
+      name: String(name),
+      rarityPerMille: it.rarityPerMille ?? null,
+      thumbKey: it.modelStickerThumbnailKey || null,
+      floorNano: it.floorPriceNanoTons ?? null,
+    });
   }
   const items = Array.from(map.values());
   modelsCache.set(giftName, { time: nowMs(), items });
@@ -491,8 +548,8 @@ async function mrktGetBackdropsForGift(giftName) {
 
   if (!res) return [];
   if (!res.ok) { const txt = await res.text().catch(() => ''); await markMrktFail(res.status, txt); return []; }
-  markMrktOk();
 
+  markMrktOk();
   const data = await res.json().catch(() => null);
   const arr = Array.isArray(data) ? data : [];
   const map = new Map();
@@ -500,19 +557,18 @@ async function mrktGetBackdropsForGift(giftName) {
     const name = it.backdropName || it.name || null;
     if (!name) continue;
     const key = norm(name);
-    if (!map.has(key)) {
-      map.set(key, {
-        name: String(name),
-        rarityPerMille: it.rarityPerMille ?? null,
-        centerHex: intToHexColor(it.colorsCenterColor ?? it.centerColor ?? null),
-      });
-    }
+    if (!map.has(key)) map.set(key, {
+      name: String(name),
+      rarityPerMille: it.rarityPerMille ?? null,
+      centerHex: intToHexColor(it.colorsCenterColor ?? it.centerColor ?? null),
+    });
   }
   const items = Array.from(map.values());
   backdropsCache.set(giftName, { time: nowMs(), items });
   return items;
 }
 
+// ===== Lots sources
 async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cursor }) {
   if (!MRKT_AUTH_RUNTIME) return { ok: false, reason: 'NO_AUTH', gifts: [], cursor: '' };
 
@@ -526,20 +582,16 @@ async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cu
     maxPrice: null,
     minPrice: null,
     mintable: null,
-    number: null, // exact number not used; we do prefix client-side
+    number: null,
     count: MRKT_COUNT,
     cursor: cursor || '',
     query: null,
     promotedFirst: false,
   };
 
-  const res = await fetchWithTimeout(
-    `${MRKT_API_URL}/gifts/saling`,
-    { method: 'POST', headers: mrktHeaders(), body: JSON.stringify(body) },
-    MRKT_TIMEOUT_MS
-  ).catch(() => null);
-
+  const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/saling`, { method: 'POST', headers: mrktHeaders(), body: JSON.stringify(body) }, MRKT_TIMEOUT_MS).catch(() => null);
   if (!res) return { ok: false, reason: 'FETCH_ERROR', gifts: [], cursor: '' };
+
   if (!res.ok) { const txt = await res.text().catch(() => ''); await markMrktFail(res.status, txt); return { ok: false, reason: `HTTP_${res.status}`, gifts: [], cursor: '' }; }
   markMrktOk();
 
@@ -547,10 +599,119 @@ async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cu
   return { ok: true, reason: 'OK', gifts: Array.isArray(data?.gifts) ? data.gifts : [], cursor: data?.cursor || '' };
 }
 
-async function mrktSearchLots({ gift, model, backdrop, numberPrefix }, pagesLimit) {
-  if (!gift) return { ok: false, reason: 'NO_GIFT', gifts: [] };
+// All-gifts cheapest listing source (feed)
+async function mrktFeedListingsAll({ cursor = '', count = MRKT_FEED_COUNT }) {
+  if (!MRKT_AUTH_RUNTIME) return { ok: false, reason: 'NO_AUTH', items: [], cursor: '' };
 
+  const body = {
+    count: Number(count),
+    cursor,
+    collectionNames: [],
+    modelNames: [],
+    backdropNames: [],
+    lowToHigh: true,
+    maxPrice: null,
+    minPrice: null,
+    number: null,
+    ordering: 'Price', // if unsupported -> MRKT will likely 4xx; we handle fallback below
+    query: null,
+    type: ['listing'],
+  };
+
+  let res = await fetchWithTimeout(`${MRKT_API_URL}/feed`, { method: 'POST', headers: mrktHeaders(), body: JSON.stringify(body) }, MRKT_TIMEOUT_MS).catch(() => null);
+  if (!res) return { ok: false, reason: 'FETCH_ERROR', items: [], cursor: '' };
+
+  if (!res.ok) {
+    // fallback ordering Latest (some deployments might not support Price ordering on feed)
+    const body2 = { ...body, ordering: 'Latest', lowToHigh: false };
+    const res2 = await fetchWithTimeout(`${MRKT_API_URL}/feed`, { method: 'POST', headers: mrktHeaders(), body: JSON.stringify(body2) }, MRKT_TIMEOUT_MS).catch(() => null);
+    if (!res2 || !res2.ok) {
+      const txt = res2 ? await res2.text().catch(() => '') : '';
+      await markMrktFail(res2 ? res2.status : 0, txt);
+      return { ok: false, reason: res2 ? `HTTP_${res2.status}` : 'FETCH_ERROR', items: [], cursor: '' };
+    }
+    res = res2;
+  }
+
+  markMrktOk();
+  const data = await res.json().catch(() => null);
+  return { ok: true, reason: 'OK', items: Array.isArray(data?.items) ? data.items : [], cursor: data?.cursor || '' };
+}
+
+function mapListingItemToLot(it) {
+  const g = it?.gift;
+  if (!g?.id) return null;
+
+  const priceNano = Number(it.amount ?? g.salePriceWithoutFee ?? g.salePrice ?? 0);
+  if (!Number.isFinite(priceNano) || priceNano <= 0) return null;
+
+  const priceTon = priceNano / 1e9;
+
+  const titleBase = g.collectionTitle || g.collectionName || g.title || 'Gift';
+  const numberVal = g.number ?? null;
+  const name = numberVal != null ? `${titleBase} #${numberVal}` : titleBase;
+
+  const giftName = g.name || giftNameFallbackFromCollectionAndNumber(titleBase, numberVal) || null;
+  const urlTelegram = giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : 'https://t.me/mrkt';
+  const urlMarket = mrktLotUrlFromId(g.id);
+
+  const modelName = g.modelTitle || g.modelName || null;
+  const backdropName = g.backdropName || null;
+
+  return {
+    id: g.id,
+    name,
+    giftName,
+    priceTon,
+    priceNano,
+    urlTelegram,
+    urlMarket,
+    model: modelName,
+    backdrop: backdropName,
+    number: numberVal,
+  };
+}
+
+async function mrktSearchLotsByFilters({ gift, model, backdrop, numberPrefix }, pagesLimit) {
   const prefix = cleanDigitsPrefix(numberPrefix || '');
+
+  // If no gift selected -> search globally via feed listings
+  if (!gift) {
+    let cursor = '';
+    const out = [];
+    for (let page = 0; page < Math.max(2, pagesLimit); page++) {
+      const r = await mrktFeedListingsAll({ cursor, count: MRKT_FEED_COUNT });
+      if (!r.ok) return { ok: false, reason: r.reason, gifts: [] };
+      if (!r.items.length) break;
+
+      for (const it of r.items) {
+        const lot = mapListingItemToLot(it);
+        if (!lot) continue;
+
+        // prefix filter
+        const numStr = lot.number == null ? '' : String(lot.number);
+        if (prefix && !numStr.startsWith(prefix)) continue;
+
+        // optional: if user typed model/backdrop without gift, we can't reliably filter by MRKT traits naming
+        // We'll apply best-effort:
+        if (model && lot.model && !sameTrait(lot.model, norm(model))) continue;
+        if (backdrop && lot.backdrop && !sameTrait(lot.backdrop, norm(backdrop))) continue;
+
+        out.push(lot);
+        if (out.length >= 200) break;
+      }
+
+      if (out.length >= 200) break;
+      cursor = r.cursor || '';
+      if (!cursor) break;
+      await sleep(MRKT_FEED_THROTTLE_MS);
+    }
+
+    out.sort((a, b) => a.priceTon - b.priceTon);
+    return { ok: true, reason: 'OK', gifts: out };
+  }
+
+  // Gift selected -> use saling
   const extraPages = prefix && prefix.length <= 2 ? 3 : (prefix ? 2 : 0);
   const maxPages = Math.max(pagesLimit, extraPages);
 
@@ -574,19 +735,13 @@ async function mrktSearchLots({ gift, model, backdrop, numberPrefix }, pagesLimi
       if (!Number.isFinite(priceTon) || priceTon <= 0) continue;
 
       const numberVal = g.number ?? null;
-      const numberStr = numberVal == null ? '' : String(numberVal);
-      if (prefix && !numberStr.startsWith(prefix)) continue;
+      const numStr = numberVal == null ? '' : String(numberVal);
+      if (prefix && !numStr.startsWith(prefix)) continue;
 
       const baseName = (g.collectionTitle || g.collectionName || g.title || gift).trim();
       const displayName = numberVal ? `${baseName} #${numberVal}` : baseName;
 
-      const modelName = g.modelTitle || g.modelName || '';
-      const backdropName = g.backdropName || '';
-
-      if (model && !sameTrait(modelName, norm(model))) continue;
-      if (backdrop && !sameTrait(backdropName, norm(backdrop))) continue;
-
-      const giftName = g.name || giftNameFallbackFromCollectionAndNumber(g.collectionTitle || g.collectionName || g.title, g.number) || null;
+      const giftName = g.name || giftNameFallbackFromCollectionAndNumber(baseName, numberVal) || null;
       const urlTelegram = giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : 'https://t.me/mrkt';
       const urlMarket = g.id ? mrktLotUrlFromId(g.id) : 'https://t.me/mrkt';
 
@@ -598,9 +753,8 @@ async function mrktSearchLots({ gift, model, backdrop, numberPrefix }, pagesLimi
         priceNano: Number(nano),
         urlTelegram,
         urlMarket,
-        model: modelName || null,
-        backdrop: backdropName || null,
-        symbol: g.symbolName || null,
+        model: g.modelTitle || g.modelName || null,
+        backdrop: g.backdropName || null,
         number: numberVal,
       });
 
@@ -615,50 +769,18 @@ async function mrktSearchLots({ gift, model, backdrop, numberPrefix }, pagesLimi
   return { ok: true, reason: 'OK', gifts: out };
 }
 
-async function mrktFeedFetch({ gift, model, backdrop, cursor, count, types }) {
-  if (!MRKT_AUTH_RUNTIME) return { ok: false, reason: 'NO_AUTH', items: [], cursor: '' };
-
-  const body = {
-    count: Number(count || MRKT_FEED_COUNT),
-    cursor: cursor || '',
-    collectionNames: gift ? [gift] : [],
-    modelNames: model ? [model] : [],
-    backdropNames: backdrop ? [backdrop] : [],
-    lowToHigh: false,
-    maxPrice: null,
-    minPrice: null,
-    number: null, // prefix handled client-side
-    ordering: 'Latest',
-    query: null,
-    type: Array.isArray(types) ? types : [],
-  };
-
-  const res = await fetchWithTimeout(
-    `${MRKT_API_URL}/feed`,
-    { method: 'POST', headers: mrktHeaders(), body: JSON.stringify(body) },
-    MRKT_TIMEOUT_MS
-  ).catch(() => null);
-
-  if (!res) return { ok: false, reason: 'FETCH_ERROR', items: [], cursor: '' };
-  if (!res.ok) { const txt = await res.text().catch(() => ''); await markMrktFail(res.status, txt); return { ok: false, reason: `HTTP_${res.status}`, items: [], cursor: '' }; }
-  markMrktOk();
-
-  const data = await res.json().catch(() => null);
-  return { ok: true, reason: 'OK', items: Array.isArray(data?.items) ? data.items : [], cursor: data?.cursor || '' };
-}
-
 async function mrktOrdersFetch({ gift, model, backdrop }) {
   if (!MRKT_AUTH_RUNTIME) return { ok: false, reason: 'NO_AUTH', orders: [] };
 
-  const key = `orders|${gift}|${model || ''}|${backdrop || ''}`;
+  const key = `orders|${gift || ''}|${model || ''}|${backdrop || ''}`;
   const now = nowMs();
   const cached = offersCache.get(key);
   if (cached && now - cached.time < OFFERS_CACHE_TTL_MS) return cached.data;
 
   const body = {
     collectionNames: gift ? [gift] : [],
-    modelNames: model ? [model] : [],
-    backdropNames: backdrop ? [backdrop] : [],
+    modelNames: gift && model ? [model] : [],
+    backdropNames: gift && backdrop ? [backdrop] : [],
     symbolNames: [],
     ordering: 'Price',
     lowToHigh: false,
@@ -694,7 +816,6 @@ async function mrktBuy({ id, priceNano }) {
   if (!MRKT_AUTH_RUNTIME) return { ok: false, reason: 'NO_AUTH' };
 
   const body = { ids: [id], prices: { [id]: priceNano } };
-
   const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/buy`, { method: 'POST', headers: mrktHeaders(), body: JSON.stringify(body) }, MRKT_TIMEOUT_MS).catch(() => null);
   if (!res) return { ok: false, reason: 'FETCH_ERROR' };
 
@@ -712,10 +833,10 @@ async function mrktBuy({ id, priceNano }) {
   return { ok: true, data, okItem };
 }
 
-// ===== History (prefix filter client-side)
+// ===== History (prefix client-side; works both gift and global best-effort)
 async function mrktHistorySales({ gift, model, backdrop, numberPrefix }) {
   const prefix = cleanDigitsPrefix(numberPrefix || '');
-  const key = `hist|${gift}|${model || ''}|${backdrop || ''}|${prefix}`;
+  const key = `hist|${gift || ''}|${model || ''}|${backdrop || ''}|${prefix}`;
   const now = nowMs();
   const cached = historyCache.get(key);
   if (cached && now - cached.time < HISTORY_CACHE_TTL_MS) return cached.data;
@@ -730,13 +851,14 @@ async function mrktHistorySales({ gift, model, backdrop, numberPrefix }) {
     if (nowMs() - started > HISTORY_TIME_BUDGET_MS) break;
 
     const r = await mrktFeedFetch({
-      gift,
-      model: model || null,
-      backdrop: backdrop || null,
+      gift: gift || null,
+      model: gift && model ? model : null,
+      backdrop: gift && backdrop ? backdrop : null,
       cursor,
       count: HISTORY_COUNT_PER_PAGE,
       types: ['sale'],
     });
+
     if (!r.ok) break;
     if (!r.items.length) break;
 
@@ -755,7 +877,8 @@ async function mrktHistorySales({ gift, model, backdrop, numberPrefix }) {
       prices.push(ton);
 
       if (lastSales.length < 35) {
-        const giftName = g.name || giftNameFallbackFromCollectionAndNumber(g.collectionTitle || g.collectionName || g.title, g.number) || null;
+        const titleBase = g.collectionTitle || g.collectionName || g.title || (gift || 'Gift');
+        const giftName = g.name || giftNameFallbackFromCollectionAndNumber(titleBase, g.number) || null;
         const urlTelegram = giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : null;
         const urlMarket = g.id ? mrktLotUrlFromId(g.id) : null;
 
@@ -765,10 +888,9 @@ async function mrktHistorySales({ gift, model, backdrop, numberPrefix }) {
           number: g.number ?? null,
           model: g.modelTitle || g.modelName || null,
           backdrop: g.backdropName || null,
-          giftName,
+          imgUrl: giftName ? `/img/gift?name=${encodeURIComponent(giftName)}` : null,
           urlTelegram,
           urlMarket,
-          imgUrl: giftName ? `/img/gift?name=${encodeURIComponent(giftName)}` : null,
         });
       }
 
@@ -778,19 +900,17 @@ async function mrktHistorySales({ gift, model, backdrop, numberPrefix }) {
     cursor = r.cursor || '';
     pages++;
     if (!cursor) break;
-
-    if (MRKT_FEED_THROTTLE_MS > 0) await sleep(MRKT_FEED_THROTTLE_MS);
+    await sleep(MRKT_FEED_THROTTLE_MS);
   }
 
   prices.sort((a, b) => a - b);
   const data = { ok: true, median: median(prices), count: prices.length, lastSales };
-
   historyCache.set(key, { time: now, data });
   return data;
 }
 
 // ===== Sub notifications
-async function notifyFloorToUser(userId, sub, lot, prevFloor, newFloor) {
+async function notifyFloorToUser(userId, sub, lot, newFloor) {
   const title = lot?.name || sub?.filters?.gift || 'Gift';
   const urlTelegram = lot?.urlTelegram || 'https://t.me/mrkt';
   const urlMarket = lot?.urlMarket || 'https://t.me/mrkt';
@@ -804,12 +924,12 @@ async function notifyFloorToUser(userId, sub, lot, prevFloor, newFloor) {
   lines.push(`Floor: ${newFloor.toFixed(3)} TON`);
   if (model) lines.push(`Model: ${model}`);
   if (backdrop) lines.push(`Backdrop: ${backdrop}`);
-  lines.push(urlTelegram); // keep for preview
+  lines.push(urlTelegram); // preview 100%
 
   const webUrl = WEBAPP_URL ? `${WEBAPP_URL}?tab=subs&subId=${encodeURIComponent(sub.id)}` : null;
 
   const openSubBtn = webUrl
-    ? { text: 'Открыть подписку', web_app: { url: webUrl } } // <-- opens inside Telegram WebApp
+    ? { text: 'Открыть подписку', web_app: { url: webUrl } }
     : { text: 'Открыть подписку', url: urlMarket };
 
   const reply_markup = {
@@ -849,11 +969,11 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         const stateKey = `${userId}:${sub.id}`;
         const prev = subStates.get(stateKey) || { floor: null, emptyStreak: 0 };
 
-        const lots = await mrktSearchLots({
-          gift: sub.filters.gift,
-          model: sub.filters.model,
-          backdrop: sub.filters.backdrop,
-          numberPrefix: sub.filters.numberPrefix,
+        const lots = await mrktSearchLotsByFilters({
+          gift: sub.filters.gift || '',
+          model: sub.filters.model || '',
+          backdrop: sub.filters.backdrop || '',
+          numberPrefix: sub.filters.numberPrefix || '',
         }, 1);
 
         if (!lots.ok) continue;
@@ -873,12 +993,11 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         }
 
         const prevFloor = prev.floor;
-
         const maxNotify = sub.maxNotifyTon != null ? Number(sub.maxNotifyTon) : null;
         const canNotify = newFloor != null && (maxNotify == null || newFloor <= maxNotify);
 
         if (canNotify && newFloor != null && (prevFloor == null || Number(prevFloor) !== Number(newFloor))) {
-          await notifyFloorToUser(userId, sub, lot, prevFloor, newFloor);
+          await notifyFloorToUser(userId, sub, lot, newFloor);
           floorNotifs++;
         }
 
@@ -892,7 +1011,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
   }
 }
 
-// ===== Telegram menu button
+// ===================== Telegram menu button =====================
 async function tgApi(method, body) {
   const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: 'POST',
@@ -927,7 +1046,7 @@ bot.on('message', async (msg) => {
       `Status:\n` +
       `• MRKT_AUTH: ${MRKT_AUTH_RUNTIME ? '✅' : '❌'}\n` +
       `• Redis: ${redis ? '✅' : '❌'}\n` +
-      `• Persist: ${redis ? '✅' : '❌ (без Redis подписки не сохранятся)'}`;
+      `• Persist: ${redis ? '✅' : '❌ (без Redis подписки/профиль не сохранятся)'}`;
     await sendMessageSafe(msg.chat.id, txt, { reply_markup: MAIN_KEYBOARD });
   }
 });
@@ -968,17 +1087,19 @@ input{
   color:var(--text);
   outline:none;
 }
-input.compact{height:38px;padding:8px 36px 8px 10px;font-size:13px}
+input.compact{height:38px;padding:8px 32px 8px 10px;font-size:13px}
 input.compact.expanded{height:44px;font-size:14px}
 .xbtn{
   position:absolute;right:8px;top:50%;transform:translateY(-50%);
-  width:26px;height:26px;border-radius:10px;
-  border:1px solid var(--border);
-  background:rgba(255,255,255,.06);
-  color:var(--muted);
+  width:20px;height:20px;border-radius:8px;
+  border:1px solid rgba(255,255,255,.10);
+  background:rgba(255,255,255,.05);
+  color:rgba(255,255,255,.55);
   cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  line-height:1;
 }
-.xbtn:hover{filter:brightness(1.15); color:var(--text)}
+.xbtn:hover{filter:brightness(1.2); color:rgba(255,255,255,.85)}
 button{
   padding:10px 12px;border:1px solid var(--border);border-radius:12px;
   background:var(--btn);color:var(--btnText);cursor:pointer;
@@ -989,8 +1110,8 @@ button:active{transform: translateY(0);}
 .primary{border-color:var(--accent);color:#052e16;background:var(--accent);font-weight:950}
 .primary:hover{filter:brightness(1.03)}
 .small{padding:8px 10px;border-radius:10px;font-size:13px}
-.buy{border-color:rgba(56,189,248,.65); background:rgba(56,189,248,.18); color:#eaf7ff; font-weight:950}
-.buy:hover{border-color:rgba(56,189,248,1); background:rgba(56,189,248,.24)}
+.buy{border-color:rgba(56,189,248,.65); background:rgba(56,189,248,.14); color:#eaf7ff; font-weight:950}
+.buy:hover{border-color:rgba(56,189,248,1); background:rgba(56,189,248,.20)}
 .badge{padding:4px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted);font-size:12px;flex:0 0 auto}
 .hr{height:1px;background:var(--border);margin:10px 0}
 .muted{color:var(--muted);font-size:13px}
@@ -1011,9 +1132,20 @@ button:active{transform: translateY(0);}
 
 .offerPill{
   display:inline-flex;align-items:center;gap:10px;
-  padding:8px 10px;border-radius:14px;border:1px solid rgba(56,189,248,.55);
-  background:rgba(56,189,248,.10); color:#eaf7ff; font-weight:900;
+  padding:6px 10px;border-radius:999px;border:1px solid rgba(56,189,248,.35);
+  background:rgba(56,189,248,.06); color:rgba(234,247,255,.92); font-weight:800;
+  font-size:13px;
 }
+
+/* dark scrollbars (Telegram/Chromium) */
+.sheetBody::-webkit-scrollbar,
+.sug::-webkit-scrollbar{width:10px;height:10px}
+.sheetBody::-webkit-scrollbar-track,
+.sug::-webkit-scrollbar-track{background:rgba(255,255,255,.03);border-radius:999px}
+.sheetBody::-webkit-scrollbar-thumb,
+.sug::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:999px}
+.sheetBody::-webkit-scrollbar-thumb:hover,
+.sug::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.28)}
 
 /* lots grid */
 .grid{display:grid;gap:10px;margin-top:10px;grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));}
@@ -1032,7 +1164,8 @@ button:active{transform: translateY(0);}
 
 /* sheet */
 .sheetWrap{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:flex-end;justify-content:center;z-index:50000;padding:12px}
-.sheet{width:min(980px, 96vw);height:min(70vh, 720px);background:var(--card);border:1px solid var(--border);border-radius:18px;padding:12px;box-shadow:0 30px 90px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:10px}
+.sheet{width:min(980px, 96vw);height:min(70vh, 720px);background:var(--card);border:1px solid var(--border);border-radius:18px;padding:12px;box-shadow:0 30px 90px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:10px; animation: up .16s ease-out}
+@keyframes up{from{transform:translateY(14px);opacity:.0}to{transform:translateY(0);opacity:1}}
 .sheetHeader{display:flex;justify-content:space-between;gap:12px;align-items:center}
 .sheetBody{overflow:auto;padding-right:4px}
 
@@ -1042,16 +1175,25 @@ button:active{transform: translateY(0);}
 .saleCard{flex:1;border:1px solid var(--border);border-radius:14px;padding:10px;background:rgba(255,255,255,.02)}
 .saleBtns{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
 
-/* lot modal */
-.modalWrap{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:60000;padding:12px}
-.modal{width:min(560px, 96vw);background:var(--card);border:1px solid var(--border);border-radius:18px;padding:12px;box-shadow:0 30px 90px rgba(0,0,0,.5)}
+/* lot bottom-sheet modal */
+.modalWrap{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:flex-end;justify-content:center;z-index:60000;padding:12px}
+.modal{
+  width:min(560px, 96vw);
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:18px;
+  padding:12px;
+  box-shadow:0 30px 90px rgba(0,0,0,.5);
+  animation: slideUp .16s ease-out;
+}
+@keyframes slideUp{from{transform:translateY(18px);opacity:0}to{transform:translateY(0);opacity:1}}
 .modalHeader{display:flex;justify-content:space-between;gap:12px;align-items:center}
 .modalTitle{font-weight:950}
 .modalImg{
   width:100%;
-  max-height:260px;
+  max-height:240px;
   height:auto;
-  object-fit:contain; /* FIX: no blur/stretch */
+  object-fit:contain;
   border-radius:14px;border:1px solid var(--border);
   background:rgba(255,255,255,.03);
   margin-top:10px;
@@ -1067,6 +1209,7 @@ button:active{transform: translateY(0);}
 <div class="tabs">
   <button class="tabbtn active" data-tab="market">Market</button>
   <button class="tabbtn" data-tab="subs">Subscriptions</button>
+  <button class="tabbtn" data-tab="profile">Profile</button>
   <button class="tabbtn" data-tab="admin" id="adminTabBtn" style="display:none">Admin</button>
 </div>
 
@@ -1077,11 +1220,12 @@ button:active{transform: translateY(0);}
     <div class="field">
       <label>Gift</label>
       <div class="inpWrap">
-        <input id="gift" class="compact" placeholder="Gift" autocomplete="off"/>
+        <input id="gift" class="compact" placeholder="Gift (можно пусто)" autocomplete="off"/>
         <button class="xbtn" data-clear="gift" type="button">×</button>
       </div>
       <div id="giftSug" class="sug" style="display:none"></div>
     </div>
+
     <div class="field">
       <label>Model</label>
       <div class="inpWrap">
@@ -1090,6 +1234,7 @@ button:active{transform: translateY(0);}
       </div>
       <div id="modelSug" class="sug" style="display:none"></div>
     </div>
+
     <div class="field">
       <label>Backdrop</label>
       <div class="inpWrap">
@@ -1098,10 +1243,11 @@ button:active{transform: translateY(0);}
       </div>
       <div id="backdropSug" class="sug" style="display:none"></div>
     </div>
+
     <div class="field" style="max-width:160px">
       <label>Number</label>
       <div class="inpWrap">
-        <input id="number" class="compact" placeholder="№ (prefix)" inputmode="numeric"/>
+        <input id="number" class="compact" placeholder="№" inputmode="numeric"/>
         <button class="xbtn" data-clear="number" type="button">×</button>
       </div>
     </div>
@@ -1111,7 +1257,7 @@ button:active{transform: translateY(0);}
     <button id="apply" class="primary">Показать</button>
     <button id="refresh">Обновить</button>
     <button id="historyBtn">История продаж</button>
-    <button id="clearAll">Очистить фильтры</button>
+    <button id="clearAll">Очистить</button>
   </div>
 
   <div id="status" class="muted" style="margin-top:10px"></div>
@@ -1130,6 +1276,14 @@ button:active{transform: translateY(0);}
     <button id="subRefresh">Обновить</button>
   </div>
   <div id="subsList" style="margin-top:10px"></div>
+</div>
+
+<div id="profile" class="card" style="display:none">
+  <h3 style="margin:0 0 8px 0">Профиль</h3>
+  <div id="profileBox" class="muted">Загрузка...</div>
+  <div class="hr"></div>
+  <div><b>История покупок</b></div>
+  <div id="purchases" style="margin-top:10px;display:flex;flex-direction:column;gap:10px"></div>
 </div>
 
 <div id="admin" class="card" style="display:none">
@@ -1170,8 +1324,8 @@ button:active{transform: translateY(0);}
     <img id="mImg" class="modalImg" src="" alt="gift"/>
     <div class="row" style="margin-top:10px">
       <button id="mBuy" class="buy">Купить</button>
-      <button id="mMrkt">Открыть MRKT</button>
-      <button id="mNft">Открыть NFT</button>
+      <button id="mMrkt">MRKT</button>
+      <button id="mNft">NFT</button>
     </div>
   </div>
 </div>
@@ -1205,12 +1359,12 @@ const WEBAPP_JS = `(() => {
     const txt = await res.text();
     let data=null;
     try{ data = txt?JSON.parse(txt):null; }catch{ data={raw:txt}; }
-    if(!res.ok) throw new Error('HTTP '+res.status+': '+JSON.stringify(data).slice(0,600));
+    if(!res.ok) throw new Error('HTTP '+res.status+': '+JSON.stringify(data).slice(0,700));
     return data;
   }
 
   function setTab(name){
-    ['market','subs','admin'].forEach(x => el(x).style.display = (x===name?'block':'none'));
+    ['market','subs','profile','admin'].forEach(x => el(x).style.display = (x===name?'block':'none'));
     document.querySelectorAll('.tabbtn').forEach(b => b.classList.toggle('active', b.dataset.tab===name));
   }
   document.querySelectorAll('.tabbtn').forEach(b => b.onclick = () => setTab(b.dataset.tab));
@@ -1218,7 +1372,7 @@ const WEBAPP_JS = `(() => {
   const params = new URLSearchParams(location.search || '');
   const initialTab = params.get('tab');
   const initialSubId = params.get('subId');
-  if (initialTab === 'subs') setTab('subs');
+  if (initialTab) setTab(initialTab);
 
   function safe(fn){
     return async () => {
@@ -1308,27 +1462,24 @@ const WEBAPP_JS = `(() => {
     }
   });
 
-  // ===== Clear buttons per field + clear all
   async function patchFilters(partial){
     const giftVal = (partial.gift !== undefined) ? partial.gift : selectedGiftValue;
     const giftLabel = (partial.giftLabel !== undefined) ? partial.giftLabel : el('gift').value.trim();
     const model = (partial.model !== undefined) ? partial.model : el('model').value.trim();
     const backdrop = (partial.backdrop !== undefined) ? partial.backdrop : el('backdrop').value.trim();
-    const number = (partial.numberPrefix !== undefined) ? partial.numberPrefix : el('number').value.trim();
+    const numberPrefix = (partial.numberPrefix !== undefined) ? partial.numberPrefix : el('number').value.trim();
 
     await api('/api/state/patch', {
       method: 'POST',
-      body: JSON.stringify({
-        filters: { gift: giftVal, giftLabel, model, backdrop, numberPrefix: number }
-      })
+      body: JSON.stringify({ filters: { gift: giftVal, giftLabel, model, backdrop, numberPrefix } })
     });
   }
 
+  // clear per field
   document.body.addEventListener('click', (e) => {
     const b = e.target.closest('button[data-clear]');
     if(!b) return;
     const what = b.getAttribute('data-clear');
-    if(!what) return;
 
     (async () => {
       hideErr();
@@ -1340,13 +1491,16 @@ const WEBAPP_JS = `(() => {
         el('backdrop').value = '';
         el('number').value = '';
         await patchFilters({ gift:'', giftLabel:'', model:'', backdrop:'', numberPrefix:'' });
-      } else if(what === 'model'){
+      }
+      if(what === 'model'){
         el('model').value = '';
         await patchFilters({ model:'' });
-      } else if(what === 'backdrop'){
+      }
+      if(what === 'backdrop'){
         el('backdrop').value = '';
         await patchFilters({ backdrop:'' });
-      } else if(what === 'number'){
+      }
+      if(what === 'number'){
         el('number').value = '';
         await patchFilters({ numberPrefix:'' });
       }
@@ -1367,7 +1521,17 @@ const WEBAPP_JS = `(() => {
     await refreshMarketData();
   });
 
-  // ===== Lot modal
+  // offers line
+  function renderOffersLine(offer){
+    const box = el('offersLine');
+    if(offer && offer.ok && offer.maxOfferTon != null){
+      box.innerHTML = '<span class="offerPill">Max offer: '+offer.maxOfferTon.toFixed(3)+' TON</span>';
+    } else if (offer && offer.ok) {
+      box.innerHTML = '<span class="offerPill">Max offer: нет данных</span>';
+    } else box.innerHTML = '';
+  }
+
+  // lot modal (bottom sheet)
   const modalWrap = el('modalWrap');
   const mTitle = el('mTitle');
   const mSub = el('mSub');
@@ -1409,7 +1573,7 @@ const WEBAPP_JS = `(() => {
   mMrkt.onclick = () => { if(modalLot?.urlMarket) tg?.openTelegramLink ? tg.openTelegramLink(modalLot.urlMarket) : window.open(modalLot.urlMarket,'_blank'); };
   mNft.onclick = () => { if(modalLot?.urlTelegram) tg?.openTelegramLink ? tg.openTelegramLink(modalLot.urlTelegram) : window.open(modalLot.urlTelegram,'_blank'); };
 
-  // ===== Sheet (history / sub details)
+  // sheet
   const sheetWrap = el('sheetWrap');
   const sheetTitle = el('sheetTitle');
   const sheetSub = el('sheetSub');
@@ -1461,18 +1625,6 @@ const WEBAPP_JS = `(() => {
     }).join('');
   }
 
-  function renderOffersLine(offer){
-    const box = el('offersLine');
-    if(offer && offer.ok && offer.maxOfferTon != null){
-      box.innerHTML = '<span class="offerPill">Max offer: '+offer.maxOfferTon.toFixed(3)+' TON</span>';
-    } else if (offer && offer.ok) {
-      box.innerHTML = '<span class="offerPill">Max offer: нет данных</span>';
-    } else {
-      box.innerHTML = '';
-    }
-  }
-
-  // open links from sheet
   document.body.addEventListener('click', (e) => {
     const openBtn = e.target.closest('button[data-open]');
     if(!openBtn) return;
@@ -1480,7 +1632,7 @@ const WEBAPP_JS = `(() => {
     if(url) tg?.openTelegramLink ? tg.openTelegramLink(url) : window.open(url,'_blank');
   });
 
-  // ===== render lots
+  // lots
   function renderLots(resp){
     const box = el('lots');
     if(resp.ok===false){ box.innerHTML = '<div style="color:#ef4444"><b>'+(resp.reason||'error')+'</b></div>'; return; }
@@ -1510,6 +1662,40 @@ const WEBAPP_JS = `(() => {
     });
   }
 
+  async function refreshProfile(){
+    const r = await api('/api/profile');
+    const u = r.user || {};
+    const photo = u.photo_url ? '<img src="'+u.photo_url+'" style="width:54px;height:54px;border-radius:16px;border:1px solid rgba(255,255,255,.12);object-fit:cover"/>' : '';
+    el('profileBox').innerHTML =
+      '<div style="display:flex;gap:10px;align-items:center">' +
+        photo +
+        '<div>' +
+          '<div><b>'+ (u.first_name || '') + ' ' + (u.last_name || '') + '</b></div>' +
+          '<div class="muted">@'+ (u.username || '-') + ' | id: '+ (u.id || '-') + '</div>' +
+        '</div>' +
+      '</div>';
+
+    const list = r.purchases || [];
+    const box = el('purchases');
+    if(!list.length){
+      box.innerHTML = '<i class="muted">Покупок пока нет</i>';
+    } else {
+      box.innerHTML = list.map(p => {
+        return '<div class="saleCard">' +
+          '<div style="display:flex;justify-content:space-between;gap:10px;align-items:center">' +
+            '<b>'+p.title+'</b>' +
+            '<span class="muted">'+p.tsMsk+'</span>' +
+          '</div>' +
+          '<div class="muted">Price: '+Number(p.priceTon).toFixed(3)+' TON</div>' +
+          '<div class="saleBtns">' +
+            (p.urlMarket ? '<button class="small" data-open="'+p.urlMarket+'">MRKT</button>' : '') +
+            (p.urlTelegram ? '<button class="small" data-open="'+p.urlTelegram+'">NFT</button>' : '') +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+  }
+
   async function refreshState(){
     const st = await api('/api/state');
     el('status').textContent =
@@ -1530,6 +1716,7 @@ const WEBAPP_JS = `(() => {
       box.innerHTML = subsList.map(s => {
         const bg = s.backdropHex ? ('background:'+s.backdropHex+';') : 'background:rgba(255,255,255,.04);';
         const img = s.thumbUrl ? '<div class="thumbWrap" style="'+bg+'"><img src="'+s.thumbUrl+'" referrerpolicy="no-referrer"/></div>' : '<div class="thumbWrap" style="'+bg+'"></div>';
+        const giftLine = s.filters.gift ? ('Gift: '+s.filters.gift) : 'Gift: any';
         const num = s.filters.numberPrefix ? ('<div class="muted">Number: #'+s.filters.numberPrefix+'*</div>') : '';
         return '<div class="card" style="margin:8px 0">' +
           '<div style="display:flex;gap:10px;align-items:center">' +
@@ -1539,7 +1726,7 @@ const WEBAPP_JS = `(() => {
                 '<b>#'+s.num+' '+(s.enabled?'ON':'OFF')+'</b>' +
                 '<button class="small" data-act="subDetails" data-id="'+s.id+'">Детали</button>' +
               '</div>' +
-              '<div class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Gift: '+s.filters.gift+'</div>' +
+              '<div class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+giftLine+'</div>' +
               '<div class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Model: '+(s.filters.model||'any')+'</div>' +
               '<div class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Backdrop: '+(s.filters.backdrop||'any')+'</div>' +
               num +
@@ -1550,11 +1737,8 @@ const WEBAPP_JS = `(() => {
             '<button class="small" data-act="subToggle" data-id="'+s.id+'">'+(s.enabled?'Отключить':'Включить')+'</button>' +
             '<button class="small" data-act="subDel" data-id="'+s.id+'">Удалить</button>' +
             '<button class="small" data-act="subNotifyMax" data-id="'+s.id+'">Max уведомлений</button>' +
-            '<button class="small" data-act="subAutoToggle" data-id="'+s.id+'">'+(s.autoBuyEnabled?'AutoBuy: ON':'AutoBuy: OFF')+'</button>' +
-            '<button class="small" data-act="subAutoMax" data-id="'+s.id+'">Max AutoBuy</button>' +
           '</div>' +
           '<div class="muted" style="margin-top:8px">Notify max: '+(s.maxNotifyTon==null?'∞':s.maxNotifyTon)+' TON</div>' +
-          '<div class="muted">AutoBuy max: '+(s.maxAutoBuyTon==null?'-':s.maxAutoBuyTon)+' TON</div>' +
         '</div>';
       }).join('');
     }
@@ -1596,7 +1780,7 @@ const WEBAPP_JS = `(() => {
     renderSalesToSheet(r);
   });
 
-  // Subs
+  // Subs actions
   el('subCreate').onclick = safe(async () => { await api('/api/sub/create',{method:'POST'}); await refreshState(); });
   el('subRefresh').onclick = safe(async () => { await refreshState(); });
   el('subCheckNow').onclick = safe(async () => {
@@ -1604,7 +1788,6 @@ const WEBAPP_JS = `(() => {
     alert('Готово: subs='+r.processedSubs+', уведомлений='+r.floorNotifs);
   });
 
-  // delegated subs actions
   document.body.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-act]');
     if(!btn) return;
@@ -1621,21 +1804,13 @@ const WEBAPP_JS = `(() => {
         const val = (v==null || v.trim()==='') ? null : Number(v);
         await api('/api/sub/set_notify_max',{method:'POST',body:JSON.stringify({id, maxNotifyTon: val})});
       }
-      if(act==='subAutoToggle'){
-        await api('/api/sub/toggle_autobuy',{method:'POST',body:JSON.stringify({id})});
-      }
-      if(act==='subAutoMax'){
-        const v = prompt('Max TON для AutoBuy (обязательно число):', '5');
-        if(v==null) return;
-        await api('/api/sub/set_autobuy_max',{method:'POST',body:JSON.stringify({id, maxAutoBuyTon: Number(v)})});
-      }
       if(act==='subDetails'){
         openSheet('Детали подписки', 'История + Max offer');
         const r = await api('/api/sub/details',{method:'POST',body:JSON.stringify({id})});
         const offerTxt = (r.offers?.maxOfferTon!=null) ? (r.offers.maxOfferTon.toFixed(3)+' TON') : 'нет данных';
         sheetTop.innerHTML =
           '<div class="offerPill">Max offer: '+offerTxt+'</div>' +
-          '<div style="margin-top:8px"><b>Оценка цены продажи:</b> '+(r.history?.median!=null?r.history.median.toFixed(3)+' TON':'нет данных')+'</div>';
+          '<div style="margin-top:10px"><b>Оценка цены продажи:</b> '+(r.history?.median!=null?r.history.median.toFixed(3)+' TON':'нет данных')+'</div>';
         renderSalesToSheet(r.history || {ok:true, median:null, count:0, lastSales:[]});
       }
 
@@ -1643,17 +1818,27 @@ const WEBAPP_JS = `(() => {
     }catch(err){ showErr(err.message||String(err)); }
   });
 
-  // admin save token
-  el('tokSave').onclick = safe(async () => {
+  // Profile refresh on open
+  document.querySelectorAll('.tabbtn').forEach(b => {
+    b.addEventListener('click', async () => {
+      if (b.dataset.tab === 'profile') {
+        try { await refreshProfile(); } catch(e){ showErr(e.message||String(e)); }
+      }
+    });
+  });
+
+  // Admin save token
+  el('tokSave')?.addEventListener('click', safe(async () => {
     const t = el('tokNew').value.trim();
     if(!t) return showErr('Вставь токен.');
     await api('/api/admin/mrkt_auth',{method:'POST',body:JSON.stringify({token:t})});
     el('tokNew').value='';
     await refreshState();
-  });
+  }));
 
   // initial
   refreshState().then(refreshMarketData).catch(e=>showErr(e.message||String(e)));
+  if (initialTab === 'profile') refreshProfile().catch(()=>{});
 
   // auto open sub details if subId in url
   if(initialTab === 'subs' && initialSubId){
@@ -1664,7 +1849,7 @@ const WEBAPP_JS = `(() => {
         const offerTxt = (r.offers?.maxOfferTon!=null) ? (r.offers.maxOfferTon.toFixed(3)+' TON') : 'нет данных';
         sheetTop.innerHTML =
           '<div class="offerPill">Max offer: '+offerTxt+'</div>' +
-          '<div style="margin-top:8px"><b>Оценка цены продажи:</b> '+(r.history?.median!=null?r.history.median.toFixed(3)+' TON':'нет данных')+'</div>';
+          '<div style="margin-top:10px"><b>Оценка цены продажи:</b> '+(r.history?.median!=null?r.history.median.toFixed(3)+' TON':'нет данных')+'</div>';
         renderSalesToSheet(r.history || {ok:true, median:null, count:0, lastSales:[]});
       }catch{}
     }, 450);
@@ -1686,6 +1871,7 @@ function startWebServer() {
     const v = verifyTelegramWebAppInitData(initData);
     if (!v.ok) return res.status(401).json({ ok: false, reason: v.reason });
     req.userId = v.userId;
+    req.tgUser = v.user || null;
     next();
   }
   const isAdmin = (userId) => ADMIN_USER_ID && Number(userId) === Number(ADMIN_USER_ID);
@@ -1719,27 +1905,32 @@ function startWebServer() {
 
   async function buildSubThumb(sub) {
     const gift = sub?.filters?.gift;
-    if (!gift) return { thumbUrl: null, backdropHex: null };
-
     let backdropHex = null;
-    if (sub?.filters?.backdrop) {
+
+    if (gift && sub?.filters?.backdrop) {
       const backs = await mrktGetBackdropsForGift(gift);
       const found = backs.find((b) => norm(b.name) === norm(sub.filters.backdrop));
       backdropHex = found?.centerHex || null;
     }
 
-    if (sub?.filters?.model) {
+    // model thumb if possible
+    if (gift && sub?.filters?.model) {
       const models = await mrktGetModelsForGift(gift);
       const found = models.find((m) => norm(m.name) === norm(sub.filters.model));
       if (found?.thumbKey) return { thumbUrl: `/img/cdn?key=${encodeURIComponent(found.thumbKey)}`, backdropHex };
     }
 
-    const cols = await mrktGetCollections();
-    const c = cols.find((x) => x.name === gift);
-    if (c?.thumbKey) return { thumbUrl: `/img/cdn?key=${encodeURIComponent(c.thumbKey)}`, backdropHex };
+    // collection thumb
+    if (gift) {
+      const cols = await mrktGetCollections();
+      const c = cols.find((x) => x.name === gift);
+      if (c?.thumbKey) return { thumbUrl: `/img/cdn?key=${encodeURIComponent(c.thumbKey)}`, backdropHex };
+    }
+
     return { thumbUrl: null, backdropHex };
   }
 
+  // ----- API state / profile
   app.get('/api/state', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
     const mask = MRKT_AUTH_RUNTIME ? MRKT_AUTH_RUNTIME.slice(0, 4) + '…' + MRKT_AUTH_RUNTIME.slice(-4) : '';
@@ -1757,11 +1948,37 @@ function startWebServer() {
 
     res.json({
       ok: true,
-      api: { mrktAuthSet: !!MRKT_AUTH_RUNTIME, isAdmin: isAdmin(req.userId), mrktAuthMask: mask, mrktLastFail: lastFail },
-      user: { enabled: !!u.enabled, filters: u.filters, subscriptions: enriched },
+      api: {
+        mrktAuthSet: !!MRKT_AUTH_RUNTIME,
+        isAdmin: isAdmin(req.userId),
+        mrktAuthMask: mask,
+        mrktLastFail: lastFail,
+      },
+      user: {
+        enabled: !!u.enabled,
+        filters: u.filters,
+        subscriptions: enriched,
+      },
     });
   });
 
+  app.get('/api/profile', auth, async (req, res) => {
+    const u = getOrCreateUser(req.userId);
+    const tgUser = req.tgUser || null;
+
+    const purchases = (u.purchases || []).map((p) => ({
+      ...p,
+      tsMsk: formatMsk(p.ts),
+    }));
+
+    res.json({
+      ok: true,
+      user: tgUser,
+      purchases,
+    });
+  });
+
+  // ----- market endpoints
   app.get('/api/mrkt/collections', auth, async (req, res) => {
     const q = String(req.query.q || '').trim().toLowerCase();
     const all = await mrktGetCollections();
@@ -1847,19 +2064,22 @@ function startWebServer() {
 
   app.get('/api/mrkt/lots', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
-    if (!u.filters.gift) return res.json({ ok: true, lots: [] });
 
-    const r = await mrktSearchLots({
-      gift: u.filters.gift,
-      model: u.filters.model,
-      backdrop: u.filters.backdrop,
-      numberPrefix: u.filters.numberPrefix,
+    const r = await mrktSearchLotsByFilters({
+      gift: u.filters.gift || '',
+      model: u.filters.model || '',
+      backdrop: u.filters.backdrop || '',
+      numberPrefix: u.filters.numberPrefix || '',
     }, WEBAPP_LOTS_PAGES);
 
     if (!r.ok) return res.json({ ok: false, reason: r.reason, lots: [] });
 
-    const backs = await mrktGetBackdropsForGift(u.filters.gift);
-    const backMap = new Map(backs.map((b) => [norm(b.name), b]));
+    // backdrop color map if gift chosen
+    let backMap = new Map();
+    if (u.filters.gift) {
+      const backs = await mrktGetBackdropsForGift(u.filters.gift);
+      backMap = new Map(backs.map((b) => [norm(b.name), b]));
+    }
 
     const lots = (r.gifts || [])
       .slice(0, WEBAPP_LOTS_LIMIT)
@@ -1885,6 +2105,8 @@ function startWebServer() {
 
   app.get('/api/mrkt/offers_current', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
+
+    // offers only meaningful when gift chosen
     if (!u.filters.gift) return res.json({ ok: true, maxOfferTon: null, count: 0 });
 
     const r = await mrktOrdersFetch({ gift: u.filters.gift, model: u.filters.model || '', backdrop: u.filters.backdrop || '' });
@@ -1896,18 +2118,18 @@ function startWebServer() {
       if (!Number.isFinite(n) || n <= 0) continue;
       if (maxNano == null || n > maxNano) maxNano = n;
     }
+
     res.json({ ok: true, maxOfferTon: maxNano != null ? maxNano / 1e9 : null, count: (r.orders || []).length });
   });
 
   app.get('/api/mrkt/history_current', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
-    if (!u.filters.gift) return res.json({ ok: true, median: null, count: 0, lastSales: [] });
 
     const h = await mrktHistorySales({
-      gift: u.filters.gift,
+      gift: u.filters.gift || '',
       model: u.filters.model || '',
       backdrop: u.filters.backdrop || '',
-      numberPrefix: u.filters.numberPrefix,
+      numberPrefix: u.filters.numberPrefix || '',
     });
 
     res.json({ ok: true, median: h.median, count: h.count, lastSales: h.lastSales || [] });
@@ -1924,39 +2146,49 @@ function startWebServer() {
 
     const g = r.okItem?.userGift || null;
     const title = `${g?.collectionTitle || g?.collectionName || g?.title || 'Gift'}${g?.number != null ? ` #${g.number}` : ''}`;
-    res.json({ ok: true, title, priceTon: priceNano / 1e9 });
+    const priceTon = priceNano / 1e9;
+    const giftName = g?.name || null;
+    const urlTelegram = giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : '';
+    const urlMarket = mrktLotUrlFromId(id);
+
+    // persist purchase to profile
+    const u = getOrCreateUser(req.userId);
+    pushPurchase(u, { ts: Date.now(), title, priceTon, urlTelegram, urlMarket });
+    scheduleSave();
+
+    res.json({ ok: true, title, priceTon });
   });
 
-  // subs
-  app.post('/api/sub/create', auth, (req, res) => {
+  // ===== subs endpoints
+  app.post('/api/sub/create', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
     const r = makeSubFromCurrentFilters(u);
     if (!r.ok) return res.status(400).json({ ok: false, reason: r.reason });
     u.subscriptions.push(r.sub);
     renumberSubs(u);
-    scheduleSave();
+    await persistNow().catch(() => scheduleSave());
     res.json({ ok: true });
   });
 
-  app.post('/api/sub/toggle', auth, (req, res) => {
+  app.post('/api/sub/toggle', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
     const s = findSub(u, req.body?.id);
     if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
     s.enabled = !s.enabled;
-    scheduleSave();
+    await persistNow().catch(() => scheduleSave());
     res.json({ ok: true });
   });
 
-  app.post('/api/sub/delete', auth, (req, res) => {
+  app.post('/api/sub/delete', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
     const id = req.body?.id;
     u.subscriptions = (u.subscriptions || []).filter((x) => x && x.id !== id);
     renumberSubs(u);
-    scheduleSave();
+    await persistNow().catch(() => scheduleSave());
     res.json({ ok: true });
   });
 
-  app.post('/api/sub/set_notify_max', auth, (req, res) => {
+  app.post('/api/sub/set_notify_max', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
     const s = findSub(u, req.body?.id);
     if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
@@ -1967,27 +2199,7 @@ function startWebServer() {
       if (!Number.isFinite(num) || num <= 0) return res.status(400).json({ ok: false, reason: 'BAD_MAX' });
       s.maxNotifyTon = num;
     }
-    scheduleSave();
-    res.json({ ok: true });
-  });
-
-  app.post('/api/sub/toggle_autobuy', auth, (req, res) => {
-    const u = getOrCreateUser(req.userId);
-    const s = findSub(u, req.body?.id);
-    if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
-    s.autoBuyEnabled = !s.autoBuyEnabled;
-    scheduleSave();
-    res.json({ ok: true });
-  });
-
-  app.post('/api/sub/set_autobuy_max', auth, (req, res) => {
-    const u = getOrCreateUser(req.userId);
-    const s = findSub(u, req.body?.id);
-    if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
-    const num = Number(req.body?.maxAutoBuyTon);
-    if (!Number.isFinite(num) || num <= 0) return res.status(400).json({ ok: false, reason: 'BAD_MAX' });
-    s.maxAutoBuyTon = num;
-    scheduleSave();
+    await persistNow().catch(() => scheduleSave());
     res.json({ ok: true });
   });
 
@@ -2002,13 +2214,15 @@ function startWebServer() {
     if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
 
     const history = await mrktHistorySales({
-      gift: s.filters.gift,
+      gift: s.filters.gift || '',
       model: s.filters.model || '',
       backdrop: s.filters.backdrop || '',
       numberPrefix: s.filters.numberPrefix || '',
     });
 
-    const offersRaw = await mrktOrdersFetch({ gift: s.filters.gift, model: s.filters.model || '', backdrop: s.filters.backdrop || '' });
+    const offersRaw = s.filters.gift
+      ? await mrktOrdersFetch({ gift: s.filters.gift, model: s.filters.model || '', backdrop: s.filters.backdrop || '' })
+      : { ok: true, orders: [] };
 
     let maxOfferTon = null;
     if (offersRaw.ok) {
@@ -2021,7 +2235,11 @@ function startWebServer() {
       maxOfferTon = maxNano != null ? maxNano / 1e9 : null;
     }
 
-    res.json({ ok: true, history: { ok: true, median: history.median, count: history.count, lastSales: history.lastSales || [] }, offers: { ok: offersRaw.ok, maxOfferTon } });
+    res.json({
+      ok: true,
+      history: { ok: true, median: history.median, count: history.count, lastSales: history.lastSales || [] },
+      offers: { ok: offersRaw.ok, maxOfferTon },
+    });
   });
 
   // admin token
@@ -2048,21 +2266,22 @@ function startWebServer() {
 
 startWebServer();
 
-// ===== intervals
+// ===================== intervals =====================
 setInterval(() => {
   checkSubscriptionsForAllUsers().catch((e) => console.error('subs error:', e));
 }, SUBS_CHECK_INTERVAL_MS);
 
-// ===== bootstrap
+// ===================== bootstrap =====================
 (async () => {
   if (REDIS_URL) {
     await initRedis();
     if (redis) {
       await loadMrktAuthFromRedis();
       await loadState();
+      console.log('Redis persistence enabled');
     }
   } else {
-    console.warn('REDIS_URL not set => subscriptions WILL NOT persist after restart');
+    console.warn('REDIS_URL not set => subscriptions/profile will NOT persist after restart');
   }
   console.log('Bot started. /start');
 })();
