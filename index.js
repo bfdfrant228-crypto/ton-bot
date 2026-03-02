@@ -1,6 +1,12 @@
 /**
  * MRKT Panel + Bot (single file)
- * v10.5-full (2026-03-02) HOTFIX: add req to saling/orders/buy/models/backdrops
+ * v10.6-full (2026-03-02)
+ *
+ * FIX:
+ * - MRKT "The req field is required" -> add req in BODY + also req in QUERY for ALL MRKT POST endpoints
+ * - AutoBuy now uses /feed listing (new listings stream) + baseline by feedLastId (like earlier working behavior)
+ * - Return subscription buttons: Max Notify + Max AutoBuy
+ * - Profile photo shown if Telegram user has photo_url
  *
  * Node 18+ recommended
  * deps: express, node-telegram-bot-api, (optional) redis
@@ -41,10 +47,7 @@ const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 9000
 const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '1') === '1';
 const AUTO_BUY_DRY_RUN = String(process.env.AUTO_BUY_DRY_RUN || '0') === '1';
 const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 2000);
-const AUTO_BUY_MAX_PER_CHECK = Number(process.env.AUTO_BUY_MAX_PER_CHECK || 1);
-const AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE = Number(
-  process.env.AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE || AUTO_BUY_MAX_PER_CHECK || 1
-);
+const AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE = Number(process.env.AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE || 1);
 const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 30_000);
 const AUTO_BUY_NO_FUNDS_PAUSE_MS = Number(process.env.AUTO_BUY_NO_FUNDS_PAUSE_MS || 10 * 60 * 1000);
 const AUTO_BUY_DISABLE_AFTER_SUCCESS = String(process.env.AUTO_BUY_DISABLE_AFTER_SUCCESS || '0') === '1';
@@ -54,14 +57,6 @@ const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 9000);
 const MRKT_COUNT = Number(process.env.MRKT_COUNT || 50);
 const MRKT_FEED_COUNT = Number(process.env.MRKT_FEED_COUNT || 60);
 const MRKT_THROTTLE_MS = Number(process.env.MRKT_THROTTLE_MS || 120);
-
-// all gifts (feed)
-const ALL_GIFTS_FEED_PAGES = Number(process.env.ALL_GIFTS_FEED_PAGES || 10);
-const ALL_GIFTS_FEED_PAGES_NUMBER = Number(process.env.ALL_GIFTS_FEED_PAGES_NUMBER || 25);
-const ALL_GIFTS_TARGET_UNIQUE = Number(process.env.ALL_GIFTS_TARGET_UNIQUE || 900);
-
-// number mode (gift selected)
-const MRKT_PAGES_NUMBER = Number(process.env.MRKT_PAGES_NUMBER || 30);
 
 // offers/orders
 const MRKT_ORDERS_COUNT = Number(process.env.MRKT_ORDERS_COUNT || 30);
@@ -85,7 +80,7 @@ const HISTORY_TIME_BUDGET_MS = Number(process.env.HISTORY_TIME_BUDGET_MS || 1500
 const REDIS_KEY_MRKT_AUTH = 'mrkt:auth:token';
 const REDIS_KEY_STATE = 'bot:state:main';
 
-console.log('v10.5-full start', {
+console.log('v10.6-full start', {
   MODE,
   APP_TITLE,
   WEBAPP_URL: !!WEBAPP_URL,
@@ -104,8 +99,8 @@ const MAIN_KEYBOARD = { keyboard: [[{ text: '📌 Статус' }]], resize_keyb
 // ===================== State =====================
 const users = new Map();
 
-// per-sub runtime state
-// `${userId}:${subId}` -> { floor, emptyStreak, pausedUntil, baselineReady, seenIds: Set<string> }
+// per-sub runtime state (in-memory)
+/// `${userId}:${subId}` -> { floor, emptyStreak, pausedUntil, feedLastId }
 const subStates = new Map();
 
 let isSubsChecking = false;
@@ -115,6 +110,8 @@ const mrktState = {
   lastOkAt: 0,
   lastFailAt: 0,
   lastFailMsg: null,
+  lastFailStatus: null,
+  lastFailEndpoint: null,
 };
 
 // AutoBuy debug for Admin
@@ -148,6 +145,10 @@ const THUMBS_CACHE_TTL_MS = 5 * 60_000;
 // ===================== Helpers =====================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const nowMs = () => Date.now();
+
+function makeReq() {
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
 
 function norm(s) {
   return String(s || '').toLowerCase().trim().replace(/\s+/g, ' ');
@@ -234,14 +235,14 @@ function extractMrktErrorMessage(txt) {
       if (keys.length) {
         const k = keys[0];
         const v = j.errors[k];
-        if (Array.isArray(v) && v.length) return String(v[0]).slice(0, 180);
-        if (typeof v === 'string') return String(v).slice(0, 180);
+        if (Array.isArray(v) && v.length) return String(v[0]).slice(0, 220);
+        if (typeof v === 'string') return String(v).slice(0, 220);
       }
     }
-    if (typeof j?.message === 'string') return j.message.slice(0, 180);
-    if (typeof j?.title === 'string') return j.title.slice(0, 180);
+    if (typeof j?.message === 'string') return j.message.slice(0, 220);
+    if (typeof j?.title === 'string') return j.title.slice(0, 220);
   } catch {}
-  return s.slice(0, 180);
+  return s.slice(0, 220);
 }
 
 async function sendMessageSafe(chatId, text, opts) {
@@ -494,7 +495,7 @@ function pushPurchase(user, entry) {
 function mrktHeaders() {
   return {
     Authorization: MRKT_AUTH_RUNTIME || '',
-    'Content-Type': 'application/json',
+    'Content-Type': 'application/json; charset=utf-8',
     Accept: 'application/json',
     Origin: 'https://cdn.tgmrkt.io',
     Referer: 'https://cdn.tgmrkt.io/',
@@ -505,32 +506,65 @@ function markMrktOk() {
   mrktState.lastOkAt = nowMs();
   mrktState.lastFailAt = 0;
   mrktState.lastFailMsg = null;
+  mrktState.lastFailStatus = null;
+  mrktState.lastFailEndpoint = null;
 }
-async function markMrktFail(status, bodyText = null) {
+async function markMrktFail(endpoint, status, bodyText = null) {
   mrktState.lastFailAt = nowMs();
+  mrktState.lastFailEndpoint = endpoint || null;
+  mrktState.lastFailStatus = status || null;
   mrktState.lastFailMsg = extractMrktErrorMessage(bodyText) || (status ? `HTTP ${status}` : 'MRKT error');
 }
 
 // ===================== MRKT API =====================
+
+async function mrktPostJson(path, bodyObj) {
+  if (!MRKT_AUTH_RUNTIME) return { ok: false, status: 401, data: null, text: 'NO_AUTH' };
+
+  const reqVal = bodyObj?.req ? String(bodyObj.req) : makeReq();
+  const body = { ...(bodyObj || {}), req: reqVal };
+
+  const url = `${MRKT_API_URL}${path}${path.includes('?') ? '&' : '?'}req=${encodeURIComponent(reqVal)}`;
+
+  const res = await fetchWithTimeout(
+    url,
+    { method: 'POST', headers: mrktHeaders(), body: JSON.stringify(body) },
+    MRKT_TIMEOUT_MS
+  ).catch(() => null);
+
+  if (!res) {
+    await markMrktFail(path, 0, 'FETCH_ERROR');
+    return { ok: false, status: 0, data: null, text: 'FETCH_ERROR' };
+  }
+
+  const txt = await res.text().catch(() => '');
+  let data = null;
+  try { data = txt ? JSON.parse(txt) : null; } catch { data = null; }
+
+  if (!res.ok) {
+    await markMrktFail(path, res.status, txt);
+    return { ok: false, status: res.status, data, text: txt };
+  }
+
+  markMrktOk();
+  return { ok: true, status: res.status, data, text: txt };
+}
+
 async function mrktGetCollections() {
   const now = nowMs();
   if (collectionsCache.items.length && now - collectionsCache.time < CACHE_TTL_MS) return collectionsCache.items;
 
-  const headers = MRKT_AUTH_RUNTIME ? { ...mrktHeaders(), Accept: 'application/json' } : { Accept: 'application/json' };
-  const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/collections`, { method: 'GET', headers }, MRKT_TIMEOUT_MS).catch(() => null);
+  const res = await fetchWithTimeout(
+    `${MRKT_API_URL}/gifts/collections`,
+    { method: 'GET', headers: { Accept: 'application/json' } },
+    MRKT_TIMEOUT_MS
+  ).catch(() => null);
 
-  if (!res) {
-    collectionsCache = { time: now, items: [] };
-    return [];
-  }
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    await markMrktFail(res.status, txt);
+  if (!res || !res.ok) {
     collectionsCache = { time: now, items: [] };
     return [];
   }
 
-  markMrktOk();
   const data = await res.json().catch(() => null);
   const arr = Array.isArray(data) ? data : [];
   const items = arr
@@ -552,25 +586,10 @@ async function mrktGetModelsForGift(giftName) {
   const cached = modelsCache.get(giftName);
   if (cached && nowMs() - cached.time < CACHE_TTL_MS) return cached.items;
 
-  // HOTFIX: req
-  const body = { req: String(Date.now()), collections: [giftName] };
+  const r = await mrktPostJson('/gifts/models', { collections: [giftName] });
+  if (!r.ok) return [];
 
-  const res = await fetchWithTimeout(
-    `${MRKT_API_URL}/gifts/models`,
-    { method: 'POST', headers: mrktHeaders(), body: JSON.stringify(body) },
-    MRKT_TIMEOUT_MS
-  ).catch(() => null);
-
-  if (!res) return [];
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    await markMrktFail(res.status, txt);
-    return [];
-  }
-
-  markMrktOk();
-  const data = await res.json().catch(() => null);
-  const arr = Array.isArray(data) ? data : [];
+  const arr = Array.isArray(r.data) ? r.data : [];
   const map = new Map();
 
   for (const it of arr) {
@@ -597,25 +616,10 @@ async function mrktGetBackdropsForGift(giftName) {
   const cached = backdropsCache.get(giftName);
   if (cached && nowMs() - cached.time < CACHE_TTL_MS) return cached.items;
 
-  // HOTFIX: req
-  const body = { req: String(Date.now()), collections: [giftName] };
+  const r = await mrktPostJson('/gifts/backdrops', { collections: [giftName] });
+  if (!r.ok) return [];
 
-  const res = await fetchWithTimeout(
-    `${MRKT_API_URL}/gifts/backdrops`,
-    { method: 'POST', headers: mrktHeaders(), body: JSON.stringify(body) },
-    MRKT_TIMEOUT_MS
-  ).catch(() => null);
-
-  if (!res) return [];
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    await markMrktFail(res.status, txt);
-    return [];
-  }
-
-  markMrktOk();
-  const data = await res.json().catch(() => null);
-  const arr = Array.isArray(data) ? data : [];
+  const arr = Array.isArray(r.data) ? r.data : [];
   const map = new Map();
 
   for (const it of arr) {
@@ -642,51 +646,34 @@ async function mrktGetBackdropsForGift(giftName) {
   return items;
 }
 
-// feed: used only for "All gifts"
-async function mrktFeedFetch({ cursor, count, ordering = 'Price', lowToHigh = true }) {
-  if (!MRKT_AUTH_RUNTIME) return { ok: false, reason: 'MRKT_AUTH is missing', items: [], cursor: '' };
-
+async function mrktFeedFetch({ cursor, count, ordering = 'Latest', lowToHigh = false, gift, model, backdrop, types }) {
   const body = {
-    req: String(Date.now()),
     count: Number(count || MRKT_FEED_COUNT),
     cursor: cursor || '',
-    collectionNames: [],
-    modelNames: [],
-    backdropNames: [],
+    collectionNames: gift ? [gift] : [],
+    modelNames: gift && model ? [model] : [],
+    backdropNames: gift && backdrop ? [backdrop] : [],
     lowToHigh: !!lowToHigh,
     maxPrice: null,
     minPrice: null,
     number: null,
-    ordering: ordering || 'Price',
+    ordering: ordering || 'Latest',
     query: null,
-    type: ['listing'],
-    types: ['listing'],
+    // поддерживаем оба поля, как MRKT любит меняться
+    type: Array.isArray(types) ? types : [],
+    types: Array.isArray(types) ? types : [],
   };
 
-  const res = await fetchWithTimeout(`${MRKT_API_URL}/feed`, {
-    method: 'POST',
-    headers: mrktHeaders(),
-    body: JSON.stringify(body),
-  }, MRKT_TIMEOUT_MS).catch(() => null);
+  const r = await mrktPostJson('/feed', body);
+  if (!r.ok) return { ok: false, reason: mrktState.lastFailMsg || 'FEED_ERROR', items: [], cursor: '' };
 
-  if (!res) return { ok: false, reason: 'Feed fetch error', items: [], cursor: '' };
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    await markMrktFail(res.status, txt);
-    return { ok: false, reason: mrktState.lastFailMsg || 'Feed error', items: [], cursor: '' };
-  }
-
-  markMrktOk();
-  const data = await res.json().catch(() => null);
-  return { ok: true, reason: 'OK', items: Array.isArray(data?.items) ? data.items : [], cursor: data?.cursor || '' };
+  const items = Array.isArray(r.data?.items) ? r.data.items : [];
+  const nextCursor = r.data?.cursor || '';
+  return { ok: true, reason: 'OK', items, cursor: nextCursor };
 }
 
 async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cursor, ordering = 'Price', lowToHigh = true }) {
-  if (!MRKT_AUTH_RUNTIME) return { ok: false, reason: 'MRKT_AUTH is missing', gifts: [], cursor: '' };
-
-  // HOTFIX: req (ИМЕННО ЭТО ЛЕЧИТ "The req field is required" В AutoBuy)
   const body = {
-    req: String(Date.now()),
     collectionNames: [collectionName],
     modelNames: modelName ? [modelName] : [],
     backdropNames: backdropName ? [backdropName] : [],
@@ -703,22 +690,12 @@ async function mrktFetchSalingPage({ collectionName, modelName, backdropName, cu
     promotedFirst: false,
   };
 
-  const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/saling`, {
-    method: 'POST',
-    headers: mrktHeaders(),
-    body: JSON.stringify(body),
-  }, MRKT_TIMEOUT_MS).catch(() => null);
+  const r = await mrktPostJson('/gifts/saling', body);
+  if (!r.ok) return { ok: false, reason: mrktState.lastFailMsg || 'SALING_ERROR', gifts: [], cursor: '' };
 
-  if (!res) return { ok: false, reason: 'Saling fetch error', gifts: [], cursor: '' };
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    await markMrktFail(res.status, txt);
-    return { ok: false, reason: mrktState.lastFailMsg || 'Saling error', gifts: [], cursor: '' };
-  }
-
-  markMrktOk();
-  const data = await res.json().catch(() => null);
-  return { ok: true, reason: 'OK', gifts: Array.isArray(data?.gifts) ? data.gifts : [], cursor: data?.cursor || '' };
+  const gifts = Array.isArray(r.data?.gifts) ? r.data.gifts : [];
+  const nextCursor = r.data?.cursor || '';
+  return { ok: true, reason: 'OK', gifts, cursor: nextCursor };
 }
 
 async function mrktOrdersFetch({ gift, model, backdrop }) {
@@ -729,9 +706,7 @@ async function mrktOrdersFetch({ gift, model, backdrop }) {
   const cached = offersCache.get(key);
   if (cached && now - cached.time < OFFERS_CACHE_TTL_MS) return cached.data;
 
-  // HOTFIX: req
   const body = {
-    req: String(Date.now()),
     collectionNames: gift ? [gift] : [],
     modelNames: gift && model ? [model] : [],
     backdropNames: gift && backdrop ? [backdrop] : [],
@@ -745,27 +720,14 @@ async function mrktOrdersFetch({ gift, model, backdrop }) {
     query: null,
   };
 
-  const res = await fetchWithTimeout(`${MRKT_API_URL}/orders`, {
-    method: 'POST',
-    headers: mrktHeaders(),
-    body: JSON.stringify(body),
-  }, MRKT_TIMEOUT_MS).catch(() => null);
-
-  if (!res) return { ok: false, reason: 'Orders fetch error', orders: [] };
-
-  const txt = await res.text().catch(() => '');
-  let data = null;
-  try { data = txt ? JSON.parse(txt) : null; } catch { data = null; }
-
-  if (!res.ok) {
-    await markMrktFail(res.status, txt);
-    const out = { ok: false, reason: mrktState.lastFailMsg || 'Orders error', orders: [] };
+  const r = await mrktPostJson('/orders', body);
+  if (!r.ok) {
+    const out = { ok: false, reason: mrktState.lastFailMsg || 'ORDERS_ERROR', orders: [] };
     offersCache.set(key, { time: now, data: out });
     return out;
   }
 
-  markMrktOk();
-  const orders = Array.isArray(data?.orders) ? data.orders : [];
+  const orders = Array.isArray(r.data?.orders) ? r.data.orders : [];
   const out = { ok: true, reason: 'OK', orders };
   offersCache.set(key, { time: now, data: out });
   return out;
@@ -782,25 +744,12 @@ function maxOfferTonFromOrders(orders) {
 }
 
 async function mrktBuy({ id, priceNano }) {
-  if (!MRKT_AUTH_RUNTIME) return { ok: false, reason: 'MRKT_AUTH is missing' };
+  const body = { ids: [id], prices: { [id]: priceNano } };
 
-  // HOTFIX: req
-  const body = { req: String(Date.now()), ids: [id], prices: { [id]: priceNano } };
+  const r = await mrktPostJson('/gifts/buy', body);
+  if (!r.ok) return { ok: false, reason: mrktState.lastFailMsg || 'BUY_ERROR', data: r.data, text: r.text };
 
-  const res = await fetchWithTimeout(`${MRKT_API_URL}/gifts/buy`, {
-    method: 'POST',
-    headers: mrktHeaders(),
-    body: JSON.stringify(body),
-  }, MRKT_TIMEOUT_MS).catch(() => null);
-
-  if (!res) return { ok: false, reason: 'Buy fetch error' };
-
-  const txt = await res.text().catch(() => '');
-  let data = null;
-  try { data = txt ? JSON.parse(txt) : null; } catch { data = null; }
-
-  if (!res.ok) return { ok: false, reason: extractMrktErrorMessage(txt) || `HTTP ${res.status}`, data };
-
+  const data = r.data;
   const okItem = Array.isArray(data)
     ? data.find((x) => x?.source?.type === 'buy_gift' && x?.userGift?.isMine === true && String(x?.userGift?.id || '') === String(id))
     : null;
@@ -853,7 +802,7 @@ function feedItemToLot(it) {
   const g = it?.gift;
   if (!g?.id) return null;
 
-  // price: prefer gift.salePrice*
+  // prefer gift.salePrice*, then item.amount
   const priceNanoRaw = g.salePriceWithoutFee ?? g.salePrice ?? it.amount ?? null;
   const priceNano = priceNanoRaw == null ? NaN : Number(priceNanoRaw);
   if (!Number.isFinite(priceNano) || priceNano <= 0) return null;
@@ -880,56 +829,24 @@ function feedItemToLot(it) {
     backdrop: g.backdropName || null,
     number: numberVal,
     collectionName: g.collectionName || g.collectionTitle || g.title || null,
+    feedId: it?.id || null,
+    feedType: it?.type || null,
+    feedDate: it?.date || null,
   };
 }
 
-// ===================== Search lots =====================
+// ===================== Search lots (Market page) =====================
 async function mrktSearchLotsByFilters({ gift, model, backdrop, numberPrefix }, pagesLimit) {
   const prefix = cleanDigitsPrefix(numberPrefix || '');
-
-  // no gift => all gifts via feed
   if (!gift) {
-    let cursor = '';
-    const byId = new Map();
-
-    const maxPages = prefix ? Math.max(ALL_GIFTS_FEED_PAGES_NUMBER, pagesLimit || 1) : Math.max(ALL_GIFTS_FEED_PAGES, pagesLimit || 1);
-    const ordering = prefix ? 'Latest' : 'Price';
-    const lowToHigh = prefix ? false : true;
-
-    for (let page = 0; page < maxPages; page++) {
-      const r = await mrktFeedFetch({ cursor, count: MRKT_FEED_COUNT, ordering, lowToHigh });
-      if (!r.ok) return { ok: false, reason: r.reason, gifts: [] };
-      if (!r.items.length) break;
-
-      for (const it of r.items) {
-        const lot = feedItemToLot(it);
-        if (!lot) continue;
-
-        const numStr = lot.number == null ? '' : String(lot.number);
-        if (prefix && !numStr.startsWith(prefix)) continue;
-
-        if (model && lot.model && !sameTrait(lot.model, norm(model))) continue;
-        if (backdrop && lot.backdrop && !sameTrait(lot.backdrop, norm(backdrop))) continue;
-
-        if (!byId.has(String(lot.id))) byId.set(String(lot.id), lot);
-        if (byId.size >= ALL_GIFTS_TARGET_UNIQUE) break;
-      }
-
-      cursor = r.cursor || '';
-      if (!cursor || byId.size >= ALL_GIFTS_TARGET_UNIQUE) break;
-      await sleep(MRKT_THROTTLE_MS);
-    }
-
-    const out = Array.from(byId.values());
-    out.sort((a, b) => a.priceTon - b.priceTon);
-    return { ok: true, reason: 'OK', gifts: out };
+    // For Market display we require a gift (safe). If empty gift -> return empty.
+    return { ok: true, reason: 'OK', gifts: [] };
   }
 
-  // gift selected => saling
   const NUMBER_MODE = !!prefix;
   const ordering = NUMBER_MODE ? 'Latest' : 'Price';
   const lowToHigh = NUMBER_MODE ? false : true;
-  const pagesToScan = NUMBER_MODE ? Math.max(MRKT_PAGES_NUMBER, pagesLimit || 1) : (pagesLimit || 1);
+  const pagesToScan = Math.max(1, Number(pagesLimit || 1));
 
   let cursor = '';
   const out = [];
@@ -991,69 +908,50 @@ async function mrktHistorySales({ gift, model, backdrop, numberPrefix }) {
   while (pages < HISTORY_MAX_PAGES && prices.length < HISTORY_TARGET_SALES) {
     if (nowMs() - started > HISTORY_TIME_BUDGET_MS) break;
 
-    const body = {
-      req: String(Date.now()),
-      count: Number(HISTORY_COUNT_PER_PAGE),
-      cursor: cursor || '',
-      collectionNames: [gift],
-      modelNames: model ? [model] : [],
-      backdropNames: backdrop ? [backdrop] : [],
-      lowToHigh: false,
-      maxPrice: null,
-      minPrice: null,
-      number: null,
+    const r = await mrktFeedFetch({
+      gift,
+      model: model || null,
+      backdrop: backdrop || null,
+      cursor,
+      count: HISTORY_COUNT_PER_PAGE,
       ordering: 'Latest',
-      query: null,
-      type: ['sale'],
+      lowToHigh: false,
       types: ['sale'],
-    };
+    });
 
-    const res = await fetchWithTimeout(`${MRKT_API_URL}/feed`, {
-      method: 'POST',
-      headers: mrktHeaders(),
-      body: JSON.stringify(body),
-    }, MRKT_TIMEOUT_MS).catch(() => null);
+    if (!r.ok) break;
+    if (!r.items.length) break;
 
-    if (!res || !res.ok) break;
+    for (const it of r.items) {
+      const lot = feedItemToLot(it);
+      if (!lot) continue;
 
-    const data = await res.json().catch(() => null);
-    const items = Array.isArray(data?.items) ? data.items : [];
-    if (!items.length) break;
-
-    for (const it of items) {
-      const g = it?.gift;
-      if (!g) continue;
-
-      const num = g.number ?? null;
-      const numStr = num == null ? '' : String(num);
+      const numStr = lot.number == null ? '' : String(lot.number);
       if (prefix && !numStr.startsWith(prefix)) continue;
 
-      const amountNano = it.amount ?? g.salePrice ?? g.salePriceWithoutFee ?? null;
-      const ton = amountNano != null ? Number(amountNano) / 1e9 : NaN;
-      if (!Number.isFinite(ton) || ton <= 0) continue;
+      // filter again by model/backdrop (safety)
+      if (model && lot.model && !sameTrait(lot.model, norm(model))) continue;
+      if (backdrop && lot.backdrop && !sameTrait(lot.backdrop, norm(backdrop))) continue;
 
-      prices.push(ton);
+      prices.push(lot.priceTon);
 
       if (lastSales.length < 35) {
-        const titleBase = g.collectionTitle || g.collectionName || g.title || gift;
-        const giftName = g.name || giftNameFallbackFromCollectionAndNumber(titleBase, g.number) || null;
-
         lastSales.push({
-          tsMsk: it.date ? formatMsk(it.date) : '',
-          priceTon: ton,
-          number: g.number ?? null,
-          model: g.modelTitle || g.modelName || null,
-          backdrop: g.backdropName || null,
-          imgUrl: giftName ? `/img/gift?name=${encodeURIComponent(giftName)}` : null,
-          urlTelegram: giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : null,
-          urlMarket: g.id ? mrktLotUrlFromId(g.id) : null,
+          tsMsk: lot.feedDate ? formatMsk(lot.feedDate) : '',
+          priceTon: lot.priceTon,
+          number: lot.number ?? null,
+          model: lot.model || null,
+          backdrop: lot.backdrop || null,
+          imgUrl: lot.giftName ? `/img/gift?name=${encodeURIComponent(lot.giftName)}` : null,
+          urlTelegram: lot.urlTelegram || null,
+          urlMarket: lot.urlMarket || null,
         });
       }
 
       if (prices.length >= HISTORY_TARGET_SALES) break;
     }
 
-    cursor = data?.cursor || '';
+    cursor = r.cursor || '';
     pages++;
     if (!cursor) break;
     await sleep(MRKT_THROTTLE_MS);
@@ -1137,8 +1035,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
           floor: null,
           emptyStreak: 0,
           pausedUntil: 0,
-          baselineReady: false,
-          seenIds: new Set(),
+          feedLastId: null,
         };
 
         if (!sub.filters.gift) continue;
@@ -1187,36 +1084,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
   }
 }
 
-// ===================== AutoBuy worker (saling Latest + baseline) =====================
-async function autobuyBaselineForSub(userId, sub) {
-  const stateKey = `${userId}:${sub.id}`;
-  const prev = subStates.get(stateKey) || {
-    floor: null,
-    emptyStreak: 0,
-    pausedUntil: 0,
-    baselineReady: false,
-    seenIds: new Set(),
-  };
-
-  const r = await mrktFetchSalingPage({
-    collectionName: sub.filters.gift,
-    modelName: sub.filters.model || null,
-    backdropName: sub.filters.backdrop || null,
-    cursor: '',
-    ordering: 'Latest',
-    lowToHigh: false,
-  });
-
-  const seen = prev.seenIds instanceof Set ? prev.seenIds : new Set();
-  if (r.ok) {
-    for (const g of r.gifts || []) {
-      if (g?.id) seen.add(String(g.id));
-    }
-  }
-
-  subStates.set(stateKey, { ...prev, seenIds: seen, baselineReady: true });
-}
-
+// ===================== AutoBuy worker (FEED listing + baseline by feedLastId) =====================
 async function autoBuyCycle() {
   if (!AUTO_BUY_GLOBAL) return;
   if (MODE !== 'real') return;
@@ -1239,7 +1107,6 @@ async function autoBuyCycle() {
       const eligible = subs.filter(
         (s) => s && s.enabled && s.autoBuyEnabled && s.maxAutoBuyTon != null && s.filters.gift
       );
-
       autoBuyDebug.eligible += eligible.length;
       if (!eligible.length) continue;
 
@@ -1259,53 +1126,86 @@ async function autoBuyCycle() {
           floor: null,
           emptyStreak: 0,
           pausedUntil: 0,
-          baselineReady: false,
-          seenIds: new Set(),
+          feedLastId: null,
         };
 
         if (st.pausedUntil && nowMs() < st.pausedUntil) continue;
 
-        if (!st.baselineReady) {
-          await autobuyBaselineForSub(userId, sub);
+        // pull latest listing events
+        const feed = await mrktFeedFetch({
+          gift: sub.filters.gift,
+          model: sub.filters.model || null,
+          backdrop: sub.filters.backdrop || null,
+          cursor: '',
+          count: MRKT_FEED_COUNT,
+          ordering: 'Latest',
+          lowToHigh: false,
+          types: ['listing'],
+        });
+
+        if (!feed.ok) {
+          autoBuyDebug.lastReason = `feed error: ${feed.reason}`;
+          continue;
+        }
+
+        if (!feed.items.length) {
+          autoBuyDebug.lastReason = 'no feed items';
+          // still store baseline if absent? no
+          continue;
+        }
+
+        autoBuyDebug.scanned += feed.items.length;
+
+        const latestId = feed.items[0]?.id || null;
+        if (!latestId) {
+          autoBuyDebug.lastReason = 'no latestId';
+          continue;
+        }
+
+        // baseline: first time just remember latestId, don't buy old listings
+        if (!st.feedLastId) {
+          subStates.set(stateKey, { ...st, feedLastId: latestId });
           autoBuyDebug.lastReason = 'baseline set';
           continue;
         }
 
-        const r = await mrktFetchSalingPage({
-          collectionName: sub.filters.gift,
-          modelName: sub.filters.model || null,
-          backdropName: sub.filters.backdrop || null,
-          cursor: '',
-          ordering: 'Latest',
-          lowToHigh: false,
-        });
+        // collect only NEW items since last check
+        const newItems = [];
+        for (const it of feed.items) {
+          if (!it?.id) continue;
+          if (it.id === st.feedLastId) break;
+          newItems.push(it);
+        }
 
-        if (!r.ok) {
-          autoBuyDebug.lastReason = `saling error: ${r.reason}`;
+        // update baseline to current latest
+        subStates.set(stateKey, { ...st, feedLastId: latestId });
+
+        if (!newItems.length) {
+          autoBuyDebug.lastReason = 'no new listings';
           continue;
         }
 
-        const gifts = r.gifts || [];
-        autoBuyDebug.scanned += gifts.length;
+        // process oldest -> newest
+        newItems.reverse();
+        autoBuyDebug.newIds += newItems.length;
 
-        const seen = st.seenIds instanceof Set ? st.seenIds : new Set();
         const prefix = cleanDigitsPrefix(sub.filters.numberPrefix || '');
 
-        for (const g of gifts) {
-          if (!g?.id) continue;
-          const id = String(g.id);
+        for (const it of newItems) {
+          if (buysDone >= AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE) break;
 
-          if (seen.has(id)) continue;
-          seen.add(id);
-          autoBuyDebug.newIds++;
-
-          const lot = salingGiftToLot(g, sub.filters.gift);
+          const lot = feedItemToLot(it);
           if (!lot) continue;
 
+          // numberPrefix filter
           if (prefix) {
             const numStr = lot.number == null ? '' : String(lot.number);
             if (!numStr.startsWith(prefix)) continue;
           }
+
+          // trait filters (safety)
+          if (sub.filters.model && lot.model && !sameTrait(lot.model, norm(sub.filters.model))) continue;
+          if (sub.filters.backdrop && lot.backdrop && !sameTrait(lot.backdrop, norm(sub.filters.backdrop))) continue;
 
           if (lot.priceTon > maxBuy) continue;
 
@@ -1353,12 +1253,12 @@ async function autoBuyCycle() {
               sub.autoBuyEnabled = false;
               scheduleSave();
             }
-
             break;
           } else {
             if (isNoFundsError(buyRes)) {
+              // disable autobuy for all subs for this user
               for (const s2 of subs) if (s2) s2.autoBuyEnabled = false;
-              subStates.set(stateKey, { ...st, seenIds: seen, pausedUntil: nowMs() + AUTO_BUY_NO_FUNDS_PAUSE_MS, baselineReady: true });
+              subStates.set(stateKey, { ...st, feedLastId: latestId, pausedUntil: nowMs() + AUTO_BUY_NO_FUNDS_PAUSE_MS });
               scheduleSave();
               autoBuyDebug.lastReason = 'no funds';
               break;
@@ -1367,8 +1267,6 @@ async function autoBuyCycle() {
             }
           }
         }
-
-        subStates.set(stateKey, { ...st, seenIds: seen, baselineReady: true });
 
         if (MRKT_THROTTLE_MS > 0) await sleep(MRKT_THROTTLE_MS);
       }
@@ -1454,7 +1352,7 @@ button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;backg
 .sug{border:1px solid var(--border);border-radius:14px;overflow:auto;background:var(--card);max-height:360px;position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:9999;box-shadow:0 14px 40px rgba(0,0,0,.45)}
 .sug .item{width:100%;text-align:left;border:0;background:transparent;padding:10px;display:flex;gap:10px;align-items:center}
 .sug .item:hover{background:rgba(255,255,255,.06)}
-.thumb{width:44px;height:44px;border-radius:14px;object-fit:contain;background:rgba(255,255,255,.06);border:1px solid var(--border);flex:0 0 auto}
+.thumb{width:44px;height:44px;border-radius:14px;object-fit:cover;background:rgba(255,255,255,.06);border:1px solid var(--border);flex:0 0 auto}
 .dot{width:14px;height:14px;border-radius:999px;border:1px solid var(--border);display:inline-block}
 
 .grid{display:grid;gap:10px;margin-top:10px;grid-template-columns: repeat(auto-fill, minmax(170px, 1fr))}
@@ -1495,7 +1393,7 @@ button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;backg
     <div class="field">
       <label>Gift</label>
       <div class="inpWrap">
-        <input id="gift" placeholder="Gift (можно пусто)" autocomplete="off"/>
+        <input id="gift" placeholder="Gift" autocomplete="off"/>
         <button class="xbtn" data-clear="gift" type="button">×</button>
       </div>
       <div id="giftSug" class="sug" style="display:none"></div>
@@ -1549,7 +1447,10 @@ button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;backg
 
 <div id="profile" class="card" style="display:none">
   <h3 style="margin:0 0 8px 0;font-size:15px">Профиль</h3>
-  <div id="profileBox" class="muted">Загрузка...</div>
+  <div class="row" style="align-items:center">
+    <img id="pfp" class="thumb" style="display:none"/>
+    <div id="profileBox" class="muted">Загрузка...</div>
+  </div>
   <div class="hr"></div>
   <div><b>История покупок</b></div>
   <div id="purchases" style="margin-top:10px;display:flex;flex-direction:column;gap:10px"></div>
@@ -1809,6 +1710,17 @@ const WEBAPP_JS = `(() => {
     const r = await api('/api/profile');
     const u=r.user||{};
     el('profileBox').textContent = (u.username?('@'+u.username+' '):'') + 'id: '+(u.id||'-');
+
+    const pfp = el('pfp');
+    if (u.photo_url) {
+      pfp.style.display = 'block';
+      pfp.src = u.photo_url;
+      pfp.referrerPolicy = 'no-referrer';
+    } else {
+      pfp.style.display = 'none';
+      pfp.src = '';
+    }
+
     const list=r.purchases||[];
     const box=el('purchases');
     box.innerHTML = list.length ? list.map(p=>'<div class="card"><b class="ellipsis">'+p.title+'</b><div class="muted">'+p.tsMsk+' · '+Number(p.priceTon).toFixed(3)+' TON</div></div>').join('') : '<i class="muted">Покупок пока нет</i>';
@@ -1818,6 +1730,8 @@ const WEBAPP_JS = `(() => {
     const r = await api('/api/admin/status');
     el('adminStatus').textContent =
       'MRKT last fail: '+(r.mrktLastFailMsg||'-')+'\\n'+
+      'MRKT last endpoint: '+(r.mrktLastFailEndpoint||'-')+'\\n'+
+      'MRKT last status: '+(r.mrktLastFailStatus||'-')+'\\n'+
       'AutoBuy: eligible='+r.autoBuy.eligible+
       ', scanned='+r.autoBuy.scanned+
       ', newIds='+r.autoBuy.newIds+
@@ -1844,6 +1758,9 @@ const WEBAPP_JS = `(() => {
       box.innerHTML = subs.map(s=>{
         const img = s.thumbUrl ? '<img class="thumb" src="'+s.thumbUrl+'" referrerpolicy="no-referrer"/>' : '<div class="thumb"></div>';
         const dot = s.backdropHex ? '<span class="dot" style="background:'+s.backdropHex+'"></span>' : '<span class="dot"></span>';
+        const notifyTxt = (s.maxNotifyTon==null)?'∞':String(s.maxNotifyTon);
+        const buyTxt = (s.maxAutoBuyTon==null)?'-':String(s.maxAutoBuyTon);
+
         return '<div class="card">'+
           '<div style="display:flex;justify-content:space-between;gap:10px;align-items:center">'+
             '<div style="display:flex;gap:10px;align-items:center;min-width:0">'+img+
@@ -1852,10 +1769,12 @@ const WEBAPP_JS = `(() => {
             '</div>'+
             '<button class="small" data-act="subDetails" data-id="'+s.id+'">Детали</button>'+
           '</div>'+
-          '<div class="muted">AutoBuy: '+(s.autoBuyEnabled?'ON':'OFF')+' | Max: '+(s.maxAutoBuyTon==null?'-':s.maxAutoBuyTon)+'</div>'+
+          '<div class="muted">Notify max: '+notifyTxt+' TON</div>'+
+          '<div class="muted">AutoBuy: '+(s.autoBuyEnabled?'ON':'OFF')+' | Max: '+buyTxt+' TON</div>'+
           '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">'+
-            '<button class="small" data-act="subAutoToggle" data-id="'+s.id+'">'+(s.autoBuyEnabled?'AutoBuy OFF':'AutoBuy ON')+'</button>'+
+            '<button class="small" data-act="subNotifyMax" data-id="'+s.id+'">Max Notify</button>'+
             '<button class="small" data-act="subAutoMax" data-id="'+s.id+'">Max AutoBuy</button>'+
+            '<button class="small" data-act="subAutoToggle" data-id="'+s.id+'">'+(s.autoBuyEnabled?'AutoBuy OFF':'AutoBuy ON')+'</button>'+
             '<button class="small" data-act="subToggle" data-id="'+s.id+'">'+(s.enabled?'Disable':'Enable')+'</button>'+
             '<button class="small" data-act="subDel" data-id="'+s.id+'">Delete</button>'+
           '</div>'+
@@ -1891,12 +1810,21 @@ const WEBAPP_JS = `(() => {
     try{
       if(act==='subToggle') await api('/api/sub/toggle',{method:'POST',body:JSON.stringify({id})});
       if(act==='subDel') await api('/api/sub/delete',{method:'POST',body:JSON.stringify({id})});
+
+      if(act==='subNotifyMax'){
+        const v = prompt('Max Notify TON (пусто = без лимита):', '');
+        if (v == null) return;
+        await api('/api/sub/set_notify_max',{method:'POST',body:JSON.stringify({id, maxNotifyTon: v})});
+      }
+
       if(act==='subAutoToggle') await api('/api/sub/toggle_autobuy',{method:'POST',body:JSON.stringify({id})});
+
       if(act==='subAutoMax'){
         const v = prompt('Max AutoBuy TON (пример: 4.29):', '');
         if(v==null) return;
         await api('/api/sub/set_autobuy_max',{method:'POST',body:JSON.stringify({id, maxAutoBuyTon: v})});
       }
+
       if(act==='subDetails'){
         openSheet('Детали подписки','');
         const r = await api('/api/sub/details',{method:'POST',body:JSON.stringify({id})});
@@ -1908,6 +1836,7 @@ const WEBAPP_JS = `(() => {
           '<div style="margin-top:6px"><b>Медиана:</b> '+(r.history?.median!=null?r.history.median.toFixed(3)+' TON':'нет')+' (n='+(r.history?.count||0)+')</div>';
         renderHistory(r.history?.lastSales||[]);
       }
+
       await refreshState();
     }catch(err){ showErr(err.message||String(err)); }
   });
@@ -2245,6 +2174,27 @@ function startWebServer() {
     res.json({ ok: true });
   });
 
+  app.post('/api/sub/set_notify_max', auth, async (req, res) => {
+    const u = getOrCreateUser(req.userId);
+    const s = findSub(u, req.body?.id);
+    if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+
+    const raw = req.body?.maxNotifyTon;
+    const str = String(raw ?? '').trim();
+    if (!str) {
+      s.maxNotifyTon = null;
+      await persistNow().catch(() => scheduleSave());
+      return res.json({ ok: true });
+    }
+
+    const v = parseTonInput(str);
+    if (!Number.isFinite(v) || v <= 0) return res.status(400).json({ ok: false, reason: 'BAD_MAX' });
+
+    s.maxNotifyTon = v;
+    await persistNow().catch(() => scheduleSave());
+    res.json({ ok: true });
+  });
+
   app.post('/api/sub/toggle_autobuy', auth, async (req, res) => {
     const u = getOrCreateUser(req.userId);
     const s = findSub(u, req.body?.id);
@@ -2252,9 +2202,10 @@ function startWebServer() {
 
     s.autoBuyEnabled = !s.autoBuyEnabled;
 
+    // reset baseline for feed (only-new)
     const stateKey = `${req.userId}:${s.id}`;
-    const prev = subStates.get(stateKey) || { floor: null, emptyStreak: 0, pausedUntil: 0, baselineReady: false, seenIds: new Set() };
-    subStates.set(stateKey, { ...prev, baselineReady: false, seenIds: new Set(), pausedUntil: 0 });
+    const prev = subStates.get(stateKey) || { floor: null, emptyStreak: 0, pausedUntil: 0, feedLastId: null };
+    subStates.set(stateKey, { ...prev, feedLastId: null, pausedUntil: 0 });
 
     await persistNow().catch(() => scheduleSave());
     res.json({ ok: true });
@@ -2320,6 +2271,8 @@ function startWebServer() {
       ok: true,
       mrktAuthMask: mask,
       mrktLastFailMsg: mrktState.lastFailMsg || null,
+      mrktLastFailStatus: mrktState.lastFailStatus || null,
+      mrktLastFailEndpoint: mrktState.lastFailEndpoint || null,
       autoBuy: {
         eligible: autoBuyDebug.eligible,
         scanned: autoBuyDebug.scanned,
