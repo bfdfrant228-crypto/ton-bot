@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <h2 id="title">MRKT Panel</h2>
+  <h2>MRKT Panel</h2>
   <div id="err" class="card" style="display:none"></div>
 
   <div class="tabs">
@@ -60,11 +60,11 @@
     <div class="row" style="margin-top:10px">
       <button id="apply" class="primary">Показать</button>
       <button id="refresh">Обновить</button>
+      <button id="historyBtn">История</button>
     </div>
 
-    <div id="lotsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка лотов…</div></div>
+    <div id="lotsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка…</div></div>
 
-    <div id="status" class="muted" style="margin-top:10px"></div>
     <div class="hr"></div>
     <div><b>Лоты</b> <span class="muted">(клик → меню)</span></div>
     <div id="lots" class="grid"></div>
@@ -76,7 +76,7 @@
       <button id="subCreate">Создать из текущих фильтров</button>
       <button id="subRefresh">Обновить</button>
     </div>
-    <div id="subsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка подписок…</div></div>
+    <div id="subsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка…</div></div>
     <div id="subsList" style="margin-top:10px"></div>
   </div>
 
@@ -96,31 +96,33 @@
     <h3>Admin</h3>
     <div id="adminStatus" class="muted">Загрузка…</div>
     <div class="hr"></div>
-    <div class="muted">MRKT_AUTH обновляется автоматически, если есть initData. Можно принудительно обновить.</div>
-    <div class="row" style="margin-top:10px">
-      <button id="adminRefresh">Force refresh token</button>
-    </div>
+    <button id="adminRefresh">Force refresh token</button>
   </div>
 
   <!-- Bottom Sheet -->
   <div id="sheetWrap" class="sheetWrap">
     <div class="sheet">
       <div class="handle"></div>
+
       <div class="sheetHeader">
-        <div>
+        <div style="min-width:0">
           <div id="sheetTitle" class="sheetTitle"></div>
           <div id="sheetSub" class="muted"></div>
         </div>
         <button id="sheetClose" class="small">✕</button>
       </div>
 
-      <img id="sheetImg" class="sheetImg" style="display:none" />
-      <div id="sheetTop" class="muted"></div>
-      <div class="kv" id="sheetKV"></div>
-      <div class="row" id="sheetBtns"></div>
+      <div class="sheetTopRow">
+        <img id="sheetImg" class="sheetImg" style="display:none" />
+        <div style="flex:1;min-width:0">
+          <div id="sheetTop" class="muted"></div>
+          <div class="kv" id="sheetKV"></div>
+          <div class="row" id="sheetBtns"></div>
+        </div>
+      </div>
 
       <div class="hr"></div>
-      <div><b>История продаж</b> <span class="muted">(картинка + NFT/MRKT)</span></div>
+      <div><b>История продаж</b> <span class="muted">(NFT/MRKT)</span></div>
       <div id="sheetSales" class="sheetBody"></div>
     </div>
   </div>
