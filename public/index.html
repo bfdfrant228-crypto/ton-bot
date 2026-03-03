@@ -60,13 +60,9 @@
     <div class="row" style="margin-top:10px">
       <button id="apply" class="primary">Показать</button>
       <button id="refresh">Обновить</button>
-      <button id="salesBtn">Продажи</button>
-      <button id="toProfile" class="small">Покупки</button>
     </div>
 
     <div id="lotsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка лотов…</div></div>
-
-    <div id="maxOfferBox" class="hintBox" style="display:none"></div>
 
     <div id="status" class="muted" style="margin-top:10px"></div>
     <div class="hr"></div>
@@ -100,11 +96,9 @@
     <h3>Admin</h3>
     <div id="adminStatus" class="muted">Загрузка…</div>
     <div class="hr"></div>
-    <div class="muted">Обновление MRKT_AUTH без перезапуска (сохранится в Redis).</div>
+    <div class="muted">MRKT_AUTH обновляется автоматически, если есть initData. Можно принудительно обновить.</div>
     <div class="row" style="margin-top:10px">
-      <div class="field"><label>Текущий токен (маска)</label><input id="tokMask" disabled/></div>
-      <div class="field"><label>Новый MRKT_AUTH</label><input id="tokNew" placeholder="вставь токен"/></div>
-      <button id="tokSave">Сохранить</button>
+      <button id="adminRefresh">Force refresh token</button>
     </div>
   </div>
 
@@ -114,7 +108,7 @@
       <div class="handle"></div>
       <div class="sheetHeader">
         <div>
-          <div id="sheetTitle" style="font-weight:950"></div>
+          <div id="sheetTitle" class="sheetTitle"></div>
           <div id="sheetSub" class="muted"></div>
         </div>
         <button id="sheetClose" class="small">✕</button>
@@ -126,12 +120,11 @@
       <div class="row" id="sheetBtns"></div>
 
       <div class="hr"></div>
-      <div><b>История продаж</b> <span class="muted">(примерная цена продажи + последние сделки)</span></div>
+      <div><b>История продаж</b> <span class="muted">(картинка + NFT/MRKT)</span></div>
       <div id="sheetSales" class="sheetBody"></div>
     </div>
   </div>
 
-  <!-- Telegram WebApp -->
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script src="/app.js"></script>
 </body>
