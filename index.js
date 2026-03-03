@@ -1,19 +1,16 @@
 /**
- * MRKT Panel + Bot
+ * MRKT Panel + Bot (stable)
+ * - Fix: backdrops is not defined (mrktFetchSalingPage)
+ * - Auto refresh MRKT_AUTH using /api/v1/auth when 401/403 happens
+ *   (needs WebApp initData captured once by opening panel)
+ *
  * Files:
  * - index.js
  * - public/index.html
  * - public/app.js
  * - public/style.css
  *
- * Key points:
- * - Multi-select gifts/models/backdrops (OR-logic), saved in state/subs/autobuy
- * - Admin token update without restart (Redis)
- * - Chat notifications: TEXT + image URL (Telegram preview), NO sendPhoto
- * - WebApp: bottom-sheet lot menu + sales history + profile purchases with images/buttons
- *
  * Node 18+
- * deps: express, node-telegram-bot-api, redis(optional)
  */
 
 const TelegramBot = require('node-telegram-bot-api');
@@ -24,7 +21,10 @@ const { Readable } = require('stream');
 
 // ===================== ENV =====================
 const token = process.env.TELEGRAM_TOKEN;
-if (!token) { console.error('TELEGRAM_TOKEN not set'); process.exit(1); }
+if (!token) {
+  console.error('TELEGRAM_TOKEN not set');
+  process.exit(1);
+}
 
 const MODE = process.env.MODE || 'real';
 
@@ -36,12 +36,12 @@ const ADMIN_USER_ID = process.env.ADMIN_USER_ID ? Number(process.env.ADMIN_USER_
 
 const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL || null;
 
-// MRKT
+// MRKT endpoints
 const MRKT_API_URL = 'https://api.tgmrkt.io/api/v1';
 const MRKT_CDN_BASE = (process.env.MRKT_CDN_BASE || 'https://cdn.tgmrkt.io/').trim();
 const FRAGMENT_GIFT_IMG_BASE = (process.env.FRAGMENT_GIFT_IMG_BASE || 'https://nft.fragment.com/gift/').trim();
 
-// token runtime (can be overwritten via Admin panel -> Redis)
+// MRKT token runtime (can be updated in Redis from Admin)
 let MRKT_AUTH_RUNTIME = (process.env.MRKT_AUTH || '').trim() || null;
 
 // intervals
@@ -78,23 +78,14 @@ const SALES_HISTORY_COUNT_PER_PAGE = Number(process.env.SALES_HISTORY_COUNT_PER_
 const SALES_HISTORY_THROTTLE_MS = Number(process.env.SALES_HISTORY_THROTTLE_MS || 120);
 const SALES_HISTORY_TIME_BUDGET_MS = Number(process.env.SALES_HISTORY_TIME_BUDGET_MS || 15000);
 
-// MRKT auth expiry notify
+// MRKT auth notify + refresh throttles
 const MRKT_AUTH_NOTIFY_COOLDOWN_MS = Number(process.env.MRKT_AUTH_NOTIFY_COOLDOWN_MS || 60 * 60 * 1000); // 1h
-let mrktAuthLastNotifiedAt = 0;
+const MRKT_AUTH_REFRESH_COOLDOWN_MS = Number(process.env.MRKT_AUTH_REFRESH_COOLDOWN_MS || 15_000); // 15s
 
 // redis keys
 const REDIS_KEY_MRKT_AUTH = 'mrkt:auth:token';
 const REDIS_KEY_STATE = 'bot:state:main';
-
-console.log('Start', {
-  MODE,
-  WEBAPP_URL: !!WEBAPP_URL,
-  ADMIN_USER_ID,
-  REDIS: !!REDIS_URL,
-  MRKT_AUTH: !!MRKT_AUTH_RUNTIME,
-  AUTO_BUY_GLOBAL,
-  AUTO_BUY_DRY_RUN
-});
+const REDIS_KEY_ADMIN_INITDATA = 'mrkt:initdata:admin';
 
 // ===================== Telegram bot =====================
 const bot = new TelegramBot(token, { polling: true });
@@ -107,6 +98,7 @@ const subStates = new Map();  // `${userId}:${subId}` -> { floor, emptyStreak, p
 let isSubsChecking = false;
 let isAutoBuying = false;
 
+// for MRKT API status
 const mrktState = {
   lastOkAt: 0,
   lastFailAt: 0,
@@ -134,7 +126,7 @@ const backdropsCache = new Map();  // gift -> {time, items}
 const offersCache = new Map();     // key -> {time, data}
 const OFFERS_CACHE_TTL_MS = 15_000;
 
-// ===================== helpers =====================
+// ===================== Helpers =====================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const nowMs = () => Date.now();
 
@@ -182,7 +174,7 @@ function normalizeFilters(f) {
   const backdrops = uniqNorm(ensureArray(f?.backdrops || f?.backdrop));
   const numberPrefix = cleanDigitsPrefix(f?.numberPrefix || '');
 
-  // if multiple gifts => clear model/backdrop (MRKT often returns empty otherwise)
+  // if multiple gifts => clear model/backdrop
   return {
     gifts,
     giftLabels,
@@ -204,6 +196,12 @@ function formatMskMs(ts) {
   const parts = fmt.formatToParts(d);
   const get = (t) => parts.find((p) => p.type === t)?.value || '';
   return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}.${ms} MSK`;
+}
+
+function joinUrl(base, key) {
+  const b = String(base || '').endsWith('/') ? String(base) : (String(base) + '/');
+  const k = String(key || '').startsWith('/') ? String(key).slice(1) : String(key);
+  return b + k;
 }
 
 function mrktLotUrlFromId(id) {
@@ -265,12 +263,6 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   finally { clearTimeout(timer); }
 }
 
-function joinUrl(base, key) {
-  const b = String(base || '').endsWith('/') ? String(base) : (String(base) + '/');
-  const k = String(key || '').startsWith('/') ? String(key).slice(1) : String(key);
-  return b + k;
-}
-
 function streamFetchToRes(r, res, fallbackContentType) {
   res.setHeader('Content-Type', r.headers.get('content-type') || fallbackContentType);
   res.setHeader('Cache-Control', 'public, max-age=86400');
@@ -287,7 +279,7 @@ function streamFetchToRes(r, res, fallbackContentType) {
     .catch(() => res.status(502).end('bad gateway'));
 }
 
-// ===================== WebApp auth =====================
+// ===================== WebApp auth verify =====================
 function verifyTelegramWebAppInitData(initData) {
   if (!initData) return { ok: false, reason: 'NO_INIT_DATA' };
 
@@ -298,6 +290,7 @@ function verifyTelegramWebAppInitData(initData) {
 
   const authDate = Number(params.get('auth_date') || 0);
   if (!authDate) return { ok: false, reason: 'NO_AUTH_DATE' };
+
   const ageSec = Math.floor(Date.now() / 1000) - authDate;
   if (ageSec > WEBAPP_AUTH_MAX_AGE_SEC) return { ok: false, reason: 'INITDATA_EXPIRED' };
 
@@ -308,6 +301,7 @@ function verifyTelegramWebAppInitData(initData) {
 
   const secretKey = crypto.createHmac('sha256', 'WebAppData').update(token).digest();
   const calcHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+
   if (calcHash !== hash) return { ok: false, reason: 'BAD_HASH' };
 
   let user = null;
@@ -344,6 +338,20 @@ async function loadMrktAuthFromRedis() {
 async function saveMrktAuthToRedis(t) {
   if (!redis) return;
   await redis.set(REDIS_KEY_MRKT_AUTH, String(t || '').trim());
+}
+
+async function loadAdminInitDataFromRedis() {
+  if (!redis) return null;
+  try {
+    const v = await redis.get(REDIS_KEY_ADMIN_INITDATA);
+    return v && String(v).trim() ? String(v) : null;
+  } catch {
+    return null;
+  }
+}
+async function saveAdminInitDataToRedis(initData) {
+  if (!redis) return;
+  await redis.set(REDIS_KEY_ADMIN_INITDATA, String(initData), { EX: WEBAPP_AUTH_MAX_AGE_SEC });
 }
 
 function exportState() {
@@ -455,18 +463,15 @@ function getOrCreateUser(userId) {
   }
   return users.get(userId);
 }
-
 function userChatId(userId) {
   const u = users.get(userId);
   const cid = u?.chatId;
   if (cid && Number.isFinite(Number(cid))) return Number(cid);
   return userId;
 }
-
 function findSub(user, id) {
   return (user.subscriptions || []).find((s) => s && s.id === id) || null;
 }
-
 function makeSubFromCurrentFilters(user) {
   const f = normalizeFilters(user.filters || {});
   if (!f.gifts.length && !f.numberPrefix) return { ok: false, reason: 'NO_GIFT_AND_NO_NUMBER' };
@@ -482,7 +487,6 @@ function makeSubFromCurrentFilters(user) {
   };
   return { ok: true, sub };
 }
-
 function pushPurchase(user, entry) {
   if (!user.purchases) user.purchases = [];
   user.purchases.unshift({
@@ -503,7 +507,7 @@ function pushPurchase(user, entry) {
 }
 
 // ===================== MRKT HTTP =====================
-function mrktHeaders() {
+function mrktHeadersJson() {
   return {
     ...(MRKT_AUTH_RUNTIME ? { Authorization: MRKT_AUTH_RUNTIME } : {}),
     'Content-Type': 'application/json; charset=utf-8',
@@ -522,6 +526,14 @@ function markMrktOk() {
   mrktState.lastFailEndpoint = null;
 }
 
+async function markMrktFail(endpoint, status, bodyText = null) {
+  mrktState.lastFailAt = nowMs();
+  mrktState.lastFailEndpoint = endpoint || null;
+  mrktState.lastFailStatus = status || null;
+  mrktState.lastFailMsg = extractMrktErrorMessage(bodyText) || (status ? `HTTP ${status}` : 'MRKT error');
+}
+
+let mrktAuthLastNotifiedAt = 0;
 async function notifyAdminMrktAuthExpired(statusCode) {
   if (!ADMIN_USER_ID) return;
   const now = nowMs();
@@ -531,25 +543,134 @@ async function notifyAdminMrktAuthExpired(statusCode) {
   try {
     await sendMessageSafe(
       ADMIN_USER_ID,
-      `⚠️ MRKT_AUTH не работает (HTTP ${statusCode}).\nОткрой панель → Admin и вставь новый токен.`,
+      `⚠️ MRKT_AUTH не работает (HTTP ${statusCode}).\nЯ попробую обновить сам. Если не получится — просто открой панель 1 раз.`,
       { disable_web_page_preview: true }
     );
   } catch {}
 }
 
-async function markMrktFail(endpoint, status, bodyText = null) {
-  mrktState.lastFailAt = nowMs();
-  mrktState.lastFailEndpoint = endpoint || null;
-  mrktState.lastFailStatus = status || null;
-  mrktState.lastFailMsg = extractMrktErrorMessage(bodyText) || (status ? `HTTP ${status}` : 'MRKT error');
+// --------- MRKT token auto-refresh via /auth ----------
+let adminInitDataRuntime = null;
+let isRefreshingMrktToken = false;
+let lastMrktRefreshAttemptAt = 0;
 
-  if (status === 401 || status === 403) {
-    await notifyAdminMrktAuthExpired(status);
+async function mrktAuthFromInitData(initData) {
+  // emulate axios form-urlencoded /auth call
+  const formObj = {
+    appId: '',
+    data: String(initData || ''),
+    token: MRKT_AUTH_RUNTIME || '',
+    isFirstTime: 'false',
+    channelFeedItemId: '',
+    channelId: '',
+    feedItemId: '',
+    gameItemFeedItemId: '',
+    gameItemId: '',
+    giftCollectionFeedItemId: '',
+    giftCollectionId: '',
+    giftId: '',
+    giveawayId: '',
+    lootboxCreatorId: '',
+    lootboxName: '',
+    pageToOpen: '',
+    profile: '',
+    pulseEventId: '',
+    stickerCollectionId: '',
+    stickerFeedItemId: '',
+    stickerId: '',
+  };
+
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(formObj)) body.set(k, v == null ? '' : String(v));
+
+  const res = await fetchWithTimeout(
+    `${MRKT_API_URL}/auth`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+        Origin: 'https://cdn.tgmrkt.io',
+        Referer: 'https://cdn.tgmrkt.io/',
+        'User-Agent': 'Mozilla/5.0',
+      },
+      body: body.toString(),
+    },
+    MRKT_TIMEOUT_MS
+  ).catch(() => null);
+
+  if (!res) return { ok: false, status: 0, reason: 'FETCH_ERROR' };
+
+  const txt = await res.text().catch(() => '');
+  let data = null;
+  try { data = txt ? JSON.parse(txt) : null; } catch { data = null; }
+
+  if (!res.ok) {
+    return { ok: false, status: res.status, reason: extractMrktErrorMessage(txt) || `HTTP_${res.status}` };
+  }
+
+  const newToken = data?.token || null;
+  if (!newToken) return { ok: false, status: res.status, reason: 'NO_TOKEN_IN_RESPONSE' };
+
+  return { ok: true, status: res.status, token: String(newToken) };
+}
+
+async function getAdminInitData() {
+  if (adminInitDataRuntime) return adminInitDataRuntime;
+  const fromRedis = await loadAdminInitDataFromRedis();
+  if (fromRedis) {
+    adminInitDataRuntime = fromRedis;
+    return fromRedis;
+  }
+  return null;
+}
+
+async function tryRefreshMrktToken(reason = 'auto') {
+  const now = nowMs();
+  if (isRefreshingMrktToken) return { ok: false, reason: 'LOCKED' };
+  if (now - lastMrktRefreshAttemptAt < MRKT_AUTH_REFRESH_COOLDOWN_MS) return { ok: false, reason: 'COOLDOWN' };
+  lastMrktRefreshAttemptAt = now;
+
+  isRefreshingMrktToken = true;
+  try {
+    const initData = await getAdminInitData();
+    if (!initData) return { ok: false, reason: 'NO_INITDATA' };
+
+    const r = await mrktAuthFromInitData(initData);
+    if (!r.ok) return { ok: false, reason: r.reason || 'AUTH_FAILED' };
+
+    MRKT_AUTH_RUNTIME = r.token;
+    if (redis) {
+      try { await saveMrktAuthToRedis(r.token); } catch {}
+    }
+
+    // drop caches (token change)
+    collectionsCache = { time: 0, items: [] };
+    modelsCache.clear();
+    backdropsCache.clear();
+    offersCache.clear();
+
+    if (ADMIN_USER_ID) {
+      try {
+        await sendMessageSafe(
+          ADMIN_USER_ID,
+          `✅ MRKT токен обновлён автоматически (${reason}).`,
+          { disable_web_page_preview: true }
+        );
+      } catch {}
+    }
+
+    return { ok: true };
+  } finally {
+    isRefreshingMrktToken = false;
   }
 }
 
-async function mrktPostJson(path, bodyObj) {
-  if (!MRKT_AUTH_RUNTIME) return { ok: false, status: 401, data: null, text: 'NO_AUTH' };
+// core MRKT POST JSON with retry on 401/403
+async function mrktPostJson(path, bodyObj, { retry = true } = {}) {
+  if (!MRKT_AUTH_RUNTIME) {
+    return { ok: false, status: 401, data: null, text: 'NO_AUTH' };
+  }
 
   const reqVal = bodyObj?.req ? String(bodyObj.req) : makeReq();
   const body = { ...(bodyObj || {}), req: reqVal };
@@ -557,7 +678,7 @@ async function mrktPostJson(path, bodyObj) {
 
   const res = await fetchWithTimeout(
     url,
-    { method: 'POST', headers: mrktHeaders(), body: JSON.stringify(body) },
+    { method: 'POST', headers: mrktHeadersJson(), body: JSON.stringify(body) },
     MRKT_TIMEOUT_MS
   ).catch(() => null);
 
@@ -572,6 +693,16 @@ async function mrktPostJson(path, bodyObj) {
 
   if (!res.ok) {
     await markMrktFail(path, res.status, txt);
+
+    // auto refresh on auth errors
+    if ((res.status === 401 || res.status === 403) && retry) {
+      await notifyAdminMrktAuthExpired(res.status);
+      const rr = await tryRefreshMrktToken(`HTTP_${res.status}`).catch(() => ({ ok: false }));
+      if (rr && rr.ok) {
+        return mrktPostJson(path, bodyObj, { retry: false });
+      }
+    }
+
     return { ok: false, status: res.status, data, text: txt };
   }
 
@@ -586,13 +717,11 @@ async function mrktGetCollections() {
 
   const res = await fetchWithTimeout(
     `${MRKT_API_URL}/gifts/collections`,
-    { method: 'GET', headers: mrktHeaders() },
+    { method: 'GET', headers: { Accept: 'application/json' } },
     MRKT_TIMEOUT_MS
   ).catch(() => null);
 
   if (!res || !res.ok) {
-    const txt = await res?.text?.().catch(() => '') || '';
-    await markMrktFail('/gifts/collections', res?.status || 0, txt);
     collectionsCache = { time: now, items: [] };
     return [];
   }
@@ -673,7 +802,15 @@ async function mrktGetBackdropsForGift(giftName) {
   return items;
 }
 
-function buildSalingBody({ count = 20, cursor = '', collectionNames = [], modelNames = [], backdropNames = [], ordering = 'Price', lowToHigh = true } = {}) {
+function buildSalingBody({
+  count = 20,
+  cursor = '',
+  collectionNames = [],
+  modelNames = [],
+  backdropNames = [],
+  ordering = 'Price',
+  lowToHigh = true
+} = {}) {
   return {
     count,
     cursor,
@@ -681,37 +818,27 @@ function buildSalingBody({ count = 20, cursor = '', collectionNames = [], modelN
     modelNames,
     backdropNames,
     symbolNames: [],
-    craftable: null,
-    giftType: null,
-    isCrafted: null,
-    isNew: null,
-    isPremarket: null,
-    isTransferable: null,
-    luckyBuy: null,
-    removeSelfSales: null,
     ordering,
     lowToHigh,
     maxPrice: null,
     minPrice: null,
     number: null,
     query: null,
-    tgCanBeCraftedFrom: null
+    promotedFirst: false,
   };
 }
 
+// ✅ FIXED VERSION (no "backdrops" undefined here)
 async function mrktFetchSalingPage({ collectionNames, modelNames, backdropNames, cursor, ordering, lowToHigh, count }) {
   const body = buildSalingBody({
     count: Number(count || MRKT_COUNT),
     cursor: cursor || '',
     collectionNames: Array.isArray(collectionNames) ? collectionNames : [],
     modelNames: Array.isArray(modelNames) ? modelNames : [],
-    backdropNames: Array.isArray(backdropNames) ? backdrops : [],
+    backdropNames: Array.isArray(backdropNames) ? backdropNames : [],
     ordering: ordering || 'Price',
     lowToHigh: !!lowToHigh,
   });
-
-  // BUGFIX: backdropNames mapping above
-  body.backdropNames = Array.isArray(backdropNames) ? backdropNames : [];
 
   const r = await mrktPostJson('/gifts/saling', body);
   if (!r.ok) return { ok: false, reason: mrktState.lastFailMsg || 'SALING_ERROR', gifts: [], cursor: '' };
@@ -936,7 +1063,7 @@ async function mrktSearchLotsByFilters(filters, pagesLimit) {
   return { ok: true, reason: 'OK', gifts: out };
 }
 
-// ===================== Chat notifications (NO sendPhoto) =====================
+// ===================== Chat notifications (text + image URL preview) =====================
 function buildChatTextWithPreview({
   title,
   priceTon,
@@ -961,7 +1088,6 @@ function buildChatTextWithPreview({
   if (boughtAtMs) lines.push(`Buy: ${formatMskMs(boughtAtMs)}`);
   if (latencyMs != null) lines.push(`Latency: ${latencyMs} ms`);
 
-  // This line gives Telegram preview image
   if (giftName) {
     const imgUrl = fragmentGiftRemoteUrlFromGiftName(giftName);
     if (imgUrl) lines.push(imgUrl);
@@ -1273,7 +1399,6 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
 
-// static public folder
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
@@ -1281,20 +1406,30 @@ function auth(req, res, next) {
   const initData = String(req.headers['x-tg-init-data'] || '');
   const v = verifyTelegramWebAppInitData(initData);
   if (!v.ok) return res.status(401).json({ ok: false, reason: v.reason });
+
   req.userId = v.userId;
   req.tgUser = v.user || null;
+
+  // capture admin initData for auto-refresh token
+  if (ADMIN_USER_ID && Number(req.userId) === Number(ADMIN_USER_ID) && initData) {
+    adminInitDataRuntime = initData;
+    if (redis) saveAdminInitDataToRedis(initData).catch(() => {});
+  }
+
   next();
 }
+
 const isAdmin = (userId) => ADMIN_USER_ID && Number(userId) === Number(ADMIN_USER_ID);
 
-// image proxy: MRKT CDN
+// image proxy
 app.get('/img/cdn', async (req, res) => {
   const key = String(req.query.key || '').trim();
   if (!key) return res.status(400).send('no key');
-  const url = joinUrl(MRKT_CDN_BASE, key);
 
+  const url = joinUrl(MRKT_CDN_BASE, key);
   const r = await fetchWithTimeout(url, { method: 'GET', headers: { Accept: 'image/*' } }, 8000).catch(() => null);
   if (!r || !r.ok) return res.status(404).send('not found');
+
   streamFetchToRes(r, res, 'image/webp');
 });
 
@@ -1479,38 +1614,12 @@ app.post('/api/mrkt/buy', auth, async (req, res) => {
   if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
   if (!Number.isFinite(priceNano) || priceNano <= 0) return res.status(400).json({ ok: false, reason: 'BAD_PRICE' });
 
-  const foundAt = Date.now();
-  const buyStart = Date.now();
   const r = await mrktBuy({ id, priceNano });
-  const boughtAt = Date.now();
-  const latencyMs = boughtAt - buyStart;
-
   if (!r.ok) return res.status(502).json({ ok: false, reason: r.reason });
 
   const g = r.okItem?.userGift || null;
   const title = `${g?.collectionTitle || g?.collectionName || g?.title || 'Gift'}${g?.number != null ? ` #${g.number}` : ''}`;
   const priceTon = priceNano / 1e9;
-  const giftName = g?.name || giftNameFallbackFromCollectionAndNumber(g?.collectionTitle || g?.collectionName || g?.title || '', g?.number) || '';
-  const urlTelegram = giftName ? `https://t.me/nft/${giftName}` : '';
-  const urlMarket = mrktLotUrlFromId(id);
-
-  const u = getOrCreateUser(req.userId);
-  pushPurchase(u, {
-    tsListed: null,
-    tsFound: foundAt,
-    tsBought: boughtAt,
-    latencyMs,
-    title,
-    priceTon,
-    urlTelegram,
-    urlMarket,
-    giftName,
-    model: g?.modelTitle || g?.modelName || '',
-    backdrop: g?.backdropName || '',
-    collection: g?.collectionTitle || g?.collectionName || '',
-  });
-  scheduleSave();
-
   res.json({ ok: true, title, priceTon });
 });
 
@@ -1605,7 +1714,7 @@ app.post('/api/sub/set_autobuy_max', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// admin
+// admin status + token update + force refresh
 app.get('/api/admin/status', auth, async (req, res) => {
   if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
   const mask = MRKT_AUTH_RUNTIME ? MRKT_AUTH_RUNTIME.slice(0, 4) + '…' + MRKT_AUTH_RUNTIME.slice(-4) : '';
@@ -1616,6 +1725,7 @@ app.get('/api/admin/status', auth, async (req, res) => {
     mrktLastFailStatus: mrktState.lastFailStatus || null,
     mrktLastFailEndpoint: mrktState.lastFailEndpoint || null,
     autoBuy: { ...autoBuyDebug },
+    haveInitData: !!(adminInitDataRuntime || (await loadAdminInitDataFromRedis())),
   });
 });
 
@@ -1638,6 +1748,13 @@ app.post('/api/admin/mrkt_auth', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/admin/mrkt_refresh', auth, async (req, res) => {
+  if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
+  const r = await tryRefreshMrktToken('manual');
+  if (!r.ok) return res.status(400).json({ ok: false, reason: r.reason || 'REFRESH_FAILED' });
+  res.json({ ok: true });
+});
+
 // start server
 const port = Number(process.env.PORT || 3000);
 app.listen(port, '0.0.0.0', () => console.log('Web listening on', port));
@@ -1652,6 +1769,7 @@ setInterval(() => { autoBuyCycle().catch((e) => console.error('autobuy error:', 
     await initRedis();
     if (redis) {
       await loadMrktAuthFromRedis();
+      adminInitDataRuntime = await loadAdminInitDataFromRedis();
       await loadState();
     }
   } else {
