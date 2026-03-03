@@ -1,17 +1,17 @@
 {
   "name": "ton-bot",
   "version": "1.0.0",
-  "private": true,
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "redis": "^4.7.0"
+  },
   "engines": {
     "node": ">=18"
-  },
-  "dependencies": {
-    "express": "^4.18.3",
-    "node-telegram-bot-api": "^0.61.0",
-    "redis": "^4.7.0"
   }
 }
