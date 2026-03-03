@@ -1,225 +1,137 @@
 <!doctype html>
 <html lang="ru">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>ton-bot panel</title>
-  <style>
-   :root{
-  --bg:#0b0f14;
-  --card:#101826;
-  --text:#e5e7eb;
-  --muted:#9ca3af;
-  --border:#223044;
-  --input:#0f172a;
-  --btn:#182235;
-  --btnText:#e5e7eb;
-  --accent:#22c55e;
-  --danger:#ef4444;
-}
-*{box-sizing:border-box}
-body{margin:0;padding:14px;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
-h2{margin:0 0 10px 0;font-size:18px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px;margin:10px 0}
-label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
-.field{position:relative;flex:1 1 200px;min-width:140px}
-.inpWrap{position:relative}
-input{width:100%;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--input);color:var(--text);outline:none;font-size:13px}
-button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:var(--btn);color:var(--btnText);cursor:pointer}
-button:hover{filter:brightness(1.05)}
-.primary{border-color:var(--accent);color:#052e16;background:var(--accent);font-weight:950}
-.small{padding:8px 10px;border-radius:10px;font-size:13px}
-.xbtn{
-  position:absolute;right:8px;top:50%;transform:translateY(-50%);
-  width:20px;height:20px;border-radius:8px;border:1px solid rgba(255,255,255,.10);
-  background:rgba(255,255,255,.05);color:rgba(255,255,255,.55);cursor:pointer;
-  display:flex;align-items:center;justify-content:center
-}
-.hr{height:1px;background:var(--border);margin:10px 0}
-.muted{color:var(--muted);font-size:12px}
-#err{display:none;border-color:var(--danger);color:#ffd1d1;white-space:pre-wrap;word-break:break-word}
-
-.tabs{display:flex;gap:8px;flex-wrap:wrap}
-.tabbtn{border-radius:999px;padding:8px 12px;font-size:13px}
-.tabbtn.active{border-color:var(--accent);color:var(--accent)}
-
-.sug{
-  border:1px solid var(--border);
-  border-radius:14px;
-  overflow:auto;
-  background:var(--card);
-  max-height:380px;
-  position:absolute;
-  top:calc(100% + 6px);left:0;right:0;
-  z-index:9999;
-  box-shadow:0 14px 40px rgba(0,0,0,.45)
-}
-.sugHead{
-  display:flex;justify-content:space-between;align-items:center;
-  padding:8px 10px;border-bottom:1px solid var(--border);
-  position:sticky;top:0;background:var(--card);z-index:2
-}
-.sugHead b{font-size:13px}
-.sug .item{
-  width:100%;
-  text-align:left;
-  border:0;
-  background:transparent;
-  padding:10px;
-  display:flex;
-  gap:10px;
-  align-items:center
-}
-.sug .item:hover{background:rgba(255,255,255,.06)}
-
-.thumb{
-  width:44px;height:44px;border-radius:14px;
-  object-fit:cover;
-  background:rgba(255,255,255,.06);
-  border:1px solid var(--border);
-  flex:0 0 auto
-}
-
-/* Backdrop color must fill the whole square */
-.thumb.color{padding:0;background:transparent;display:flex;align-items:center;justify-content:center}
-.colorFill{
-  width:100%;height:100%;
-  border-radius:14px;
-  border:1px solid rgba(255,255,255,.12)
-}
-
-.selMark{
-  margin-left:auto;
-  width:22px;height:22px;
-  border-radius:10px;
-  border:1px solid rgba(255,255,255,.12);
-  display:flex;align-items:center;justify-content:center;
-  color:rgba(255,255,255,.8);
-  background:rgba(255,255,255,.04);
-  flex:0 0 auto;
-}
-.selMark.on{
-  border-color:rgba(34,197,94,.6);
-  color:#052e16;
-  background:rgba(34,197,94,.95);
-  font-weight:900;
-}
-
-.dot{width:14px;height:14px;border-radius:999px;border:1px solid var(--border);display:inline-block}
-
-.grid{display:grid;gap:10px;margin-top:10px;grid-template-columns:repeat(auto-fill,minmax(170px,1fr))}
-@media (max-width:520px){.grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
-.lot{border:1px solid var(--border);border-radius:16px;padding:10px;background:rgba(255,255,255,.02);cursor:pointer}
-.lot img{width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:14px;border:1px solid var(--border)}
-.price{font-size:15px;font-weight:950;margin-top:8px}
-.ellipsis{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.badge{padding:4px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted);font-size:12px}
-
-.hintBox{border:1px solid var(--border);border-radius:14px;padding:10px;background:rgba(255,255,255,.02);color:var(--muted);font-size:12px;margin-top:10px}
-
-.loaderLine{display:none;align-items:center;gap:10px;color:var(--muted);font-size:12px;margin-top:10px}
-.spinner{width:16px;height:16px;border-radius:999px;border:3px solid rgba(255,255,255,.2);border-top-color:var(--accent);animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-/* bottom sheet */
-.sheetWrap{
-  position:fixed;inset:0;
-  background:rgba(0,0,0,.35);
-  display:flex;align-items:flex-end;justify-content:center;
-  z-index:50000;padding:10px;
-  opacity:0;visibility:hidden;pointer-events:none;
-  transition:opacity .18s ease,visibility .18s ease
-}
-.sheetWrap.show{opacity:1;visibility:visible;pointer-events:auto}
-.sheet{
-  width:min(980px,96vw);height:min(80vh,860px);
-  background:var(--card);border:1px solid var(--border);
-  border-radius:22px 22px 14px 14px;
-  padding:12px;
-  box-shadow:0 30px 90px rgba(0,0,0,.5);
-  display:flex;flex-direction:column;gap:10px;
-  transform:translateY(20px);transition:transform .18s ease
-}
-.sheetWrap.show .sheet{transform:translateY(0)}
-.handle{width:44px;height:5px;border-radius:999px;background:rgba(255,255,255,.18);align-self:center}
-.sheetHeader{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
-.sheetBody{overflow:auto}
-.sheetImg{width:100%;max-height:240px;object-fit:cover;border-radius:14px;border:1px solid var(--border);background:rgba(255,255,255,.03)}
-.kv{display:flex;gap:10px;flex-wrap:wrap}
-.kv .p{padding:6px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px;color:var(--muted)}
-.sale{border:1px solid var(--border);border-radius:12px;padding:10px;background:rgba(255,255,255,.02)}
-
-.purchRow{display:flex;gap:10px;align-items:center}
-.purchRow img{width:52px;height:52px;border-radius:14px;border:1px solid var(--border);object-fit:cover;background:rgba(255,255,255,.03);flex:0 0 auto}
-
-/* scrollbar style (smaller, not outside) */
-*::-webkit-scrollbar{width:8px;height:8px}
-*::-webkit-scrollbar-thumb{
-  background:rgba(255,255,255,.14);
-  border-radius:999px;
-  border:2px solid transparent;
-  background-clip:padding-box
-}
-*::-webkit-scrollbar-track{background:transparent}
-  </style>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>MRKT Panel</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <h2>Панель управления</h2>
+  <h2 id="title">MRKT Panel</h2>
+  <div id="err" class="card" style="display:none"></div>
 
-  <div id="err" class="card" style="border-color:#c33"></div>
-  <div id="status" class="card">Загрузка…</div>
-
-  <div class="card">
-    <h3>Фильтры</h3>
-    <div class="row">
-      <div>
-        <label>Gift (collection)</label>
-        <select id="gift"></select>
-      </div>
-      <div>
-        <label>Model</label>
-        <input id="model" placeholder="Любая" />
-      </div>
-      <div>
-        <label>Backdrop</label>
-        <input id="backdrop" placeholder="Любой" />
-      </div>
-    </div>
-
-    <div class="row" style="margin-top:10px">
-      <div>
-        <label>Min TON</label>
-        <input id="minPrice" type="number" step="0.001" />
-      </div>
-      <div>
-        <label>Max TON</label>
-        <input id="maxPrice" type="number" step="0.001" />
-      </div>
-    </div>
-
-    <div class="row" style="margin-top:10px">
-      <button id="save">Сохранить</button>
-      <button id="toggleMonitor">Мониторинг: ?</button>
-      <button id="toggleAutobuy">Автопокупка: ?</button>
-    </div>
+  <div class="tabs">
+    <button class="tabbtn active" data-tab="market">Market</button>
+    <button class="tabbtn" data-tab="subs">Subscriptions</button>
+    <button class="tabbtn" data-tab="profile">Profile</button>
+    <button class="tabbtn" data-tab="admin" id="adminTabBtn" style="display:none">Admin</button>
   </div>
 
-  <div class="card">
+  <div id="market" class="card">
+    <h3>Поиск</h3>
+
+    <div class="row">
+      <div class="field">
+        <label>Gift (можно несколько)</label>
+        <div class="inpWrap">
+          <input id="gift" placeholder="Нажми чтобы выбрать" autocomplete="off"/>
+          <button class="xbtn" data-clear="gift" type="button">×</button>
+        </div>
+        <div id="giftSug" class="sug" style="display:none"></div>
+      </div>
+
+      <div class="field">
+        <label>Model (только если 1 gift)</label>
+        <div class="inpWrap">
+          <input id="model" placeholder="Нажми чтобы выбрать" autocomplete="off"/>
+          <button class="xbtn" data-clear="model" type="button">×</button>
+        </div>
+        <div id="modelSug" class="sug" style="display:none"></div>
+      </div>
+
+      <div class="field">
+        <label>Backdrop (только если 1 gift)</label>
+        <div class="inpWrap">
+          <input id="backdrop" placeholder="Нажми чтобы выбрать" autocomplete="off"/>
+          <button class="xbtn" data-clear="backdrop" type="button">×</button>
+        </div>
+        <div id="backdropSug" class="sug" style="display:none"></div>
+      </div>
+
+      <div class="field" style="max-width:160px">
+        <label>Number prefix</label>
+        <div class="inpWrap">
+          <input id="number" placeholder="№" inputmode="numeric"/>
+          <button class="xbtn" data-clear="number" type="button">×</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:10px">
+      <button id="apply" class="primary">Показать</button>
+      <button id="refresh">Обновить</button>
+      <button id="salesBtn">Продажи</button>
+      <button id="toProfile" class="small">Покупки</button>
+    </div>
+
+    <div id="lotsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка лотов…</div></div>
+
+    <div id="maxOfferBox" class="hintBox" style="display:none"></div>
+
+    <div id="status" class="muted" style="margin-top:10px"></div>
+    <div class="hr"></div>
+    <div><b>Лоты</b> <span class="muted">(клик → меню)</span></div>
+    <div id="lots" class="grid"></div>
+  </div>
+
+  <div id="subs" class="card" style="display:none">
     <h3>Подписки</h3>
     <div class="row">
-      <button id="subCreate">➕ Создать из текущих фильтров</button>
-      <button id="refresh">🔄 Обновить</button>
+      <button id="subCreate">Создать из текущих фильтров</button>
+      <button id="subRefresh">Обновить</button>
     </div>
-    <div id="subs" style="margin-top:10px"></div>
+    <div id="subsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка подписок…</div></div>
+    <div id="subsList" style="margin-top:10px"></div>
   </div>
 
-  <div class="card">
-    <h3>Логи</h3>
-    <button id="logsRefresh">🔄 Обновить</button>
-    <div id="logs" style="margin-top:10px"></div>
+  <div id="profile" class="card" style="display:none">
+    <h3>Профиль</h3>
+    <div class="row" style="align-items:center">
+      <img id="pfp" class="thumb" style="display:none"/>
+      <div id="profileBox" class="muted">Загрузка…</div>
+    </div>
+    <div id="profileLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка…</div></div>
+    <div class="hr"></div>
+    <div><b>История покупок</b></div>
+    <div id="purchases" style="margin-top:10px;display:flex;flex-direction:column;gap:10px"></div>
   </div>
 
+  <div id="admin" class="card" style="display:none">
+    <h3>Admin</h3>
+    <div id="adminStatus" class="muted">Загрузка…</div>
+    <div class="hr"></div>
+    <div class="muted">Обновление MRKT_AUTH без перезапуска (сохранится в Redis).</div>
+    <div class="row" style="margin-top:10px">
+      <div class="field"><label>Текущий токен (маска)</label><input id="tokMask" disabled/></div>
+      <div class="field"><label>Новый MRKT_AUTH</label><input id="tokNew" placeholder="вставь токен"/></div>
+      <button id="tokSave">Сохранить</button>
+    </div>
+  </div>
+
+  <!-- Bottom Sheet -->
+  <div id="sheetWrap" class="sheetWrap">
+    <div class="sheet">
+      <div class="handle"></div>
+      <div class="sheetHeader">
+        <div>
+          <div id="sheetTitle" style="font-weight:950"></div>
+          <div id="sheetSub" class="muted"></div>
+        </div>
+        <button id="sheetClose" class="small">✕</button>
+      </div>
+
+      <img id="sheetImg" class="sheetImg" style="display:none" />
+      <div id="sheetTop" class="muted"></div>
+      <div class="kv" id="sheetKV"></div>
+      <div class="row" id="sheetBtns"></div>
+
+      <div class="hr"></div>
+      <div><b>История продаж</b> <span class="muted">(примерная цена продажи + последние сделки)</span></div>
+      <div id="sheetSales" class="sheetBody"></div>
+    </div>
+  </div>
+
+  <!-- Telegram WebApp -->
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script src="/app.js"></script>
 </body>
