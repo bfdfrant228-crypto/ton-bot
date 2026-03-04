@@ -69,3 +69,5 @@ button:hover{filter:brightness(1.05)}
 
 .swatches{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .swatch{width:14px;height:14px;border-radius:50%;border:1px solid var(--border)}
+.field.open { z-index: 999999; }
+.sug { z-index: 1000000; }
