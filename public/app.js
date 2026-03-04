@@ -232,26 +232,16 @@
     const sheetWrap = el('sheetWrap');
     const sheetTitle = el('sheetTitle');
     const sheetSub = el('sheetSub');
-    const sheetTop = el('sheetTop');
-    const sheetKV = el('sheetKV');
-    const sheetBtns = el('sheetBtns');
     const sheetSales = el('sheetSales');
-    const sheetImg = el('sheetImg');
     el('sheetClose').onclick = ()=>sheetWrap.classList.remove('show');
     sheetWrap.addEventListener('click',(e)=>{ if(e.target===sheetWrap) sheetWrap.classList.remove('show'); });
 
     function openSheet(title, sub){
       sheetTitle.textContent=title||'';
       sheetSub.textContent=sub||'';
-      sheetTop.textContent='';
-      sheetKV.innerHTML='';
-      sheetBtns.innerHTML='';
       sheetSales.innerHTML='';
-      sheetImg.style.display='none';
-      sheetImg.src='';
       sheetWrap.classList.add('show');
     }
-    function pill(txt){ return `<div class="p">${txt}</div>`; }
 
     function renderSales(resp){
       if(!resp || resp.ok===false){
@@ -272,7 +262,7 @@
 
       html += items.slice(0, 20).map(x=>{
         const img = x.imgUrl ? `<img src="${x.imgUrl}" referrerpolicy="no-referrer" loading="lazy" style="width:60px;height:60px;border-radius:14px;border:1px solid var(--border);object-fit:cover;flex:0 0 auto"/>` : `<div class="thumb"></div>`;
-        return `<div class="sale">
+        return `<div class="sale" style="margin-bottom:8px">
           <div style="display:flex;gap:10px;align-items:center">
             ${img}
             <div style="min-width:0;flex:1">
@@ -289,7 +279,7 @@
             <button class="small" data-open="${x.urlMarket}">MRKT</button>
           </div>
         </div>`;
-      }).join('<div style="height:8px"></div>');
+      }).join('');
 
       sheetSales.innerHTML = html;
     }
@@ -303,7 +293,7 @@
       box.innerHTML = lots.map(x=>{
         const img = x.imgUrl ? `<img src="${x.imgUrl}" referrerpolicy="no-referrer" loading="lazy"/>` : '<div style="aspect-ratio:1/1;border:1px solid rgba(255,255,255,.10);border-radius:14px"></div>';
         const num = (x.number!=null)?(`<span class="badge">#${x.number}</span>`):'';
-        return `<div class="lot" data-id="${x.id}">
+        return `<div class="lot">
           ${img}
           <div class="price">${x.priceTon.toFixed(3)} TON</div>
           <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
@@ -313,84 +303,19 @@
           ${x.backdrop?`<div class="muted ellipsis" style="margin-top:6px">Backdrop: ${x.backdrop}</div>`:''}
         </div>`;
       }).join('');
-
-      const map = new Map(lots.map(l => [String(l.id), l]));
-      box.querySelectorAll('.lot').forEach(node=>{
-        node.onclick = wrap('lots', async()=>{
-          const id = node.getAttribute('data-id');
-          const lot = map.get(String(id));
-          if(!lot) return;
-
-          openSheet('Лот', lot.name);
-
-          if (lot.imgUrl) { sheetImg.style.display='block'; sheetImg.src = lot.imgUrl; sheetImg.referrerPolicy='no-referrer'; }
-
-          sheetTop.innerHTML =
-            `<div><b>Цена:</b> ${lot.priceTon.toFixed(3)} TON</div>` +
-            (lot.model?`<div class="muted">Model: ${lot.model}</div>`:'') +
-            (lot.backdrop?`<div class="muted">Backdrop: ${lot.backdrop}</div>`:'');
-
-          const det = await api('/api/lot/details', { method:'POST', body: JSON.stringify({ id: lot.id }) });
-
-          sheetKV.innerHTML = [
-            pill('Max offer (exact): <b>'+(det.offers.exact!=null?det.offers.exact.toFixed(3)+' TON':'—')+'</b>'),
-            pill('Max offer (collection): <b>'+(det.offers.collection!=null?det.offers.collection.toFixed(3)+' TON':'—')+'</b>'),
-            pill('Floor (exact): <b>'+(det.floors.exact!=null?det.floors.exact.toFixed(3)+' TON':'—')+'</b>'),
-            pill('Floor (collection): <b>'+(det.floors.collection!=null?det.floors.collection.toFixed(3)+' TON':'—')+'</b>'),
-          ].join('');
-
-          sheetBtns.innerHTML = '';
-          const mkBtn = (label, action, strong=false) => {
-            const b = document.createElement('button');
-            b.className = 'small';
-            b.textContent = label;
-            if (strong){
-              b.style.borderColor='var(--accent)';
-              b.style.background='var(--accent)';
-              b.style.color='#052e16';
-              b.style.fontWeight='900';
-            }
-            b.onclick = action;
-            sheetBtns.appendChild(b);
-          };
-
-          mkBtn('Buy', async()=>{
-            const ok = confirm('Купить?\n'+lot.name+'\nЦена: '+lot.priceTon.toFixed(3)+' TON');
-            if(!ok) return;
-            const r = await api('/api/mrkt/buy', { method:'POST', body: JSON.stringify({ id: lot.id, priceNano: lot.priceNano }) });
-            alert('Куплено: '+r.title+' за '+r.priceTon.toFixed(3)+' TON');
-          }, true);
-
-          mkBtn('NFT', ()=> tg?.openTelegramLink ? tg.openTelegramLink(lot.urlTelegram) : window.open(lot.urlTelegram,'_blank'));
-          mkBtn('MRKT', ()=> tg?.openTelegramLink ? tg.openTelegramLink(lot.urlMarket) : window.open(lot.urlMarket,'_blank'));
-
-          renderSales(det.salesHistory);
-        });
-      });
     }
 
     function renderSubs(list){
       const box = el('subsList');
       if(!list || !list.length){ box.innerHTML = '<i class="muted">Подписок нет</i>'; return; }
       box.innerHTML = list.map(s => {
-        const img = s.thumbUrl ? `<img class="thumb" src="${s.thumbUrl}" referrerpolicy="no-referrer"/>` : `<div class="thumb"></div>`;
         return `<div class="card">
-          <div style="display:flex;gap:10px;align-items:center">
-            ${img}
+          <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
             <div style="min-width:0;flex:1">
               <b>#${s.num} ${s.enabled?'ON':'OFF'}</b>
               <div class="muted ellipsis">Gifts: ${(s.filters.gifts||[]).join(', ') || '-'}</div>
             </div>
-            <button class="small" data-act="subInfo" data-id="${s.id}">Info</button>
-          </div>
-          <div class="muted">Notify max: ${s.maxNotifyTon==null?'∞':s.maxNotifyTon} TON</div>
-          <div class="muted">AutoBuy: ${s.autoBuyEnabled?'ON':'OFF'} | Max: ${s.maxAutoBuyTon==null?'-':s.maxAutoBuyTon} TON</div>
-          <div class="row" style="margin-top:8px">
-            <button class="small" data-act="subNotifyMax" data-id="${s.id}">Max Notify</button>
-            <button class="small" data-act="subAutoMax" data-id="${s.id}">Max AutoBuy</button>
-            <button class="small" data-act="subAutoToggle" data-id="${s.id}">${s.autoBuyEnabled?'AutoBuy OFF':'AutoBuy ON'}</button>
             <button class="small" data-act="subToggle" data-id="${s.id}">${s.enabled?'Disable':'Enable'}</button>
-            <button class="small" data-act="subDel" data-id="${s.id}">Delete</button>
           </div>
         </div>`;
       }).join('');
@@ -398,6 +323,7 @@
 
     async function refreshState(){
       const st = await api('/api/state');
+
       sel.gifts = st.user.filters.gifts || [];
       sel.giftLabels = st.user.filters.giftLabels || {};
       sel.models = st.user.filters.models || [];
@@ -409,7 +335,6 @@
       el('backdrop').value = listInputText(sel.backdrops);
 
       renderSubs(st.user.subscriptions || []);
-
       if (st.api.isAdmin) el('adminTabBtn').style.display = 'inline-block';
     }
 
@@ -429,33 +354,10 @@
         const r = await api('/api/profile');
         const u=r.user||{};
         el('profileBox').textContent = (u.username?('@'+u.username+' '):'') + 'id: '+(u.id||'-');
-
         const pfp = el('pfp');
         if (u.photo_url) { pfp.style.display='block'; pfp.src=u.photo_url; pfp.referrerPolicy='no-referrer'; }
         else { pfp.style.display='none'; pfp.src=''; }
-
-        const list=r.purchases||[];
-        const box=el('purchases');
-        box.innerHTML = list.length
-          ? list.map(p=>{
-              const img = p.imgUrl ? `<img src="${p.imgUrl}" referrerpolicy="no-referrer" loading="lazy"/>` : '';
-              return `<div class="card">
-                <div class="purchRow">${img || '<div class="thumb"></div>'}
-                  <div style="min-width:0">
-                    <div class="ellipsis"><b>${p.title}</b></div>
-                    ${p.lotId ? `<div class="muted">ID: ${p.lotId}</div>` : ''}
-                  </div>
-                </div>
-                <div class="muted" style="margin-top:8px">Found: ${p.foundMsk||'-'}</div>
-                <div class="muted">Buy: ${p.boughtMsk||'-'} ${p.latencyMs!=null?(' · '+p.latencyMs+'ms'):''}</div>
-                <div class="muted">Price: ${Number(p.priceTon).toFixed(3)} TON</div>
-                <div class="row" style="margin-top:8px">
-                  ${p.urlTelegram?`<button class="small" data-open="${p.urlTelegram}">NFT</button>`:''}
-                  ${p.urlMarket?`<button class="small" data-open="${p.urlMarket}">MRKT</button>`:''}
-                </div>
-              </div>`;
-            }).join('')
-          : '<i class="muted">Покупок пока нет</i>';
+        el('purchases').innerHTML = '<i class="muted">Профиль в этой сборке минимальный</i>';
       } finally {
         setLoading('profile', false);
       }
@@ -464,11 +366,10 @@
     async function refreshAdmin(){
       const r = await api('/api/admin/status');
       el('adminStatus').textContent =
-        'haveInitData: ' + (r.haveInitData?'YES':'NO') + '\n' +
+        'haveSession: ' + (r.haveSession?'YES':'NO') + '\n' +
         'mrktAuthSet: ' + (r.mrktAuthSet?'YES':'NO') + '\n' +
-        'MRKT fail: ' + (r.mrktLastFailMsg || '-') + '\n' +
-        'endpoint: ' + (r.mrktLastFailEndpoint || '-') + '\n' +
-        'status: ' + (r.mrktLastFailStatus || '-') + '\n';
+        'pauseUntil(ms): ' + (r.pauseUntil||0) + '\n' +
+        'MRKT fail: ' + (r.lastFailMsg || '-') + '\n';
     }
 
     // buttons
@@ -491,27 +392,6 @@
 
       wrap('subs', async()=>{
         if(act==='subToggle') await api('/api/sub/toggle',{method:'POST',body:JSON.stringify({id})});
-        if(act==='subDel') await api('/api/sub/delete',{method:'POST',body:JSON.stringify({id})});
-
-        if(act==='subNotifyMax'){
-          const v = prompt('Max Notify TON (пусто = без лимита):', '');
-          if (v == null) return;
-          await api('/api/sub/set_notify_max',{method:'POST',body:JSON.stringify({id, maxNotifyTon: v})});
-        }
-        if(act==='subAutoToggle'){
-          await api('/api/sub/toggle_autobuy',{method:'POST',body:JSON.stringify({id})});
-        }
-        if(act==='subAutoMax'){
-          const v = prompt('Max AutoBuy TON:', '');
-          if (v == null) return;
-          await api('/api/sub/set_autobuy_max',{method:'POST',body:JSON.stringify({id, maxAutoBuyTon: v})});
-        }
-        if(act==='subInfo'){
-          const r = await api('/api/sub/details',{method:'POST',body:JSON.stringify({id})});
-          openSheet('Подписка', '#'+r.sub.num+' '+(r.sub.enabled?'ON':'OFF'));
-          renderSales(r.salesHistory);
-        }
-
         await refreshState();
       })();
     });
