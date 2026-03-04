@@ -64,11 +64,3 @@ button:hover{filter:brightness(1.05)}
 .sale{border:1px solid var(--border);border-radius:12px;padding:10px;background:rgba(255,255,255,.02)}
 .purchRow{display:flex;gap:10px;align-items:center}
 .purchRow img{width:52px;height:52px;border-radius:14px;border:1px solid var(--border);object-fit:cover;background:rgba(255,255,255,.03);flex:0 0 auto}
-
-/* scrollbar */
-*::-webkit-scrollbar{width:8px;height:8px}
-*::-webkit-scrollbar-thumb{background:rgba(255,255,255,.14);border-radius:999px;border:2px solid transparent;background-clip:padding-box}
-*::-webkit-scrollbar-track{background:transparent}
-
-.swatches{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
-.swatch{width:14px;height:14px;border-radius:50%;border:1px solid var(--border)}
