@@ -1,14 +1,11 @@
 /**
- * ton-bot v15.5 (MRKT)
- *
- * Key changes:
- * - Token refresh /auth uses ONLY JSON body exactly like DevTools:
- *   { appId: null, data: "<mrkt initData>", photo: "<url>" }
- * - Adds Admin UI API to store MRKT initData+photo ("MRKT session") in Redis.
- * - Adds MRKT request queue + min gap + 429 pause by Retry-After.
+ * ton-bot v15.6 (MRKT)
+ * - Stable MRKT token refresh via saved MRKT session (data+photo) from DevTools /api/v1/auth
+ * - MRKT request queue + min-gap + 429 pause (Retry-After)
+ * - Restored rich UI: lots grid + bottom sheet + sales history, subs thumbs/swatches, profile purchases
  *
  * Node 18+
- * deps: express, node-telegram-bot-api, redis(optional)
+ * deps: express, node-telegram-bot-api, redis(optional but recommended)
  */
 
 const TelegramBot = require('node-telegram-bot-api');
@@ -16,11 +13,12 @@ const express = require('express');
 const crypto = require('crypto');
 const { Readable } = require('stream');
 
-// ===================== ENV =====================
+// =============== ENV ===============
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_TOKEN not set'); process.exit(1); }
 
 const MODE = process.env.MODE || 'real';
+
 const APP_TITLE = String(process.env.APP_TITLE || 'Панель');
 const WEBAPP_URL = process.env.WEBAPP_URL || null;
 
@@ -40,54 +38,68 @@ const FRAGMENT_GIFT_IMG_BASE = (process.env.FRAGMENT_GIFT_IMG_BASE || 'https://n
 
 let MRKT_AUTH_RUNTIME = (process.env.MRKT_AUTH || '').trim() || null;
 
-// MRKT throttle / 429
+// Throttle / RPS
 const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 12000);
 const MRKT_MIN_GAP_MS = Number(process.env.MRKT_MIN_GAP_MS || 250);
 const MRKT_429_DEFAULT_PAUSE_MS = Number(process.env.MRKT_429_DEFAULT_PAUSE_MS || 4000);
 
-// MRKT limits
+// Limits
 const MRKT_COUNT = Number(process.env.MRKT_COUNT || 25);
 const MRKT_ORDERS_COUNT = Number(process.env.MRKT_ORDERS_COUNT || 30);
 
-// UI limits
+// WebApp limits
 const WEBAPP_SUGGEST_LIMIT = Number(process.env.WEBAPP_SUGGEST_LIMIT || 120);
 const WEBAPP_LOTS_LIMIT = Number(process.env.WEBAPP_LOTS_LIMIT || 40);
 const WEBAPP_LOTS_PAGES = Number(process.env.WEBAPP_LOTS_PAGES || 1);
 
-// global view: do NOT scan many collections, otherwise 429
-const WEBAPP_GLOBAL_COLLECTIONS_LIMIT = Number(process.env.WEBAPP_GLOBAL_COLLECTIONS_LIMIT || 30); // show floors from collections only (no /saling)
-const LOTS_CACHE_TTL_MS = Number(process.env.LOTS_CACHE_TTL_MS || 2500);
+// If gift not selected: show collection floors (safe) instead of hammering /saling
+const WEBAPP_GLOBAL_COLLECTIONS_LIMIT = Number(process.env.WEBAPP_GLOBAL_COLLECTIONS_LIMIT || 30);
 
-// subs/autobuy minimal
-const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 12000);
+// Caches
+const LOTS_CACHE_TTL_MS = Number(process.env.LOTS_CACHE_TTL_MS || 2500);
+const DETAILS_CACHE_TTL_MS = Number(process.env.DETAILS_CACHE_TTL_MS || 3500);
+const THUMBS_CACHE_TTL_MS = Number(process.env.THUMBS_CACHE_TTL_MS || 5 * 60_000);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60_000);
+const OFFERS_CACHE_TTL_MS = Number(process.env.OFFERS_CACHE_TTL_MS || 15_000);
+
+// Subs/autobuy
+const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 15000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 6);
 
-const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '0') === '1'; // safe default OFF
+const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '0') === '1';
 const AUTO_BUY_DRY_RUN = String(process.env.AUTO_BUY_DRY_RUN || '1') === '1';
 const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 5000);
 const AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE = Number(process.env.AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE || 1);
 const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 60_000);
+
+// Sales history
+const SALES_HISTORY_TARGET = Number(process.env.SALES_HISTORY_TARGET || 24);
+const SALES_HISTORY_MAX_PAGES = Number(process.env.SALES_HISTORY_MAX_PAGES || 30);
+const SALES_HISTORY_COUNT_PER_PAGE = Number(process.env.SALES_HISTORY_COUNT_PER_PAGE || 50);
+const SALES_HISTORY_THROTTLE_MS = Number(process.env.SALES_HISTORY_THROTTLE_MS || 180);
+const SALES_HISTORY_TIME_BUDGET_MS = Number(process.env.SALES_HISTORY_TIME_BUDGET_MS || 15000);
+
+// Refresh cooldown
+const MRKT_AUTH_REFRESH_COOLDOWN_MS = Number(process.env.MRKT_AUTH_REFRESH_COOLDOWN_MS || 8000);
+const MRKT_AUTH_NOTIFY_COOLDOWN_MS = Number(process.env.MRKT_AUTH_NOTIFY_COOLDOWN_MS || 60 * 60 * 1000);
 
 // Redis keys
 const REDIS_KEY_STATE = 'bot:state:main';
 const REDIS_KEY_MRKT_AUTH = 'mrkt:auth:token';
 const REDIS_KEY_MRKT_SESSION = 'mrkt:session:admin'; // { data, photo }
 
-console.log('v15.5 boot', {
-  MODE,
-  PUBLIC_URL,
-  WEBAPP_URL,
-  ADMIN_USER_ID,
+console.log('v15.6 boot', {
+  MODE, PUBLIC_URL, WEBAPP_URL, ADMIN_USER_ID,
   REDIS: !!REDIS_URL,
   MRKT_AUTH_SET: !!MRKT_AUTH_RUNTIME,
   MRKT_MIN_GAP_MS,
 });
 
-// ===================== Telegram =====================
+// =============== Telegram ===============
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 const MAIN_KEYBOARD = { keyboard: [[{ text: '📌 Статус' }]], resize_keyboard: true };
 
-// ===================== Redis =====================
+// =============== Redis ===============
 let redis = null;
 async function initRedis() {
   if (!REDIS_URL) return;
@@ -111,7 +123,7 @@ async function redisSet(key, val, opts) {
   try { await redis.set(key, val, opts); } catch {}
 }
 
-// ===================== State =====================
+// =============== State ===============
 const users = new Map();
 const subStates = new Map();
 const autoBuyRecentAttempts = new Map();
@@ -130,20 +142,23 @@ const mrktState = {
 };
 
 let mrktQueue = Promise.resolve();
-const lotsCache = new Map(); // key -> {time, data}
 
 // caches
-const CACHE_TTL_MS = 5 * 60_000;
+const lotsCache = new Map();      // key -> {time,data}
+const detailsCache = new Map();   // lotId -> {time,data}
 let collectionsCache = { time: 0, items: [] };
-const modelsCache = new Map();
-const backdropsCache = new Map();
-const offersCache = new Map();
-const OFFERS_CACHE_TTL_MS = 15_000;
+const modelsCache = new Map();     // gift -> {time,items}
+const backdropsCache = new Map();  // gift -> {time,items}
+const offersCache = new Map();     // key -> {time,data}
+const thumbsCache = new Map();     // key -> {time, thumbUrl, swatches}
 
 // MRKT session runtime
-let mrktSessionRuntime = null; // { data, photo }
+let mrktSessionRuntime = null; // {data, photo}
+let isRefreshing = false;
+let lastRefreshAt = 0;
+let lastNotifiedAt = 0;
 
-// ===================== helpers =====================
+// =============== Helpers ===============
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const nowMs = () => Date.now();
 
@@ -259,14 +274,13 @@ function streamFetchToRes(r, res, fallbackContentType) {
   r.arrayBuffer().then((ab) => res.end(Buffer.from(ab))).catch(() => res.status(502).end('bad gateway'));
 }
 
-// ===================== bot state persistence =====================
+// =============== Persistence (bot state) ===============
 function normalizeFilters(f) {
   const gifts = uniqNorm(ensureArray(f?.gifts || f?.gift));
   const giftLabels = (f?.giftLabels && typeof f.giftLabels === 'object') ? f.giftLabels : {};
   const models = uniqNorm(ensureArray(f?.models || f?.model));
   const backdrops = uniqNorm(ensureArray(f?.backdrops || f?.backdrop));
   const numberPrefix = cleanDigitsPrefix(f?.numberPrefix || '');
-
   return {
     gifts,
     giftLabels,
@@ -289,13 +303,6 @@ function getOrCreateUser(userId) {
   return users.get(userId);
 }
 
-function userChatId(userId) {
-  const u = users.get(userId);
-  const cid = u?.chatId;
-  if (cid && Number.isFinite(Number(cid))) return Number(cid);
-  return userId;
-}
-
 function renumberSubs(user) {
   const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
   subs.forEach((s, idx) => { if (s) s.num = idx + 1; });
@@ -308,7 +315,6 @@ function findSub(user, id) {
 function makeSubFromCurrentFilters(user) {
   const f = normalizeFilters(user.filters || {});
   if (!f.gifts.length && !f.numberPrefix) return { ok: false, reason: 'NO_GIFT_AND_NO_NUMBER' };
-
   const sub = {
     id: `sub_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
     num: (user.subscriptions || []).length + 1,
@@ -319,6 +325,24 @@ function makeSubFromCurrentFilters(user) {
     filters: JSON.parse(JSON.stringify(f)),
   };
   return { ok: true, sub };
+}
+
+function pushPurchase(user, entry) {
+  if (!user.purchases) user.purchases = [];
+  user.purchases.unshift({
+    tsFound: entry.tsFound || null,
+    tsBought: entry.tsBought || Date.now(),
+    latencyMs: entry.latencyMs || null,
+    title: entry.title || '',
+    priceTon: entry.priceTon || 0,
+    urlTelegram: entry.urlTelegram || '',
+    urlMarket: entry.urlMarket || '',
+    giftName: entry.giftName || '',
+    model: entry.model || '',
+    backdrop: entry.backdrop || '',
+    lotId: entry.lotId || '',
+  });
+  user.purchases = user.purchases.slice(0, 250);
 }
 
 function exportState() {
@@ -362,6 +386,8 @@ function importState(parsed) {
       }));
     renumberSubs(safe);
 
+    safe.purchases = (safe.purchases || []).slice(0, 250).map((p) => ({ ...p, priceTon: Number(p.priceTon || 0) }));
+
     users.set(userId, safe);
   }
 }
@@ -376,7 +402,7 @@ function scheduleSave() {
   }, 250);
 }
 
-// ===================== WebApp initData verify (for OUR panel only) =====================
+// =============== WebApp initData verify (our panel) ===============
 function verifyTelegramWebAppInitData(initData) {
   if (!initData) return { ok: false, reason: 'NO_INIT_DATA' };
 
@@ -408,17 +434,14 @@ function verifyTelegramWebAppInitData(initData) {
   return { ok: true, userId, user };
 }
 
-// ===================== MRKT queue + gate =====================
+// =============== MRKT queue gate ===============
 async function mrktRunExclusive(fn) {
   const prev = mrktQueue;
   let release;
   mrktQueue = new Promise((r) => (release = r));
   await prev;
-  try {
-    return await fn();
-  } finally {
-    release();
-  }
+  try { return await fn(); }
+  finally { release(); }
 }
 
 async function mrktWaitGate() {
@@ -439,7 +462,7 @@ function setPauseFrom429(res) {
   mrktState.pauseUntil = Math.max(mrktState.pauseUntil || 0, until);
 }
 
-// ===================== MRKT /auth refresh (needs MRKT initData) =====================
+// =============== MRKT session store ===============
 async function loadMrktSessionFromRedis() {
   if (!redis) return null;
   const raw = await redisGet(REDIS_KEY_MRKT_SESSION);
@@ -464,16 +487,10 @@ async function notifyAdminOnce(msg) {
   try { await sendMessageSafe(ADMIN_USER_ID, msg, { disable_web_page_preview: true }); } catch {}
 }
 
-let isRefreshing = false;
-let lastRefreshAt = 0;
-
+// =============== MRKT auth refresh ===============
 async function mrktAuthWithSession(session) {
   const url = `${MRKT_API_URL}/auth`;
-  const body = {
-    appId: null,
-    data: String(session?.data || ''),
-    photo: session?.photo ?? null,
-  };
+  const body = { appId: null, data: String(session?.data || ''), photo: session?.photo ?? null };
 
   const res = await fetchWithTimeout(url, {
     method: 'POST',
@@ -494,12 +511,11 @@ async function mrktAuthWithSession(session) {
   let data = null;
   try { data = txt ? JSON.parse(txt) : null; } catch {}
 
-  if (!res.ok) {
-    return { ok: false, status: res.status, reason: extractMrktErrorMessage(txt) || `HTTP_${res.status}`, text: txt };
-  }
+  if (!res.ok) return { ok: false, status: res.status, reason: extractMrktErrorMessage(txt) || `HTTP_${res.status}`, text: txt };
 
   const token = data?.token || null;
   if (!token) return { ok: false, status: res.status, reason: 'NO_TOKEN_IN_RESPONSE', text: txt };
+
   return { ok: true, token: String(token), status: res.status };
 }
 
@@ -515,14 +531,14 @@ async function tryRefreshMrktToken(reason = 'auto', { force = false } = {}) {
     if (!session) session = await loadMrktSessionFromRedis();
 
     if (!session) {
-      await notifyAdminOnce('MRKT: нет сохранённой MRKT-сессии. Зайди в Admin и вставь data/photo из DevTools запроса /api/v1/auth.');
+      await notifyAdminOnce('MRKT: нет сохранённой MRKT session. В Admin вставь data/photo из DevTools запроса /api/v1/auth.');
       return { ok: false, reason: 'NO_MRKT_SESSION' };
     }
 
     const r = await mrktAuthWithSession(session);
     if (!r.ok) {
-      console.error('[MRKT AUTH] refresh failed:', r.status, r.reason, (r.text || '').slice(0, 300));
-      await notifyAdminOnce(`MRKT: не удалось обновить токен (${r.reason}). Проверь MRKT data/photo в Admin.`);
+      console.error('[MRKT AUTH] refresh failed:', r.status, r.reason, (r.text || '').slice(0, 260));
+      await notifyAdminOnce(`MRKT: не удалось обновить токен (${r.reason}). Обнови data/photo в Admin.`);
       return { ok: false, reason: r.reason };
     }
 
@@ -535,6 +551,7 @@ async function tryRefreshMrktToken(reason = 'auto', { force = false } = {}) {
     backdropsCache.clear();
     offersCache.clear();
     lotsCache.clear();
+    detailsCache.clear();
 
     console.log(`[MRKT AUTH] refreshed OK (${reason})`);
     return { ok: true };
@@ -549,7 +566,7 @@ async function ensureMrktAuth() {
   return !!r.ok;
 }
 
-// ===================== MRKT wrappers =====================
+// =============== MRKT wrappers ===============
 function markMrktOk() {
   mrktState.lastOkAt = nowMs();
   mrktState.lastFailAt = 0;
@@ -585,8 +602,8 @@ async function mrktGetJson(path, { retry = true } = {}) {
     }
 
     await mrktWaitGate();
-
     const url = `${MRKT_API_URL}${path}${path.includes('?') ? '&' : '?'}req=${encodeURIComponent(makeReq())}`;
+
     const res = await fetchWithTimeout(url, { method: 'GET', headers: mrktHeadersCommon() }, MRKT_TIMEOUT_MS).catch(() => null);
     if (!res) { markMrktFail(path, 0, 'FETCH_ERROR'); return { ok: false, status: 0, data: null, text: 'FETCH_ERROR' }; }
 
@@ -619,7 +636,6 @@ async function mrktPostJson(path, bodyObj, { retry = true } = {}) {
     }
 
     await mrktWaitGate();
-
     const reqVal = bodyObj?.req ? String(bodyObj.req) : makeReq();
     const body = { ...(bodyObj || {}), req: reqVal };
     const url = `${MRKT_API_URL}${path}${path.includes('?') ? '&' : '?'}req=${encodeURIComponent(reqVal)}`;
@@ -648,7 +664,7 @@ async function mrktPostJson(path, bodyObj, { retry = true } = {}) {
   });
 }
 
-// ===================== MRKT business =====================
+// =============== MRKT business ===============
 function buildSalingBody({ count, cursor, collectionNames, modelNames, backdropNames, ordering, lowToHigh }) {
   return {
     count,
@@ -697,6 +713,7 @@ function salingGiftToLot(g) {
   return {
     id: String(g.id || ''),
     name: displayName,
+    collectionName: g.collectionName || g.collectionTitle || null,
     giftName,
     priceTon,
     priceNano: Number(nano),
@@ -808,11 +825,18 @@ async function mrktGetBackdropsForGift(giftName) {
 
   const arr = Array.isArray(r.data) ? r.data : [];
   const map = new Map();
+
   for (const it of arr) {
     const name = it.backdropName || it.name || null;
     if (!name) continue;
     const key = norm(name);
-    if (!map.has(key)) map.set(key, { name: String(name), centerHex: null });
+
+    // best-effort colors
+    const v = it.backdropColorsCenterColor ?? it.colorsCenterColor ?? it.centerColor ?? null;
+    const num = Number(v);
+    const hex = Number.isFinite(num) ? ('#' + ((num >>> 0).toString(16).padStart(6, '0')).slice(-6)) : null;
+
+    if (!map.has(key)) map.set(key, { name: String(name), centerHex: hex });
   }
 
   const items = Array.from(map.values());
@@ -820,7 +844,43 @@ async function mrktGetBackdropsForGift(giftName) {
   return items;
 }
 
-// sales history (only for 1 gift)
+async function mrktOrdersFetch({ gift, model, backdrop }) {
+  const key = `orders|${gift || ''}|${model || ''}|${backdrop || ''}`;
+  const now = nowMs();
+  const cached = offersCache.get(key);
+  if (cached && now - cached.time < OFFERS_CACHE_TTL_MS) return cached.data;
+
+  const body = {
+    collectionNames: gift ? [gift] : [],
+    modelNames: gift && model ? [model] : [],
+    backdropNames: gift && backdrop ? [backdrop] : [],
+    symbolNames: [],
+    ordering: 'Price',
+    lowToHigh: false,
+    maxPrice: null,
+    minPrice: null,
+    count: MRKT_ORDERS_COUNT,
+    cursor: '',
+    query: null,
+  };
+
+  const r = await mrktPostJson('/orders', body);
+  const out = r.ok ? { ok: true, orders: Array.isArray(r.data?.orders) ? r.data.orders : [] } : { ok: false, orders: [] };
+  offersCache.set(key, { time: now, data: out });
+  return out;
+}
+
+function maxOfferTonFromOrders(orders) {
+  let maxNano = null;
+  for (const o of orders || []) {
+    const n = o?.priceMaxNanoTONs == null ? null : Number(o.priceMaxNanoTONs);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    if (maxNano == null || n > maxNano) maxNano = n;
+  }
+  return maxNano != null ? maxNano / 1e9 : null;
+}
+
+// sales history
 async function mrktFeedSales({ gift, modelNames = [], backdropNames = [] }) {
   if (!gift) return { ok: true, approxPriceTon: null, sales: [], note: null };
 
@@ -895,6 +955,7 @@ async function mrktFeedSales({ gift, modelNames = [], backdropNames = [] }) {
     cursor = r.data?.cursor || '';
     pages++;
     if (!cursor) break;
+
     if (SALES_HISTORY_THROTTLE_MS > 0) await sleep(SALES_HISTORY_THROTTLE_MS);
   }
 
@@ -902,10 +963,29 @@ async function mrktFeedSales({ gift, modelNames = [], backdropNames = [] }) {
   return { ok: true, approxPriceTon: median(prices), sales, note: null };
 }
 
-// ===================== notifications subs =====================
+// =============== Buy ===============
+async function mrktBuy({ id, priceNano }) {
+  const body = { ids: [id], prices: { [id]: priceNano } };
+  const r = await mrktPostJson('/gifts/buy', body);
+  if (!r.ok) return { ok: false, reason: mrktState.lastFailMsg || 'BUY_ERROR', data: r.data, text: r.text };
+
+  const data = r.data;
+  const okItem = Array.isArray(data)
+    ? data.find((x) => x?.source?.type === 'buy_gift' && x?.userGift?.isMine === true && String(x?.userGift?.id || '') === String(id))
+    : null;
+
+  if (!okItem) return { ok: false, reason: 'BUY_NOT_CONFIRMED', data };
+  return { ok: true, okItem };
+}
+
+function isNoFundsError(obj) {
+  const s = JSON.stringify(obj?.data || obj || '').toLowerCase();
+  return s.includes('not enough') || s.includes('insufficient') || s.includes('balance');
+}
+
+// =============== Subs notifications ===============
 async function notifySub(userId, sub, lot) {
   const chatId = userChatId(userId);
-
   const lines = [];
   lines.push(`Подписка #${sub.num}`);
   lines.push(lot.name);
@@ -922,11 +1002,10 @@ async function notifySub(userId, sub, lot) {
 async function checkSubscriptionsForAllUsers() {
   if (MODE !== 'real') return;
   if (isSubsChecking) return;
-
   isSubsChecking = true;
+
   try {
     let sent = 0;
-
     for (const [userId, user] of users.entries()) {
       if (!user.enabled) continue;
 
@@ -967,31 +1046,12 @@ async function checkSubscriptionsForAllUsers() {
   }
 }
 
-// ===================== AutoBuy (optional) =====================
-async function mrktBuy({ id, priceNano }) {
-  const body = { ids: [id], prices: { [id]: priceNano } };
-  const r = await mrktPostJson('/gifts/buy', body);
-  if (!r.ok) return { ok: false, reason: mrktState.lastFailMsg || 'BUY_ERROR' };
-
-  const data = r.data;
-  const okItem = Array.isArray(data)
-    ? data.find((x) => x?.source?.type === 'buy_gift' && x?.userGift?.isMine === true && String(x?.userGift?.id || '') === String(id))
-    : null;
-
-  if (!okItem) return { ok: false, reason: 'BUY_NOT_CONFIRMED' };
-  return { ok: true };
-}
-function isNoFundsError(obj) {
-  const s = JSON.stringify(obj || '').toLowerCase();
-  return s.includes('not enough') || s.includes('insufficient') || s.includes('balance');
-}
-
 async function autoBuyCycle() {
   if (!AUTO_BUY_GLOBAL) return;
   if (MODE !== 'real') return;
   if (isAutoBuying) return;
-
   isAutoBuying = true;
+
   try {
     for (const [userId, user] of users.entries()) {
       const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
@@ -1056,7 +1116,7 @@ async function autoBuyCycle() {
   }
 }
 
-// ===================== Telegram handlers =====================
+// =============== Telegram /start + status ===============
 bot.onText(/^\/start\b/, async (msg) => {
   const u = getOrCreateUser(msg.from.id);
   u.chatId = msg.chat.id;
@@ -1098,12 +1158,12 @@ bot.on('message', async (msg) => {
   }
 });
 
-// ===================== Web server =====================
+// =============== Express server ===============
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
-
 app.use(express.static('public'));
+
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
 // images proxy
@@ -1115,6 +1175,7 @@ app.get('/img/cdn', async (req, res) => {
   if (!r || !r.ok) return res.status(404).send('not found');
   streamFetchToRes(r, res, 'image/webp');
 });
+
 app.get('/img/gift', async (req, res) => {
   const name = String(req.query.name || '').trim();
   if (!name) return res.status(400).send('no name');
@@ -1146,15 +1207,74 @@ function webAuth(req, res, next) {
 }
 const isAdmin = (uid) => ADMIN_USER_ID && Number(uid) === Number(ADMIN_USER_ID);
 
-// API: state
+// =============== API ===============
+
+// state
 app.get('/api/state', webAuth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
+
+  // enrich subs thumbs/swatches with cache to avoid MRKT spam
+  const subs = Array.isArray(u.subscriptions) ? u.subscriptions : [];
+  const enriched = [];
+
+  for (const s of subs) {
+    const f = normalizeFilters(s.filters || {});
+    const gift = f.gifts.length === 1 ? f.gifts[0] : null;
+    const model = gift && f.models.length ? f.models[0] : null;
+
+    const key = `thumb|${gift || ''}|${model || ''}|${(f.backdrops || []).join('|')}`;
+    const now = nowMs();
+    const cached = thumbsCache.get(key);
+    if (cached && now - cached.time < THUMBS_CACHE_TTL_MS) {
+      enriched.push({ ...s, thumbUrl: cached.thumbUrl, swatches: cached.swatches });
+      continue;
+    }
+
+    let thumbUrl = null;
+    let swatches = [];
+
+    if (gift && model) {
+      const models = await mrktGetModelsForGift(gift);
+      const m = models.find((x) => norm(x.name) === norm(model));
+      if (m?.thumbKey) thumbUrl = `/img/cdn?key=${encodeURIComponent(m.thumbKey)}`;
+    }
+
+    if (!thumbUrl && gift) {
+      const cols = await mrktGetCollections();
+      const c = cols.find((x) => x.name === gift);
+      if (c?.thumbKey) thumbUrl = `/img/cdn?key=${encodeURIComponent(c.thumbKey)}`;
+    }
+
+    if (gift && Array.isArray(f.backdrops) && f.backdrops.length) {
+      const backs = await mrktGetBackdropsForGift(gift);
+      const map = new Map(backs.map((b) => [norm(b.name), b.centerHex]));
+      swatches = f.backdrops.map((b) => map.get(norm(b)) || null).filter(Boolean).slice(0, 8);
+    }
+
+    thumbsCache.set(key, { time: now, thumbUrl, swatches });
+    enriched.push({ ...s, thumbUrl, swatches });
+  }
+
   const mask = MRKT_AUTH_RUNTIME ? MRKT_AUTH_RUNTIME.slice(0, 4) + '…' + MRKT_AUTH_RUNTIME.slice(-4) : '';
   const haveSess = !!(mrktSessionRuntime || (await loadMrktSessionFromRedis()));
+
   res.json({
     ok: true,
-    api: { mrktAuthSet: !!MRKT_AUTH_RUNTIME, mrktAuthMask: mask, isAdmin: isAdmin(req.userId), mrktSessionSaved: haveSess },
-    user: { enabled: !!u.enabled, filters: u.filters, subscriptions: u.subscriptions || [] },
+    api: {
+      mrktAuthSet: !!MRKT_AUTH_RUNTIME,
+      mrktAuthMask: mask,
+      mrktSessionSaved: haveSess,
+      isAdmin: isAdmin(req.userId),
+      mrktPauseUntil: mrktState.pauseUntil || 0,
+      mrktLastFail: mrktState.lastFailMsg || null,
+      mrktLastFailStatus: mrktState.lastFailStatus || null,
+      mrktLastFailEndpoint: mrktState.lastFailEndpoint || null,
+    },
+    user: {
+      enabled: !!u.enabled,
+      filters: u.filters,
+      subscriptions: enriched,
+    },
   });
 });
 
@@ -1175,11 +1295,16 @@ app.post('/api/state/patch', webAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// Admin: set MRKT session (paste data/photo)
+// admin: session
 app.get('/api/admin/mrkt_session', webAuth, async (req, res) => {
   if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
   const sess = mrktSessionRuntime || (await loadMrktSessionFromRedis());
-  res.json({ ok: true, have: !!sess, photo: sess?.photo || null, dataMask: sess?.data ? (sess.data.slice(0, 16) + '…' + sess.data.slice(-16)) : null });
+  res.json({
+    ok: true,
+    have: !!sess,
+    photo: sess?.photo || null,
+    dataMask: sess?.data ? (sess.data.slice(0, 16) + '…' + sess.data.slice(-16)) : null,
+  });
 });
 
 app.post('/api/admin/mrkt_session', webAuth, async (req, res) => {
@@ -1188,9 +1313,7 @@ app.post('/api/admin/mrkt_session', webAuth, async (req, res) => {
   const data = String(req.body?.data || '').trim();
   const photo = String(req.body?.photo || '').trim() || null;
 
-  if (!data || !data.includes('hash=')) {
-    return res.status(400).json({ ok: false, reason: 'BAD_DATA' });
-  }
+  if (!data || !data.includes('hash=')) return res.status(400).json({ ok: false, reason: 'BAD_DATA' });
 
   const sess = { data, photo };
   mrktSessionRuntime = sess;
@@ -1206,7 +1329,7 @@ app.post('/api/admin/mrkt_refresh', webAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// collections / suggest
+// collections/suggest
 app.get('/api/mrkt/collections', webAuth, async (req, res) => {
   const q = String(req.query.q || '').trim().toLowerCase();
   const all = await mrktGetCollections();
@@ -1251,22 +1374,23 @@ app.get('/api/mrkt/suggest', webAuth, async (req, res) => {
     const items = backs
       .filter((b) => !q || b.name.toLowerCase().includes(q))
       .slice(0, WEBAPP_SUGGEST_LIMIT)
-      .map((b) => ({ label: b.name, value: b.name, colorHex: '#000000' }));
+      .map((b) => ({ label: b.name, value: b.name, colorHex: b.centerHex || '#000000' }));
     return res.json({ ok: true, items });
   }
 
   res.status(400).json({ ok: false, reason: 'BAD_KIND' });
 });
 
-// Market lots
+// market lots
 app.get('/api/mrkt/lots', webAuth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
   const f = normalizeFilters(u.filters || {});
+
   const cacheKey = `lots|${req.userId}|${JSON.stringify(f)}`;
   const cached = lotsCache.get(cacheKey);
   if (cached && nowMs() - cached.time < LOTS_CACHE_TTL_MS) return res.json(cached.data);
 
-  // If gift not selected: return cheapest collection FLOORS (no /saling)
+  // no gift => show floors (safe)
   if (!f.gifts.length) {
     const cols = await mrktGetCollections();
     const list = cols
@@ -1284,10 +1408,12 @@ app.get('/api/mrkt/lots', webAuth, async (req, res) => {
         model: null,
         backdrop: null,
         number: null,
+        giftName: null,
+        collectionName: c.name,
         imgUrl: c.thumbKey ? `/img/cdn?key=${encodeURIComponent(c.thumbKey)}` : null,
       }));
 
-    const payload = { ok: true, lots: list.slice(0, WEBAPP_LOTS_LIMIT), note: 'Показываю floor коллекций (без запроса /saling, чтобы не ловить 429).' };
+    const payload = { ok: true, lots: list.slice(0, WEBAPP_LOTS_LIMIT), note: 'Без выбранного gift показываю floor коллекций (чтобы не ловить 429).' };
     lotsCache.set(cacheKey, { time: nowMs(), data: payload });
     return res.json(payload);
   }
@@ -1305,18 +1431,121 @@ app.get('/api/mrkt/lots', webAuth, async (req, res) => {
   res.json(payload);
 });
 
-// history
+// history current
 app.get('/api/mrkt/history_current', webAuth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
   const f = normalizeFilters(u.filters || {});
-  if (f.gifts.length !== 1) {
-    return res.json({ ok: true, approxPriceTon: null, sales: [], note: 'История продаж работает для 1 gift.' });
-  }
+  if (f.gifts.length !== 1) return res.json({ ok: true, approxPriceTon: null, sales: [], note: 'История продаж работает для 1 gift.' });
   const gift = f.gifts[0];
   res.json(await mrktFeedSales({ gift, modelNames: f.models, backdropNames: f.backdrops }));
 });
 
-// subs minimal
+// lot details (floors + offers + history)
+app.post('/api/lot/details', webAuth, async (req, res) => {
+  const lot = req.body?.lot;
+  const lotId = String(lot?.id || '').trim();
+  if (!lotId) return res.status(400).json({ ok: false, reason: 'NO_LOT' });
+
+  const cached = detailsCache.get(lotId);
+  if (cached && nowMs() - cached.time < DETAILS_CACHE_TTL_MS) return res.json(cached.data);
+
+  const gift = lot.collectionName || null;
+  const model = lot.model || null;
+  const backdrop = lot.backdrop || null;
+
+  let floorExact = null;
+  let floorCollection = null;
+  let offerExact = null;
+  let offerCollection = null;
+
+  if (gift) {
+    const ex = await mrktSearchLotsByFilters({ gifts:[gift], models: model?[model]:[], backdrops: backdrop?[backdrop]:[], numberPrefix:'' }, 1);
+    if (ex.ok && ex.lots?.length) floorExact = ex.lots[0].priceTon;
+
+    const col = await mrktSearchLotsByFilters({ gifts:[gift], models:[], backdrops:[], numberPrefix:'' }, 1);
+    if (col.ok && col.lots?.length) floorCollection = col.lots[0].priceTon;
+
+    const o1 = await mrktOrdersFetch({ gift, model, backdrop });
+    if (o1.ok) offerExact = maxOfferTonFromOrders(o1.orders);
+
+    const o2 = await mrktOrdersFetch({ gift, model: null, backdrop: null });
+    if (o2.ok) offerCollection = maxOfferTonFromOrders(o2.orders);
+  }
+
+  const salesHistory = gift ? await mrktFeedSales({ gift, modelNames: model?[model]:[], backdropNames: backdrop?[backdrop]:[] }) : { ok:true, approxPriceTon:null, sales:[], note:'no gift' };
+
+  const payload = {
+    ok: true,
+    floors: { exact: floorExact, collection: floorCollection },
+    offers: { exact: offerExact, collection: offerCollection },
+    salesHistory,
+  };
+
+  detailsCache.set(lotId, { time: nowMs(), data: payload });
+  res.json(payload);
+});
+
+// buy
+app.post('/api/mrkt/buy', webAuth, async (req, res) => {
+  const id = String(req.body?.id || '').trim();
+  const priceNano = Number(req.body?.priceNano);
+  const lot = req.body?.lot || null;
+
+  if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
+  if (!Number.isFinite(priceNano) || priceNano <= 0) return res.status(400).json({ ok: false, reason: 'BAD_PRICE' });
+
+  const foundAt = Date.now();
+  const buyStart = Date.now();
+  const r = await mrktBuy({ id, priceNano });
+  const boughtAt = Date.now();
+  const latencyMs = boughtAt - buyStart;
+
+  if (!r.ok) return res.status(502).json({ ok: false, reason: r.reason });
+
+  const title = lot?.name || 'Gift';
+  const priceTon = priceNano / 1e9;
+
+  const giftName = lot?.giftName || '';
+  const urlTelegram = lot?.urlTelegram || (giftName ? `https://t.me/nft/${giftName}` : '');
+  const urlMarket = lot?.urlMarket || mrktLotUrlFromId(id);
+
+  const userObj = getOrCreateUser(req.userId);
+  pushPurchase(userObj, {
+    tsFound: foundAt,
+    tsBought: boughtAt,
+    latencyMs,
+    title,
+    priceTon,
+    urlTelegram,
+    urlMarket,
+    giftName,
+    model: lot?.model || '',
+    backdrop: lot?.backdrop || '',
+    lotId: id,
+  });
+  scheduleSave();
+
+  res.json({ ok: true });
+});
+
+// profile
+app.get('/api/profile', webAuth, async (req, res) => {
+  const u = getOrCreateUser(req.userId);
+  const purchases = (u.purchases || []).map((p) => ({
+    title: p.title,
+    lotId: p.lotId || null,
+    priceTon: p.priceTon,
+    foundMsk: p.tsFound ? new Date(p.tsFound).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }) : null,
+    boughtMsk: p.tsBought ? new Date(p.tsBought).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }) : null,
+    latencyMs: p.latencyMs ?? null,
+    imgUrl: p.giftName ? `/img/gift?name=${encodeURIComponent(p.giftName)}` : null,
+    urlTelegram: p.urlTelegram || null,
+    urlMarket: p.urlMarket || null,
+  }));
+  res.json({ ok: true, user: req.tgUser, purchases });
+});
+
+// subs
 app.post('/api/sub/create', webAuth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
   const r = makeSubFromCurrentFilters(u);
@@ -1326,25 +1555,28 @@ app.post('/api/sub/create', webAuth, async (req, res) => {
   scheduleSave();
   res.json({ ok: true });
 });
+
 app.post('/api/sub/toggle', webAuth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
-  const s = findSub(u, req.body?.id);
+  const s = findSub(u, String(req.body?.id || ''));
   if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
   s.enabled = !s.enabled;
   scheduleSave();
   res.json({ ok: true });
 });
+
 app.post('/api/sub/delete', webAuth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
-  const id = req.body?.id;
+  const id = String(req.body?.id || '');
   u.subscriptions = (u.subscriptions || []).filter((x) => x && x.id !== id);
   renumberSubs(u);
   scheduleSave();
   res.json({ ok: true });
 });
+
 app.post('/api/sub/set_notify_max', webAuth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
-  const s = findSub(u, req.body?.id);
+  const s = findSub(u, String(req.body?.id || ''));
   if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
 
   const str = String(req.body?.maxNotifyTon ?? '').trim();
@@ -1357,14 +1589,46 @@ app.post('/api/sub/set_notify_max', webAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ===================== Start server + workers =====================
+app.post('/api/sub/toggle_autobuy', webAuth, async (req, res) => {
+  const u = getOrCreateUser(req.userId);
+  const s = findSub(u, String(req.body?.id || ''));
+  if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+  s.autoBuyEnabled = !s.autoBuyEnabled;
+  scheduleSave();
+  res.json({ ok: true });
+});
+
+app.post('/api/sub/set_autobuy_max', webAuth, async (req, res) => {
+  const u = getOrCreateUser(req.userId);
+  const s = findSub(u, String(req.body?.id || ''));
+  if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+
+  const v = parseTonInput(req.body?.maxAutoBuyTon);
+  if (!Number.isFinite(v) || v <= 0) return res.status(400).json({ ok: false, reason: 'BAD_MAX' });
+  s.maxAutoBuyTon = v;
+  scheduleSave();
+  res.json({ ok: true });
+});
+
+app.post('/api/sub/details', webAuth, async (req, res) => {
+  const u = getOrCreateUser(req.userId);
+  const s = findSub(u, String(req.body?.id || ''));
+  if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
+
+  const sf = normalizeFilters(s.filters || {});
+  const gift = sf.gifts.length === 1 ? sf.gifts[0] : null;
+  const salesHistory = gift ? await mrktFeedSales({ gift, modelNames: sf.models, backdropNames: sf.backdrops }) : { ok:true, approxPriceTon:null, sales:[], note:'no gift' };
+
+  res.json({ ok: true, sub: s, salesHistory });
+});
+
+// =============== Start server + workers + bootstrap ===============
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
 
 setInterval(() => { checkSubscriptionsForAllUsers().catch((e) => console.error('subs error:', e)); }, SUBS_CHECK_INTERVAL_MS);
 setInterval(() => { autoBuyCycle().catch((e) => console.error('autobuy error:', e)); }, AUTO_BUY_CHECK_INTERVAL_MS);
 
-// ===================== Bootstrap =====================
 (async () => {
   if (REDIS_URL) {
     await initRedis();
