@@ -64,9 +64,10 @@
     </div>
 
     <div id="lotsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка…</div></div>
+    <div id="note" class="muted" style="margin-top:10px"></div>
 
     <div class="hr"></div>
-    <div><b>Лоты</b> <span class="muted">(клик → меню)</span></div>
+    <div><b>Лоты</b> <span class="muted">(без gift показываю floors коллекций)</span></div>
     <div id="lots" class="grid"></div>
   </div>
 
@@ -82,21 +83,38 @@
 
   <div id="profile" class="card" style="display:none">
     <h3>Профиль</h3>
-    <div class="row" style="align-items:center">
-      <img id="pfp" class="thumb" style="display:none"/>
-      <div id="profileBox" class="muted">Загрузка…</div>
-    </div>
-    <div id="profileLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка…</div></div>
-    <div class="hr"></div>
-    <div><b>История покупок</b></div>
-    <div id="purchases" style="margin-top:10px;display:flex;flex-direction:column;gap:10px"></div>
+    <div class="muted">В этой сборке профиль упрощён (фокус на MRKT токене + 429 стабильности).</div>
   </div>
 
   <div id="admin" class="card" style="display:none">
     <h3>Admin</h3>
+
     <div id="adminStatus" class="muted">Загрузка…</div>
     <div class="hr"></div>
-    <button id="adminRefresh">Force refresh token</button>
+
+    <div class="muted">
+      Важно: сюда нужно вставить <b>MRKT initData</b> (поле <code>data</code> из DevTools запроса MRKT <code>/api/v1/auth</code>),
+      иначе авто‑обновление токена не работает.
+    </div>
+
+    <div class="row" style="margin-top:10px;align-items:flex-start">
+      <div class="field" style="flex:1 1 420px;min-width:260px">
+        <label>MRKT data (initData из MRKT)</label>
+        <textarea id="mrktData" style="width:100%;min-height:120px;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--input);color:var(--text)"></textarea>
+      </div>
+      <div class="field" style="flex:1 1 260px;min-width:220px">
+        <label>photo (как в DevTools)</label>
+        <input id="mrktPhoto" placeholder="https://t.me/i/userpic/..." />
+        <div class="row" style="margin-top:10px">
+          <button id="saveMrktSession" class="primary">Сохранить MRKT session</button>
+          <button id="forceRefresh">Force refresh token</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="muted" style="margin-top:10px">
+      Если MRKT выдаёт 429 — это лимит запросов. Код сам будет ждать и продолжать.
+    </div>
   </div>
 
   <!-- Bottom Sheet -->
@@ -112,17 +130,8 @@
         <button id="sheetClose" class="small">✕</button>
       </div>
 
-      <div class="sheetTopRow">
-        <img id="sheetImg" class="sheetImg" style="display:none" />
-        <div style="flex:1;min-width:0">
-          <div id="sheetTop" class="muted"></div>
-          <div class="kv" id="sheetKV"></div>
-          <div class="row" id="sheetBtns"></div>
-        </div>
-      </div>
-
       <div class="hr"></div>
-      <div><b>История продаж</b> <span class="muted">(NFT/MRKT)</span></div>
+      <div><b>История продаж</b></div>
       <div id="sheetSales" class="sheetBody"></div>
     </div>
   </div>
