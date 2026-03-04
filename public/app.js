@@ -132,8 +132,6 @@
         const btn = e.target.closest('button[data-v]');
         if (!btn) return;
         onToggleFn(btn.getAttribute('data-v'));
-
-        // rerender to update checks
         renderSug(id, title, items, isSelFn, onToggleFn);
       };
     }
@@ -264,7 +262,6 @@
       let html = `<div class="muted" style="margin-bottom:10px">
         Примерная цена продажи: <b>${approx!=null ? approx.toFixed(3)+' TON' : 'нет данных'}</b>
       </div>`;
-
       if (resp.note) html += `<div class="muted" style="margin-bottom:10px">${resp.note}</div>`;
 
       const items = resp.sales || [];
@@ -375,24 +372,19 @@
     function renderSubs(list){
       const box = el('subsList');
       if(!list || !list.length){ box.innerHTML = '<i class="muted">Подписок нет</i>'; return; }
-
       box.innerHTML = list.map(s => {
         const img = s.thumbUrl ? `<img class="thumb" src="${s.thumbUrl}" referrerpolicy="no-referrer"/>` : `<div class="thumb"></div>`;
-        const sw = (s.swatches||[]).map(h => `<span class="swatch" style="background:${h}"></span>`).join('');
         return `<div class="card">
           <div style="display:flex;gap:10px;align-items:center">
             ${img}
             <div style="min-width:0;flex:1">
               <b>#${s.num} ${s.enabled?'ON':'OFF'}</b>
               <div class="muted ellipsis">Gifts: ${(s.filters.gifts||[]).join(', ') || '-'}</div>
-              ${sw ? `<div class="swatches">${sw}</div>` : ''}
             </div>
             <button class="small" data-act="subInfo" data-id="${s.id}">Info</button>
           </div>
-
           <div class="muted">Notify max: ${s.maxNotifyTon==null?'∞':s.maxNotifyTon} TON</div>
           <div class="muted">AutoBuy: ${s.autoBuyEnabled?'ON':'OFF'} | Max: ${s.maxAutoBuyTon==null?'-':s.maxAutoBuyTon} TON</div>
-
           <div class="row" style="margin-top:8px">
             <button class="small" data-act="subNotifyMax" data-id="${s.id}">Max Notify</button>
             <button class="small" data-act="subAutoMax" data-id="${s.id}">Max AutoBuy</button>
@@ -406,7 +398,6 @@
 
     async function refreshState(){
       const st = await api('/api/state');
-
       sel.gifts = st.user.filters.gifts || [];
       sel.giftLabels = st.user.filters.giftLabels || {};
       sel.models = st.user.filters.models || [];
@@ -453,15 +444,11 @@
                   <div style="min-width:0">
                     <div class="ellipsis"><b>${p.title}</b></div>
                     ${p.lotId ? `<div class="muted">ID: ${p.lotId}</div>` : ''}
-                    ${p.model?`<div class="muted ellipsis">Model: ${p.model}</div>`:''}
-                    ${p.backdrop?`<div class="muted ellipsis">Backdrop: ${p.backdrop}</div>`:''}
                   </div>
                 </div>
-
                 <div class="muted" style="margin-top:8px">Found: ${p.foundMsk||'-'}</div>
                 <div class="muted">Buy: ${p.boughtMsk||'-'} ${p.latencyMs!=null?(' · '+p.latencyMs+'ms'):''}</div>
                 <div class="muted">Price: ${Number(p.priceTon).toFixed(3)} TON</div>
-
                 <div class="row" style="margin-top:8px">
                   ${p.urlTelegram?`<button class="small" data-open="${p.urlTelegram}">NFT</button>`:''}
                   ${p.urlMarket?`<button class="small" data-open="${p.urlMarket}">MRKT</button>`:''}
@@ -478,6 +465,7 @@
       const r = await api('/api/admin/status');
       el('adminStatus').textContent =
         'haveInitData: ' + (r.haveInitData?'YES':'NO') + '\n' +
+        'mrktAuthSet: ' + (r.mrktAuthSet?'YES':'NO') + '\n' +
         'MRKT fail: ' + (r.mrktLastFailMsg || '-') + '\n' +
         'endpoint: ' + (r.mrktLastFailEndpoint || '-') + '\n' +
         'status: ' + (r.mrktLastFailStatus || '-') + '\n';
@@ -489,8 +477,7 @@
 
     el('historyBtn').onclick = wrap('lots', async()=>{
       openSheet('История продаж', 'по текущим фильтрам');
-      const r = await api('/api/mrkt/history_current');
-      renderSales(r);
+      renderSales(await api('/api/mrkt/history_current'));
     });
 
     el('subCreate').onclick = wrap('subs', async()=>{ await api('/api/sub/create',{method:'POST'}); await refreshState(); });
@@ -522,21 +509,6 @@
         if(act==='subInfo'){
           const r = await api('/api/sub/details',{method:'POST',body:JSON.stringify({id})});
           openSheet('Подписка', '#'+r.sub.num+' '+(r.sub.enabled?'ON':'OFF'));
-          sheetTop.innerHTML =
-            `<div class="muted">Gifts: ${(r.sub.filters.gifts||[]).join(', ')}</div>` +
-            ((r.sub.filters.models||[]).length?`<div class="muted">Models: ${(r.sub.filters.models||[]).join(', ')}</div>`:'') +
-            ((r.sub.filters.backdrops||[]).length?`<div class="muted">Backdrops: ${(r.sub.filters.backdrops||[]).join(', ')}</div>`:'') +
-            (r.sub.filters.numberPrefix?`<div class="muted">Number prefix: ${r.sub.filters.numberPrefix}</div>`:'') +
-            `<div class="muted" style="margin-top:6px">Notify max: ${(r.sub.maxNotifyTon==null?'∞':r.sub.maxNotifyTon)} TON</div>`+
-            `<div class="muted">AutoBuy max: ${(r.sub.maxAutoBuyTon==null?'-':r.sub.maxAutoBuyTon)} TON</div>`;
-
-          sheetKV.innerHTML = [
-            pill('Max offer (exact): <b>'+(r.offers.exact!=null?r.offers.exact.toFixed(3)+' TON':'—')+'</b>'),
-            pill('Max offer (collection): <b>'+(r.offers.collection!=null?r.offers.collection.toFixed(3)+' TON':'—')+'</b>'),
-            pill('Floor (exact): <b>'+(r.floors.exact!=null?r.floors.exact.toFixed(3)+' TON':'—')+'</b>'),
-            pill('Floor (collection): <b>'+(r.floors.collection!=null?r.floors.collection.toFixed(3)+' TON':'—')+'</b>'),
-          ].join('');
-
           renderSales(r.salesHistory);
         }
 
@@ -547,6 +519,7 @@
     el('adminRefresh').onclick = wrap('subs', async()=>{
       await api('/api/admin/mrkt_refresh', { method:'POST' });
       await refreshAdmin();
+      await refreshAll();
     });
 
     // initial
@@ -554,9 +527,6 @@
 
   } catch (e) {
     const box = document.getElementById('err');
-    if (box) {
-      box.style.display = 'block';
-      box.textContent = 'JS crash: ' + (e?.message || String(e));
-    }
+    if (box) { box.style.display = 'block'; box.textContent = 'JS crash: ' + (e?.message || String(e)); }
   }
 })();
