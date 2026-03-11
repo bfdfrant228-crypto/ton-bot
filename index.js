@@ -1,20 +1,19 @@
 /**
- * v20-perf-full (2026-03-10)
- * Single-file MRKT panel + bot
+ * v21-perf-ui (2026-03-11)
+ * Single file: server + Telegram bot + WebApp (MRKT).
  *
- * FIXES vs your current v19:
- * 1) Fix crash: CACHE_TTL_MS defined.
- * 2) No more “hang -> 502”: if MRKT wants us to wait too long (429/pause), HTTP endpoints return FAST with note "wait N sec"
- *    (we do NOT sleep inside request handlers).
- * 3) Checkmarks in dropdown appear immediately (re-render on toggle).
- * 4) X (clear) buttons restored.
- * 5) /api/state is FAST (no MRKT calls inside).
+ * Fixes requested:
+ * - Multi-select gifts: dropdown no longer "locks" on selected text (search query separated)
+ * - Checkmark appears immediately (rerender after toggle), dropdown stays open
+ * - Auto-retry after "RPS limit wait Ns" without manual reload
+ * - Subscriptions: thumbnails + backdrop swatches restored WITHOUT MRKT calls inside /api/state
+ *   (UI is computed on sub create + manual rebuild button)
+ * - Market: "История покупок (по фильтрам)" added
+ * - Links open via Telegram WebApp openTelegramLink (not new tab) when possible
+ * - 502 reduced: HTTP handlers do not sleep long; they return fast "wait" notes
  *
- * IMPORTANT: set Railway vars to reduce RPS:
- *   AUTO_BUY_GLOBAL=0
- *   AUTO_BUY_DRY_RUN=1
- *   MRKT_MIN_GAP_MS=1200
- *   MRKT_HTTP_MAX_WAIT_MS=800
+ * Node 18+
+ * deps: express, node-telegram-bot-api, redis(optional)
  */
 
 const TelegramBot = require('node-telegram-bot-api');
@@ -24,10 +23,7 @@ const { Readable } = require('stream');
 
 // ===================== ENV =====================
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-if (!TELEGRAM_TOKEN) {
-  console.error('TELEGRAM_TOKEN not set');
-  process.exit(1);
-}
+if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_TOKEN not set'); process.exit(1); }
 
 const MODE = process.env.MODE || 'real';
 const APP_TITLE = String(process.env.APP_TITLE || 'Панель');
@@ -54,32 +50,34 @@ const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 12000);
 const MRKT_MIN_GAP_MS = Number(process.env.MRKT_MIN_GAP_MS || 1200);
 const MRKT_429_DEFAULT_PAUSE_MS = Number(process.env.MRKT_429_DEFAULT_PAUSE_MS || 4500);
 
-// NEW: if we need to wait more than this inside HTTP request => return fast note instead of sleeping (prevents 502)
+// If gate requires waiting longer than this inside HTTP request => return fast note instead of sleeping
 const MRKT_HTTP_MAX_WAIT_MS = Number(process.env.MRKT_HTTP_MAX_WAIT_MS || 800);
 
 // limits
-const MRKT_COUNT = Number(process.env.MRKT_COUNT || 10);
+const MRKT_COUNT = Number(process.env.MRKT_COUNT || 12);
 const MRKT_PAGES = Number(process.env.MRKT_PAGES || 1);
 const MRKT_ORDERS_COUNT = Number(process.env.MRKT_ORDERS_COUNT || 25);
 
-const WEBAPP_LOTS_LIMIT = Number(process.env.WEBAPP_LOTS_LIMIT || 20);
+const WEBAPP_LOTS_LIMIT = Number(process.env.WEBAPP_LOTS_LIMIT || 24);
 const WEBAPP_LOTS_PAGES = Number(process.env.WEBAPP_LOTS_PAGES || 1);
-const WEBAPP_SUGGEST_LIMIT = Number(process.env.WEBAPP_SUGGEST_LIMIT || 100);
+const WEBAPP_SUGGEST_LIMIT = Number(process.env.WEBAPP_SUGGEST_LIMIT || 120);
 
 const GLOBAL_SCAN_COLLECTIONS = Number(process.env.GLOBAL_SCAN_COLLECTIONS || 2);
 const GLOBAL_SCAN_CACHE_TTL_MS = Number(process.env.GLOBAL_SCAN_CACHE_TTL_MS || 120_000);
 
-// TTL caches (FIX: define it, crash was here)
+// caches
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60_000);
 const OFFERS_CACHE_TTL_MS = Number(process.env.OFFERS_CACHE_TTL_MS || 20_000);
 const LOTS_CACHE_TTL_MS = Number(process.env.LOTS_CACHE_TTL_MS || 2500);
 const DETAILS_CACHE_TTL_MS = Number(process.env.DETAILS_CACHE_TTL_MS || 4000);
+const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 30_000);
 
-// subs/autobuy
+// subs
 const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 30000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 6);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
 
+// AutoBuy (keep OFF until stable)
 const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '0') === '1';
 const AUTO_BUY_DRY_RUN = String(process.env.AUTO_BUY_DRY_RUN || '1') === '1';
 const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 6000);
@@ -89,7 +87,7 @@ const AUTO_BUY_DISABLE_AFTER_SUCCESS = String(process.env.AUTO_BUY_DISABLE_AFTER
 
 // sales history
 const SALES_HISTORY_TARGET = Number(process.env.SALES_HISTORY_TARGET || 18);
-const SALES_HISTORY_MAX_PAGES = Number(process.env.SALES_HISTORY_MAX_PAGES || 12);
+const SALES_HISTORY_MAX_PAGES = Number(process.env.SALES_HISTORY_MAX_PAGES || 10);
 const SALES_HISTORY_COUNT_PER_PAGE = Number(process.env.SALES_HISTORY_COUNT_PER_PAGE || 50);
 const SALES_HISTORY_THROTTLE_MS = Number(process.env.SALES_HISTORY_THROTTLE_MS || 220);
 const SALES_HISTORY_TIME_BUDGET_MS = Number(process.env.SALES_HISTORY_TIME_BUDGET_MS || 9000);
@@ -101,7 +99,7 @@ const REDIS_KEY_STATE = 'bot:state:main';
 const REDIS_KEY_MRKT_AUTH = 'mrkt:auth:token';
 const REDIS_KEY_MRKT_SESSION = 'mrkt:session:admin'; // { data:string, photo:any }
 
-console.log('v20-perf-full start', {
+console.log('v21-perf-ui start', {
   MODE,
   PUBLIC_URL: !!PUBLIC_URL,
   WEBAPP_URL: !!WEBAPP_URL,
@@ -122,18 +120,11 @@ const MAIN_KEYBOARD = { keyboard: [[{ text: '📌 Статус' }]], resize_keyb
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const nowMs = () => Date.now();
 
-function makeReq() {
-  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-}
-function norm(s) {
-  return String(s || '').toLowerCase().trim().replace(/\s+/g, ' ');
-}
-function normTraitName(s) {
-  return norm(s).replace(/\s*\([^)]*%[^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
-}
-function cleanDigitsPrefix(v, maxLen = 12) {
-  return String(v || '').replace(/\D/g, '').slice(0, maxLen);
-}
+function makeReq() { return `${Date.now()}_${Math.random().toString(16).slice(2)}`; }
+function norm(s) { return String(s || '').toLowerCase().trim().replace(/\s+/g, ' '); }
+function normTraitName(s) { return norm(s).replace(/\s*\([^)]*%[^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim(); }
+function cleanDigitsPrefix(v, maxLen = 12) { return String(v || '').replace(/\D/g, '').slice(0, maxLen); }
+
 function parseTonInput(x) {
   const s = String(x ?? '').trim();
   if (!s) return NaN;
@@ -155,7 +146,7 @@ function ensureArray(v) {
 function uniqNorm(arr) {
   const out = [];
   const seen = new Set();
-  for (const x of arr || []) {
+  for (const x of (arr || [])) {
     const k = norm(x);
     if (!k) continue;
     if (seen.has(k)) continue;
@@ -171,19 +162,15 @@ function joinUrl(base, key) {
   return b + k;
 }
 
-function tonFromNano(nano) {
-  const x = Number(nano);
-  return Number.isFinite(x) ? x / 1e9 : null;
-}
+function tonFromNano(nano) { const x = Number(nano); return Number.isFinite(x) ? x / 1e9 : null; }
 function maskToken(t) {
   const s = String(t || '').trim();
   if (!s) return '';
   if (s.length <= 10) return s;
   return s.slice(0, 4) + '…' + s.slice(-4);
 }
-function mrktLotUrlFromId(id) {
-  return id ? `https://t.me/mrkt/app?startapp=${String(id).replace(/-/g, '')}` : 'https://t.me/mrkt';
-}
+function mrktLotUrlFromId(id) { return id ? `https://t.me/mrkt/app?startapp=${String(id).replace(/-/g, '')}` : 'https://t.me/mrkt'; }
+
 function giftNameFallbackFromCollectionAndNumber(collectionTitleOrName, number) {
   const base = String(collectionTitleOrName || '').replace(/\s+/g, '');
   if (!base || number == null) return null;
@@ -194,6 +181,7 @@ function fragmentGiftRemoteUrlFromGiftName(giftName) {
   const slug = String(giftName).trim().toLowerCase();
   return joinUrl(FRAGMENT_GIFT_IMG_BASE, `${encodeURIComponent(slug)}.medium.jpg`);
 }
+
 function extractMrktErrorMessage(txt) {
   const s = String(txt || '').trim();
   if (!s) return null;
@@ -211,11 +199,13 @@ function extractMrktErrorMessage(txt) {
   } catch {}
   return s.slice(0, 220);
 }
+
 function median(sorted) {
   if (!sorted.length) return null;
   const L = sorted.length;
   return L % 2 ? sorted[(L - 1) / 2] : (sorted[L / 2 - 1] + sorted[L / 2]) / 2;
 }
+
 function fmtWaitMs(ms) {
   const s = Math.max(1, Math.ceil(ms / 1000));
   return `${s}s`;
@@ -223,17 +213,13 @@ function fmtWaitMs(ms) {
 
 async function sendMessageSafe(chatId, text, opts) {
   while (true) {
-    try {
-      return await bot.sendMessage(chatId, text, opts);
-    } catch (e) {
+    try { return await bot.sendMessage(chatId, text, opts); }
+    catch (e) {
       const retryAfter =
         e?.response?.body?.parameters?.retry_after ??
         e?.response?.parameters?.retry_after ??
         null;
-      if (retryAfter) {
-        await sleep((Number(retryAfter) + 1) * 1000);
-        continue;
-      }
+      if (retryAfter) { await sleep((Number(retryAfter) + 1) * 1000); continue; }
       throw e;
     }
   }
@@ -242,29 +228,17 @@ async function sendMessageSafe(chatId, text, opts) {
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+  try { return await fetch(url, { ...options, signal: controller.signal }); }
+  finally { clearTimeout(timer); }
 }
 
 function streamFetchToRes(r, res, fallbackContentType) {
   res.setHeader('Content-Type', r.headers.get('content-type') || fallbackContentType);
   res.setHeader('Cache-Control', 'public, max-age=86400');
   try {
-    if (r.body && Readable.fromWeb) {
-      Readable.fromWeb(r.body).pipe(res);
-      return;
-    }
+    if (r.body && Readable.fromWeb) { Readable.fromWeb(r.body).pipe(res); return; }
   } catch {}
-  r.arrayBuffer()
-    .then((ab) => res.end(Buffer.from(ab)))
-    .catch(() => res.status(502).end('bad gateway'));
-}
-
-function isAdmin(userId) {
-  return ADMIN_USER_ID && Number(userId) === Number(ADMIN_USER_ID);
+  r.arrayBuffer().then((ab) => res.end(Buffer.from(ab))).catch(() => res.status(502).end('bad gateway'));
 }
 
 // ===================== WebApp initData verify =====================
@@ -278,6 +252,7 @@ function verifyTelegramWebAppInitData(initData) {
 
   const authDate = Number(params.get('auth_date') || 0);
   if (!authDate) return { ok: false, reason: 'NO_AUTH_DATE' };
+
   const ageSec = Math.floor(Date.now() / 1000) - authDate;
   if (ageSec > WEBAPP_AUTH_MAX_AGE_SEC) return { ok: false, reason: 'INITDATA_EXPIRED' };
 
@@ -291,14 +266,14 @@ function verifyTelegramWebAppInitData(initData) {
   if (calcHash !== hash) return { ok: false, reason: 'BAD_HASH' };
 
   let user = null;
-  try {
-    user = JSON.parse(params.get('user') || 'null');
-  } catch {}
+  try { user = JSON.parse(params.get('user') || 'null'); } catch {}
   const userId = user?.id;
   if (!userId) return { ok: false, reason: 'NO_USER' };
 
   return { ok: true, userId, user };
 }
+
+function isAdmin(userId) { return ADMIN_USER_ID && Number(userId) === Number(ADMIN_USER_ID); }
 
 // ===================== Redis =====================
 let redis = null;
@@ -318,23 +293,17 @@ async function initRedis() {
 }
 async function redisGet(key) {
   if (!redis) return null;
-  try {
-    return await redis.get(key);
-  } catch {
-    return null;
-  }
+  try { return await redis.get(key); } catch { return null; }
 }
 async function redisSet(key, val, opts) {
   if (!redis) return;
-  try {
-    await redis.set(key, val, opts);
-  } catch {}
+  try { await redis.set(key, val, opts); } catch {}
 }
 
 // ===================== State =====================
-const users = new Map(); // userId -> user
-const subStates = new Map(); // `${userId}:${subId}` -> { floor, emptyStreak, pausedUntil }
-const autoBuyRecentAttempts = new Map(); // `${userId}:${lotId}` -> ts
+const users = new Map();
+const subStates = new Map();
+const autoBuyRecentAttempts = new Map();
 
 function normalizeFilters(f) {
   const gifts = uniqNorm(ensureArray(f?.gifts || f?.gift));
@@ -343,17 +312,10 @@ function normalizeFilters(f) {
   const backdrops = uniqNorm(ensureArray(f?.backdrops || f?.backdrop));
   const numberPrefix = cleanDigitsPrefix(f?.numberPrefix || '');
 
-  // multi gift => clear model/backdrops to avoid dead searches
   const safeModels = gifts.length === 1 ? models : [];
   const safeBackdrops = gifts.length === 1 ? backdrops : [];
 
-  return {
-    gifts,
-    giftLabels,
-    models: safeModels,
-    backdrops: safeBackdrops,
-    numberPrefix,
-  };
+  return { gifts, giftLabels, models: safeModels, backdrops: safeBackdrops, numberPrefix };
 }
 
 function getOrCreateUser(userId) {
@@ -397,6 +359,7 @@ function makeSubFromCurrentFilters(user) {
     autoBuyEnabled: false,
     maxAutoBuyTon: null,
     filters: JSON.parse(JSON.stringify(f)),
+    ui: { thumbKey: null, swatches: [] }, // stored, /api/state stays fast
   };
   return { ok: true, sub };
 }
@@ -417,6 +380,7 @@ function pushPurchase(user, entry) {
     model: String(entry.model || ''),
     backdrop: String(entry.backdrop || ''),
     collection: String(entry.collection || ''),
+    number: entry.number == null ? null : Number(entry.number),
   });
   user.purchases = user.purchases.slice(0, 300);
 }
@@ -459,8 +423,17 @@ function importState(parsed) {
         autoBuyEnabled: !!s.autoBuyEnabled,
         maxAutoBuyTon: s.maxAutoBuyTon == null ? null : Number(s.maxAutoBuyTon),
         filters: normalizeFilters(s?.filters || {}),
+        ui: (s.ui && typeof s.ui === 'object')
+          ? { thumbKey: s.ui.thumbKey || null, swatches: Array.isArray(s.ui.swatches) ? s.ui.swatches : [] }
+          : { thumbKey: null, swatches: [] },
       }));
     renumberSubs(safe);
+
+    safe.purchases = (safe.purchases || []).slice(0, 300).map((p) => ({
+      ...p,
+      priceTon: Number(p.priceTon || 0),
+      number: p.number == null ? null : Number(p.number),
+    }));
 
     users.set(userId, safe);
   }
@@ -476,7 +449,7 @@ function scheduleSave() {
   }, 250);
 }
 
-// ===================== MRKT session + auth refresh =====================
+// ===================== MRKT auth/session refresh =====================
 let mrktSessionRuntime = null; // {data, photo}
 let isRefreshing = false;
 let lastRefreshAt = 0;
@@ -509,25 +482,21 @@ async function mrktAuthWithSession(session) {
   const body = {
     appId: null,
     data: String(session?.data || ''),
-    photo: session?.photo ?? null, // IMPORTANT: keep as object/null/string
+    photo: session?.photo ?? null, // keep as object/null/string
   };
 
-  const res = await fetchWithTimeout(
-    url,
-    {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-        Origin: 'https://cdn.tgmrkt.io',
-        Referer: 'https://cdn.tgmrkt.io/',
-        'User-Agent': 'Mozilla/5.0',
-        ...(MRKT_AUTH_RUNTIME ? { Authorization: MRKT_AUTH_RUNTIME } : {}),
-      },
-      body: JSON.stringify(body),
+  const res = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      Origin: 'https://cdn.tgmrkt.io',
+      Referer: 'https://cdn.tgmrkt.io/',
+      'User-Agent': 'Mozilla/5.0',
+      ...(MRKT_AUTH_RUNTIME ? { Authorization: MRKT_AUTH_RUNTIME } : {}),
     },
-    MRKT_TIMEOUT_MS
-  ).catch(() => null);
+    body: JSON.stringify(body),
+  }, MRKT_TIMEOUT_MS).catch(() => null);
 
   if (!res) return { ok: false, status: 0, reason: 'FETCH_ERROR', text: '' };
 
@@ -582,6 +551,7 @@ async function tryRefreshMrktToken(reason = 'auto', { force = false } = {}) {
     offersCache.clear();
     lotsCache.clear();
     detailsCache.clear();
+    salesCache.clear();
     globalCheapestCache.time = 0;
     globalCheapestCache.lots = [];
     globalCheapestCache.note = null;
@@ -621,11 +591,14 @@ async function mrktRunExclusive(fn) {
   finally { release(); }
 }
 
+function setPauseMs(ms) {
+  const until = nowMs() + Math.max(1000, ms || MRKT_429_DEFAULT_PAUSE_MS);
+  mrktState.pauseUntil = Math.max(mrktState.pauseUntil || 0, until);
+}
 function setPauseFrom429(res) {
   const ra = res?.headers?.get?.('retry-after');
   const ms = ra ? (Number(ra) * 1000) : MRKT_429_DEFAULT_PAUSE_MS;
-  const until = nowMs() + (Number.isFinite(ms) && ms > 0 ? ms : MRKT_429_DEFAULT_PAUSE_MS);
-  mrktState.pauseUntil = Math.max(mrktState.pauseUntil || 0, until);
+  setPauseMs(ms);
 }
 
 function markMrktOk() {
@@ -635,7 +608,6 @@ function markMrktOk() {
   mrktState.lastFailStatus = null;
   mrktState.lastFailEndpoint = null;
 }
-
 function markMrktFail(endpoint, status, txt) {
   mrktState.lastFailAt = nowMs();
   mrktState.lastFailEndpoint = endpoint || null;
@@ -643,17 +615,14 @@ function markMrktFail(endpoint, status, txt) {
   mrktState.lastFailMsg = extractMrktErrorMessage(txt) || (status ? `HTTP ${status}` : 'MRKT error');
 }
 
-// Non-blocking gate: do NOT sleep long inside HTTP handlers
+// Gate: do not sleep long inside HTTP request
 async function mrktGateCheckOrWait() {
   const now = nowMs();
-
   const pauseMs = (mrktState.pauseUntil && now < mrktState.pauseUntil) ? (mrktState.pauseUntil - now) : 0;
   const gapMs = (mrktState.nextAllowedAt && now < mrktState.nextAllowedAt) ? (mrktState.nextAllowedAt - now) : 0;
   const waitMs = Math.max(pauseMs, gapMs);
 
-  if (waitMs > MRKT_HTTP_MAX_WAIT_MS) {
-    return { ok: false, waitMs };
-  }
+  if (waitMs > MRKT_HTTP_MAX_WAIT_MS) return { ok: false, waitMs };
 
   if (waitMs > 0) await sleep(waitMs);
   mrktState.nextAllowedAt = nowMs() + MRKT_MIN_GAP_MS;
@@ -673,35 +642,34 @@ function mrktHeadersJson() {
   return { ...mrktHeadersCommon(), 'Content-Type': 'application/json; charset=utf-8' };
 }
 
+function bodyLooksLikeRpsLimit(txt) {
+  const s = String(txt || '').toLowerCase();
+  return s.includes('more rps') || s.includes('rps') && s.includes('support');
+}
+
 async function mrktGetJson(path, { retry = true } = {}) {
   return mrktRunExclusive(async () => {
     if (!MRKT_AUTH_RUNTIME) {
       const ok = await ensureMrktAuth();
-      if (!ok) {
-        markMrktFail(path, 401, 'NO_AUTH');
-        return { ok: false, status: 401, data: null, text: 'NO_AUTH' };
-      }
+      if (!ok) { markMrktFail(path, 401, 'NO_AUTH'); return { ok: false, status: 401, data: null, text: 'NO_AUTH' }; }
     }
 
     const gate = await mrktGateCheckOrWait();
-    if (!gate.ok) {
-      return { ok: false, status: 429, data: null, text: 'RPS_WAIT', waitMs: gate.waitMs };
-    }
+    if (!gate.ok) return { ok: false, status: 429, data: null, text: 'RPS_WAIT', waitMs: gate.waitMs };
 
     const url = `${MRKT_API_URL}${path}${path.includes('?') ? '&' : '?'}req=${encodeURIComponent(makeReq())}`;
-
     const res = await fetchWithTimeout(url, { method: 'GET', headers: mrktHeadersCommon() }, MRKT_TIMEOUT_MS).catch(() => null);
-    if (!res) {
-      markMrktFail(path, 0, 'FETCH_ERROR');
-      return { ok: false, status: 0, data: null, text: 'FETCH_ERROR' };
-    }
+    if (!res) { markMrktFail(path, 0, 'FETCH_ERROR'); return { ok: false, status: 0, data: null, text: 'FETCH_ERROR' }; }
 
     const txt = await res.text().catch(() => '');
     let data = null;
     try { data = txt ? JSON.parse(txt) : null; } catch {}
 
     if (!res.ok) {
-      if (res.status === 429) setPauseFrom429(res);
+      if (res.status === 429 || bodyLooksLikeRpsLimit(txt)) {
+        setPauseFrom429(res);
+        return { ok: false, status: 429, data, text: txt, waitMs: (mrktState.pauseUntil - nowMs()) };
+      }
       markMrktFail(path, res.status, txt);
 
       if ((res.status === 401 || res.status === 403) && retry) {
@@ -720,33 +688,28 @@ async function mrktPostJson(path, bodyObj, { retry = true } = {}) {
   return mrktRunExclusive(async () => {
     if (!MRKT_AUTH_RUNTIME) {
       const ok = await ensureMrktAuth();
-      if (!ok) {
-        markMrktFail(path, 401, 'NO_AUTH');
-        return { ok: false, status: 401, data: null, text: 'NO_AUTH' };
-      }
+      if (!ok) { markMrktFail(path, 401, 'NO_AUTH'); return { ok: false, status: 401, data: null, text: 'NO_AUTH' }; }
     }
 
     const gate = await mrktGateCheckOrWait();
-    if (!gate.ok) {
-      return { ok: false, status: 429, data: null, text: 'RPS_WAIT', waitMs: gate.waitMs };
-    }
+    if (!gate.ok) return { ok: false, status: 429, data: null, text: 'RPS_WAIT', waitMs: gate.waitMs };
 
     const reqVal = bodyObj?.req ? String(bodyObj.req) : makeReq();
     const body = { ...(bodyObj || {}), req: reqVal };
     const url = `${MRKT_API_URL}${path}${path.includes('?') ? '&' : '?'}req=${encodeURIComponent(reqVal)}`;
 
     const res = await fetchWithTimeout(url, { method: 'POST', headers: mrktHeadersJson(), body: JSON.stringify(body) }, MRKT_TIMEOUT_MS).catch(() => null);
-    if (!res) {
-      markMrktFail(path, 0, 'FETCH_ERROR');
-      return { ok: false, status: 0, data: null, text: 'FETCH_ERROR' };
-    }
+    if (!res) { markMrktFail(path, 0, 'FETCH_ERROR'); return { ok: false, status: 0, data: null, text: 'FETCH_ERROR' }; }
 
     const txt = await res.text().catch(() => '');
     let data = null;
     try { data = txt ? JSON.parse(txt) : null; } catch {}
 
     if (!res.ok) {
-      if (res.status === 429) setPauseFrom429(res);
+      if (res.status === 429 || bodyLooksLikeRpsLimit(txt)) {
+        setPauseFrom429(res);
+        return { ok: false, status: 429, data, text: txt, waitMs: (mrktState.pauseUntil - nowMs()) };
+      }
       markMrktFail(path, res.status, txt);
 
       if ((res.status === 401 || res.status === 403) && retry) {
@@ -769,6 +732,7 @@ const backdropsCache = new Map();
 const offersCache = new Map();
 const lotsCache = new Map();
 const detailsCache = new Map();
+const salesCache = new Map();
 const globalCheapestCache = { time: 0, lots: [], note: null };
 
 async function mrktGetCollections() {
@@ -777,9 +741,8 @@ async function mrktGetCollections() {
 
   const r = await mrktGetJson('/gifts/collections');
   if (!r.ok) {
-    // if rate limited, return cached even if stale
-    if (r.status === 429 && collectionsCache.items.length) return collectionsCache.items;
-    collectionsCache = { time: now, items: [] };
+    // return stale cache if any
+    if (collectionsCache.items.length) return collectionsCache.items;
     return [];
   }
 
@@ -812,9 +775,15 @@ async function mrktGetModelsForGift(giftName) {
     const name = it.modelTitle || it.modelName;
     if (!name) continue;
     const key = normTraitName(name);
-    if (!map.has(key)) map.set(key, { name: String(name), thumbKey: it.modelStickerThumbnailKey || null, floorNano: it.floorPriceNanoTons ?? null });
+    if (!map.has(key)) {
+      map.set(key, {
+        name: String(name),
+        thumbKey: it.modelStickerThumbnailKey || null,
+        floorNano: it.floorPriceNanoTons ?? null,
+        rarityPerMille: it.rarityPerMille ?? null, // <-- percent label
+      });
+    }
   }
-
   const items = Array.from(map.values());
   modelsCache.set(giftName, { time: nowMs(), items });
   return items;
@@ -830,7 +799,6 @@ async function mrktGetBackdropsForGift(giftName) {
 
   const arr = Array.isArray(r.data) ? r.data : [];
   const map = new Map();
-
   for (const it of arr) {
     const name = it.backdropName || it.name || null;
     if (!name) continue;
@@ -842,7 +810,6 @@ async function mrktGetBackdropsForGift(giftName) {
 
     if (!map.has(key)) map.set(key, { name: String(name), centerHex: hex });
   }
-
   const items = Array.from(map.values());
   backdropsCache.set(giftName, { time: nowMs(), items });
   return items;
@@ -859,16 +826,11 @@ function buildSalingBody({
   number = null,
 } = {}) {
   return {
-    count,
-    cursor,
-    collectionNames,
-    modelNames,
-    backdropNames,
+    count, cursor,
+    collectionNames, modelNames, backdropNames,
     symbolNames: [],
-    ordering,
-    lowToHigh,
-    maxPrice: null,
-    minPrice: null,
+    ordering, lowToHigh,
+    maxPrice: null, minPrice: null,
     number: number != null ? Number(number) : null,
     query: null,
     promotedFirst: false,
@@ -941,7 +903,6 @@ async function mrktSearchLotsByFilters(filters, pagesLimit) {
   const models = gifts.length === 1 ? (f.models || []) : [];
   const backdrops = gifts.length === 1 ? (f.backdrops || []) : [];
 
-  // Optimization: if numberPrefix looks like exact (>=4 digits) -> ask MRKT by exact number
   const exactNumber = prefix && prefix.length >= 4 ? Number(prefix) : null;
 
   for (let page = 0; page < pagesToScan; page++) {
@@ -962,12 +923,11 @@ async function mrktSearchLotsByFilters(filters, pagesLimit) {
       const lot = salingGiftToLot(g);
       if (!lot) continue;
 
-      if (prefix && exactNumber == null) {
-        const numStr = lot.number == null ? '' : String(lot.number);
-        if (!numStr.startsWith(prefix)) continue;
-      }
       if (exactNumber != null) {
         if (lot.number == null || Number(lot.number) !== exactNumber) continue;
+      } else if (prefix) {
+        const numStr = lot.number == null ? '' : String(lot.number);
+        if (!numStr.startsWith(prefix)) continue;
       }
 
       out.push(lot);
@@ -1024,90 +984,103 @@ function maxOfferTonFromOrders(orders) {
   return maxNano != null ? maxNano / 1e9 : null;
 }
 
+async function mrktFeedSalesCached(key, fetcher) {
+  const now = nowMs();
+  const cached = salesCache.get(key);
+  if (cached && now - cached.time < SALES_CACHE_TTL_MS) return { ...cached.data, cached: true };
+
+  const data = await fetcher();
+  salesCache.set(key, { time: now, data });
+  return data;
+}
+
 async function mrktFeedSales({ gift, modelNames = [], backdropNames = [] }) {
-  if (!gift) return { ok: true, approxPriceTon: null, sales: [], note: 'no gift' };
+  const key = `sales|${gift}|m=${(modelNames||[]).join('|')}|b=${(backdropNames||[]).join('|')}`;
+  return mrktFeedSalesCached(key, async () => {
+    if (!gift) return { ok: true, approxPriceTon: null, sales: [], note: 'no gift' };
 
-  const wantModels = new Set((modelNames || []).map(normTraitName).filter(Boolean));
-  const wantBacks = new Set((backdropNames || []).map(normTraitName).filter(Boolean));
+    const wantModels = new Set((modelNames || []).map(normTraitName).filter(Boolean));
+    const wantBacks = new Set((backdropNames || []).map(normTraitName).filter(Boolean));
 
-  const started = nowMs();
-  let cursor = '';
-  let pages = 0;
-  const sales = [];
-  const prices = [];
+    const started = nowMs();
+    let cursor = '';
+    let pages = 0;
+    const sales = [];
+    const prices = [];
 
-  while (pages < SALES_HISTORY_MAX_PAGES && sales.length < SALES_HISTORY_TARGET) {
-    if (nowMs() - started > SALES_HISTORY_TIME_BUDGET_MS) break;
+    while (pages < SALES_HISTORY_MAX_PAGES && sales.length < SALES_HISTORY_TARGET) {
+      if (nowMs() - started > SALES_HISTORY_TIME_BUDGET_MS) break;
 
-    const body = {
-      count: Number(SALES_HISTORY_COUNT_PER_PAGE),
-      cursor: cursor || '',
-      collectionNames: [gift],
-      modelNames: Array.isArray(modelNames) ? modelNames : [],
-      backdropNames: Array.isArray(backdropNames) ? backdropNames : [],
-      lowToHigh: false,
-      maxPrice: null,
-      minPrice: null,
-      number: null,
-      ordering: 'Latest',
-      query: null,
-      type: ['sale'],
-      types: ['sale'],
-    };
+      const body = {
+        count: Number(SALES_HISTORY_COUNT_PER_PAGE),
+        cursor: cursor || '',
+        collectionNames: [gift],
+        modelNames: Array.isArray(modelNames) ? modelNames : [],
+        backdropNames: Array.isArray(backdropNames) ? backdropNames : [],
+        lowToHigh: false,
+        maxPrice: null,
+        minPrice: null,
+        number: null,
+        ordering: 'Latest',
+        query: null,
+        type: ['sale'],
+        types: ['sale'],
+      };
 
-    const r = await mrktPostJson('/feed', body);
-    if (!r.ok) {
-      if (r.status === 429) return { ok: true, approxPriceTon: null, sales: [], note: `RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}` };
-      break;
+      const r = await mrktPostJson('/feed', body);
+      if (!r.ok) {
+        if (r.status === 429) return { ok: true, approxPriceTon: null, sales: [], note: `RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}` };
+        break;
+      }
+
+      const items = Array.isArray(r.data?.items) ? r.data.items : [];
+      if (!items.length) break;
+
+      for (const it of items) {
+        const g = it?.gift;
+        if (!g) continue;
+
+        const mName = g.modelTitle || g.modelName || null;
+        const bName = g.backdropName || null;
+
+        if (wantModels.size && !wantModels.has(normTraitName(mName))) continue;
+        if (wantBacks.size && !wantBacks.has(normTraitName(bName))) continue;
+
+        const amountNano = it.amount ?? g.salePriceWithoutFee ?? g.salePrice ?? null;
+        const ton = amountNano != null ? Number(amountNano) / 1e9 : NaN;
+        if (!Number.isFinite(ton) || ton <= 0) continue;
+
+        const base = (g.collectionTitle || g.collectionName || g.title || gift).trim();
+        const number = g.number ?? null;
+        const name = number != null ? `${base} #${number}` : base;
+
+        const giftName = g.name || giftNameFallbackFromCollectionAndNumber(base, number) || null;
+        const urlTelegram = giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : 'https://t.me/mrkt';
+        const urlMarket = g.id ? mrktLotUrlFromId(g.id) : 'https://t.me/mrkt';
+
+        sales.push({ ts: it.date || null, priceTon: ton, name, model: mName, backdrop: bName, urlTelegram, urlMarket });
+        prices.push(ton);
+        if (sales.length >= SALES_HISTORY_TARGET) break;
+      }
+
+      cursor = r.data?.cursor || '';
+      pages++;
+      if (!cursor) break;
+
+      if (SALES_HISTORY_THROTTLE_MS > 0) await sleep(SALES_HISTORY_THROTTLE_MS);
     }
 
-    const items = Array.isArray(r.data?.items) ? r.data.items : [];
-    if (!items.length) break;
-
-    for (const it of items) {
-      const g = it?.gift;
-      if (!g) continue;
-
-      const mName = g.modelTitle || g.modelName || null;
-      const bName = g.backdropName || null;
-
-      if (wantModels.size && !wantModels.has(normTraitName(mName))) continue;
-      if (wantBacks.size && !wantBacks.has(normTraitName(bName))) continue;
-
-      const amountNano = it.amount ?? g.salePriceWithoutFee ?? g.salePrice ?? null;
-      const ton = amountNano != null ? Number(amountNano) / 1e9 : NaN;
-      if (!Number.isFinite(ton) || ton <= 0) continue;
-
-      const base = (g.collectionTitle || g.collectionName || g.title || gift).trim();
-      const number = g.number ?? null;
-      const name = number != null ? `${base} #${number}` : base;
-
-      const giftName = g.name || giftNameFallbackFromCollectionAndNumber(base, number) || null;
-      const urlTelegram = giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : 'https://t.me/mrkt';
-      const urlMarket = g.id ? mrktLotUrlFromId(g.id) : 'https://t.me/mrkt';
-
-      sales.push({ ts: it.date || null, priceTon: ton, name, model: mName, backdrop: bName, urlTelegram, urlMarket });
-      prices.push(ton);
-      if (sales.length >= SALES_HISTORY_TARGET) break;
-    }
-
-    cursor = r.data?.cursor || '';
-    pages++;
-    if (!cursor) break;
-
-    if (SALES_HISTORY_THROTTLE_MS > 0) await sleep(SALES_HISTORY_THROTTLE_MS);
-  }
-
-  prices.sort((a, b) => a - b);
-  return { ok: true, approxPriceTon: median(prices), sales, note: null };
+    prices.sort((a, b) => a - b);
+    return { ok: true, approxPriceTon: median(prices), sales, note: null };
+  });
 }
 
 async function mrktBuy({ id, priceNano }) {
   const body = { ids: [id], prices: { [id]: priceNano } };
   const r = await mrktPostJson('/gifts/buy', body);
   if (!r.ok) return { ok: false, reason: r.status === 429 ? 'RPS_WAIT' : (mrktState.lastFailMsg || 'BUY_ERROR'), waitMs: r.waitMs || 0, data: r.data };
-
   const data = r.data;
+
   const okItem = Array.isArray(data)
     ? data.find((x) => x?.source?.type === 'buy_gift' && x?.userGift?.isMine === true && String(x?.userGift?.id || '') === String(id))
     : null;
@@ -1121,7 +1094,7 @@ function isNoFundsError(obj) {
   return s.includes('not enough') || s.includes('insufficient') || s.includes('balance');
 }
 
-// global cheapest scan (cached)
+// Global cheapest scan (cached)
 async function mrktGlobalCheapestLotsReal() {
   const now = nowMs();
   if (globalCheapestCache.lots.length && now - globalCheapestCache.time < GLOBAL_SCAN_CACHE_TTL_MS) {
@@ -1145,7 +1118,6 @@ async function mrktGlobalCheapestLotsReal() {
       ordering: 'Price',
       lowToHigh: true,
       count: 3,
-      number: null,
     });
 
     if (!r.ok) {
@@ -1175,16 +1147,53 @@ async function mrktGlobalCheapestLotsReal() {
   return { ok: true, lots: out, note: globalCheapestCache.note };
 }
 
-// ===================== Subs notify (your requested format) =====================
+// ===================== Sub UI build (thumb + swatches) =====================
+async function buildSubUi(sub) {
+  try {
+    const f = normalizeFilters(sub.filters || {});
+    const gift = f.gifts.length === 1 ? f.gifts[0] : null;
+    if (!gift) return { thumbKey: null, swatches: [] };
+
+    // thumbKey
+    let thumbKey = null;
+
+    if (f.models.length === 1) {
+      const models = await mrktGetModelsForGift(gift);
+      const m = models.find((x) => normTraitName(x.name) === normTraitName(f.models[0]));
+      if (m?.thumbKey) thumbKey = m.thumbKey;
+    }
+
+    if (!thumbKey) {
+      const cols = await mrktGetCollections();
+      const c = cols.find((x) => x.name === gift);
+      if (c?.thumbKey) thumbKey = c.thumbKey;
+    }
+
+    // swatches
+    let swatches = [];
+    if (f.backdrops.length) {
+      const backs = await mrktGetBackdropsForGift(gift);
+      const map = new Map(backs.map((b) => [normTraitName(b.name), b.centerHex]));
+      swatches = f.backdrops.map((b) => map.get(normTraitName(b)) || null).filter(Boolean).slice(0, 8);
+    }
+
+    return { thumbKey: thumbKey || null, swatches };
+  } catch {
+    return { thumbKey: null, swatches: [] };
+  }
+}
+
+// ===================== Subs notify format =====================
 async function notifyFloorToUser(userId, sub, lot, newFloor) {
   const chatId = userChatId(userId);
 
+  // per your request: no gift title line, only price+traits+ t.me/nft link, only MRKT button
   const lines = [];
   lines.push(`Подписка #${sub.num}`);
   lines.push(`Цена: ${newFloor.toFixed(3)} TON`);
   if (lot?.model) lines.push(`Model: ${lot.model}`);
   if (lot?.backdrop) lines.push(`Backdrop: ${lot.backdrop}`);
-  lines.push(lot?.urlTelegram || 'https://t.me/mrkt'); // only t.me/nft link => preview
+  lines.push(lot?.urlTelegram || 'https://t.me/mrkt');
 
   const reply_markup = lot?.urlMarket
     ? { inline_keyboard: [[{ text: 'MRKT', url: lot.urlMarket }]] }
@@ -1220,7 +1229,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         if (!sf.gifts.length) continue;
 
         const stateKey = `${userId}:${sub.id}`;
-        const prev = subStates.get(stateKey) || { floor: null, emptyStreak: 0, pausedUntil: 0 };
+        const prev = subStates.get(stateKey) || { floor: null, emptyStreak: 0 };
 
         const r = await mrktSearchLotsByFilters(sf, 1);
         if (!r.ok) continue;
@@ -1261,7 +1270,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
   }
 }
 
-// ===================== AutoBuy =====================
+// ===================== AutoBuy (kept, but disable via vars) =====================
 let isAutoBuying = false;
 
 async function autoBuyCycle() {
@@ -1423,19 +1432,14 @@ app.get('/img/gift', async (req, res) => {
 });
 
 // UI
-app.get('/', (req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(WEBAPP_HTML);
-});
-app.get('/app.js', (req, res) => {
-  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-  res.send(WEBAPP_JS);
-});
+app.get('/', (req, res) => { res.setHeader('Content-Type','text/html; charset=utf-8'); res.send(WEBAPP_HTML); });
+app.get('/app.js', (req, res) => { res.setHeader('Content-Type','application/javascript; charset=utf-8'); res.send(WEBAPP_JS); });
 
-// FAST state
+// FAST state: no MRKT calls!
 app.get('/api/state', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
   const sess = mrktSessionRuntime || (await loadMrktSessionFromRedis());
+
   res.json({
     ok: true,
     api: {
@@ -1473,7 +1477,7 @@ app.post('/api/state/patch', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// MRKT endpoints
+// MRKT collections + suggest
 app.get('/api/mrkt/collections', auth, async (req, res) => {
   const q = String(req.query.q || '').trim().toLowerCase();
   const all = await mrktGetCollections();
@@ -1503,12 +1507,16 @@ app.get('/api/mrkt/suggest', auth, async (req, res) => {
     const items = models
       .filter((m) => !q || m.name.toLowerCase().includes(q))
       .slice(0, WEBAPP_SUGGEST_LIMIT)
-      .map((m) => ({
-        label: m.name,
-        value: m.name,
-        imgUrl: m.thumbKey ? `/img/cdn?key=${encodeURIComponent(m.thumbKey)}` : null,
-        sub: m.floorNano != null ? `min: ${(tonFromNano(m.floorNano)).toFixed(3)} TON` : null,
-      }));
+      .map((m) => {
+        const rarity =
+          m.rarityPerMille != null && Number.isFinite(Number(m.rarityPerMille))
+            ? ` · ${(Number(m.rarityPerMille) / 10).toFixed(1)}%`
+            : '';
+        const imgUrl = m.thumbKey ? `/img/cdn?key=${encodeURIComponent(m.thumbKey)}` : null;
+        const floor = m.floorNano != null ? tonFromNano(m.floorNano) : null;
+        const sub = (floor != null ? `min: ${floor.toFixed(3)} TON` : 'min: —') + rarity;
+        return { label: m.name, value: m.name, imgUrl, sub };
+      });
     return res.json({ ok: true, items });
   }
 
@@ -1525,6 +1533,7 @@ app.get('/api/mrkt/suggest', auth, async (req, res) => {
   res.status(400).json({ ok: false, reason: 'BAD_KIND' });
 });
 
+// Market lots (cached + auto note)
 app.get('/api/mrkt/lots', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
   const f = normalizeFilters(u.filters || {});
@@ -1532,7 +1541,6 @@ app.get('/api/mrkt/lots', auth, async (req, res) => {
   const cached = lotsCache.get(cacheKey);
   if (cached && nowMs() - cached.time < LOTS_CACHE_TTL_MS) return res.json(cached.data);
 
-  // no gift => global cheapest
   if (!f.gifts.length) {
     const r = await mrktGlobalCheapestLotsReal();
     const lots = (r.lots || []).slice(0, WEBAPP_LOTS_LIMIT).map((lot) => ({
@@ -1540,7 +1548,7 @@ app.get('/api/mrkt/lots', auth, async (req, res) => {
       imgUrl: lot.giftName ? `/img/gift?name=${encodeURIComponent(lot.giftName)}` : null,
       listedMsk: lot.listedAt ? new Date(Date.parse(lot.listedAt)).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }) : null,
     }));
-    const payload = { ok: true, lots, note: r.note || null };
+    const payload = { ok: true, lots, note: r.note || null, waitMs: r.note?.includes('wait') ? 2000 : 0 };
     lotsCache.set(cacheKey, { time: nowMs(), data: payload });
     return res.json(payload);
   }
@@ -1548,7 +1556,7 @@ app.get('/api/mrkt/lots', auth, async (req, res) => {
   const r = await mrktSearchLotsByFilters(f, WEBAPP_LOTS_PAGES || MRKT_PAGES);
   if (!r.ok) {
     if (r.reason === 'RPS_WAIT') {
-      const payload = { ok: true, lots: [], note: `MRKT RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}` };
+      const payload = { ok: true, lots: [], note: `MRKT RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}`, waitMs: r.waitMs || 1000 };
       lotsCache.set(cacheKey, { time: nowMs(), data: payload });
       return res.json(payload);
     }
@@ -1561,11 +1569,12 @@ app.get('/api/mrkt/lots', auth, async (req, res) => {
     listedMsk: lot.listedAt ? new Date(Date.parse(lot.listedAt)).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }) : null,
   }));
 
-  const payload = { ok: true, lots, note: null };
+  const payload = { ok: true, lots, note: null, waitMs: 0 };
   lotsCache.set(cacheKey, { time: nowMs(), data: payload });
   res.json(payload);
 });
 
+// Max offer current (optional)
 app.get('/api/mrkt/maxoffer_current', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
   const f = normalizeFilters(u.filters || {});
@@ -1589,6 +1598,7 @@ app.get('/api/mrkt/maxoffer_current', auth, async (req, res) => {
   res.json({ ok: true, exactMaxOfferTon: exact, collectionMaxOfferTon: col, note: null });
 });
 
+// Lot details + sales history
 app.post('/api/lot/details', auth, async (req, res) => {
   const lot = req.body?.lot || null;
   const lotId = String(lot?.id || '').trim();
@@ -1601,21 +1611,18 @@ app.post('/api/lot/details', auth, async (req, res) => {
   const model = lot?.model ? String(lot.model) : null;
   const backdrop = lot?.backdrop ? String(lot.backdrop) : null;
 
-  // floors (best-effort fast)
   let floorExact = null;
   let floorCollection = null;
-
-  const ex = gift ? await mrktSearchLotsByFilters({ gifts: [gift], models: model ? [model] : [], backdrops: backdrop ? [backdrop] : [], numberPrefix: '' }, 1) : null;
-  if (ex?.ok && ex.gifts?.length) floorExact = ex.gifts[0].priceTon;
-
-  const col = gift ? await mrktSearchLotsByFilters({ gifts: [gift], models: [], backdrops: [], numberPrefix: '' }, 1) : null;
-  if (col?.ok && col.gifts?.length) floorCollection = col.gifts[0].priceTon;
-
-  // offers
   let offerExact = null;
   let offerCollection = null;
 
   if (gift) {
+    const ex = await mrktSearchLotsByFilters({ gifts: [gift], models: model ? [model] : [], backdrops: backdrop ? [backdrop] : [], numberPrefix: '' }, 1);
+    if (ex.ok && ex.gifts?.length) floorExact = ex.gifts[0].priceTon;
+
+    const col = await mrktSearchLotsByFilters({ gifts: [gift], models: [], backdrops: [], numberPrefix: '' }, 1);
+    if (col.ok && col.gifts?.length) floorCollection = col.gifts[0].priceTon;
+
     const o1 = await mrktOrdersFetch({ gift, model, backdrop });
     const o2 = await mrktOrdersFetch({ gift, model: null, backdrop: null });
 
@@ -1627,17 +1634,12 @@ app.post('/api/lot/details', auth, async (req, res) => {
     ? await mrktFeedSales({ gift, modelNames: model ? [model] : [], backdropNames: backdrop ? [backdrop] : [] })
     : { ok: true, approxPriceTon: null, sales: [], note: 'no gift' };
 
-  const payload = {
-    ok: true,
-    floors: { exact: floorExact, collection: floorCollection },
-    offers: { exact: offerExact, collection: offerCollection },
-    salesHistory,
-  };
-
+  const payload = { ok: true, floors: { exact: floorExact, collection: floorCollection }, offers: { exact: offerExact, collection: offerCollection }, salesHistory };
   detailsCache.set(lotId, { time: nowMs(), data: payload });
   res.json(payload);
 });
 
+// Buy (keep endpoint, UI can hide button if you want later)
 app.post('/api/mrkt/buy', auth, async (req, res) => {
   const id = String(req.body?.id || '').trim();
   const priceNano = Number(req.body?.priceNano);
@@ -1672,19 +1674,20 @@ app.post('/api/mrkt/buy', auth, async (req, res) => {
     model: lot?.model || '',
     backdrop: lot?.backdrop || '',
     collection: lot?.collectionName || '',
+    number: lot?.number ?? null,
   });
   scheduleSave();
 
   res.json({ ok: true, title: lot?.name || 'Gift', priceTon: priceNano / 1e9 });
 });
 
+// Profile purchases
 app.get('/api/profile', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
   const purchases = (u.purchases || []).slice(0, 80).map((p) => ({
     title: p.title,
     lotId: p.lotId || null,
     priceTon: p.priceTon,
-    listedMsk: p.tsListed ? new Date(p.tsListed).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }) : null,
     foundMsk: p.tsFound ? new Date(p.tsFound).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }) : null,
     boughtMsk: p.tsBought ? new Date(p.tsBought).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }) : null,
     latencyMs: p.latencyMs ?? null,
@@ -1693,17 +1696,77 @@ app.get('/api/profile', auth, async (req, res) => {
     urlMarket: p.urlMarket || null,
     model: p.model || null,
     backdrop: p.backdrop || null,
+    number: p.number ?? null,
   }));
   res.json({ ok: true, user: req.tgUser, purchases });
 });
 
-// subs
+// Market: purchases history by current filters (your request)
+app.get('/api/purchases/by_filters', auth, async (req, res) => {
+  const u = getOrCreateUser(req.userId);
+  const f = normalizeFilters(u.filters || {});
+  const list = (u.purchases || []).slice(0, 300);
+
+  const wantGifts = new Set((f.gifts || []).map(norm));
+  const wantModel = f.models.length === 1 ? normTraitName(f.models[0]) : null;
+  const wantBackdrop = f.backdrops.length === 1 ? normTraitName(f.backdrops[0]) : null;
+  const prefix = f.numberPrefix || '';
+  const exactNumber = prefix && prefix.length >= 4 ? Number(prefix) : null;
+
+  const filtered = list.filter((p) => {
+    if (wantGifts.size) {
+      if (!wantGifts.has(norm(p.collection))) return false;
+    }
+    if (wantModel && normTraitName(p.model) !== wantModel) return false;
+    if (wantBackdrop && normTraitName(p.backdrop) !== wantBackdrop) return false;
+
+    if (exactNumber != null) {
+      if (p.number == null || Number(p.number) !== exactNumber) return false;
+    } else if (prefix) {
+      if (p.number == null || !String(p.number).startsWith(prefix)) return false;
+    }
+
+    return true;
+  }).slice(0, 40);
+
+  const items = filtered.map((p) => ({
+    title: p.title,
+    lotId: p.lotId || null,
+    priceTon: p.priceTon,
+    boughtMsk: p.tsBought ? new Date(p.tsBought).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }) : null,
+    imgUrl: p.giftName ? `/img/gift?name=${encodeURIComponent(p.giftName)}` : null,
+    urlTelegram: p.urlTelegram || null,
+    urlMarket: p.urlMarket || null,
+    model: p.model || null,
+    backdrop: p.backdrop || null,
+    number: p.number ?? null,
+  }));
+
+  res.json({ ok: true, items });
+});
+
+// ===================== Subs endpoints =====================
 app.post('/api/sub/create', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
   const r = makeSubFromCurrentFilters(u);
   if (!r.ok) return res.status(400).json({ ok: false, reason: r.reason });
+
+  // build UI once
+  r.sub.ui = await buildSubUi(r.sub);
+
   u.subscriptions.push(r.sub);
   renumberSubs(u);
+  scheduleSave();
+  res.json({ ok: true });
+});
+
+app.post('/api/sub/rebuild_ui', auth, async (req, res) => {
+  const u = getOrCreateUser(req.userId);
+  const subs = Array.isArray(u.subscriptions) ? u.subscriptions : [];
+  for (const s of subs) {
+    if (!s) continue;
+    s.ui = await buildSubUi(s);
+  }
   scheduleSave();
   res.json({ ok: true });
 });
@@ -1787,26 +1850,20 @@ app.post('/api/sub/details', auth, async (req, res) => {
     if (col.ok && col.gifts?.length) floorCollection = col.gifts[0].priceTon;
 
     const o1 = await mrktOrdersFetch({ gift, model, backdrop });
-    if (o1.ok) offerExact = maxOfferTonFromOrders(o1.orders);
-
     const o2 = await mrktOrdersFetch({ gift, model: null, backdrop: null });
-    if (o2.ok) offerCollection = maxOfferTonFromOrders(o2.orders);
+
+    offerExact = o1.ok ? maxOfferTonFromOrders(o1.orders) : null;
+    offerCollection = o2.ok ? maxOfferTonFromOrders(o2.orders) : null;
   }
 
   const salesHistory = gift
     ? await mrktFeedSales({ gift, modelNames: sf.models, backdropNames: sf.backdrops })
     : { ok: true, approxPriceTon: null, sales: [], note: 'multi-gift' };
 
-  res.json({
-    ok: true,
-    sub: s,
-    floors: { exact: floorExact, collection: floorCollection },
-    offers: { exact: offerExact, collection: offerCollection },
-    salesHistory,
-  });
+  res.json({ ok: true, sub: s, floors: { exact: floorExact, collection: floorCollection }, offers: { exact: offerExact, collection: offerCollection }, salesHistory });
 });
 
-// ========== ADMIN ==========
+// ===================== Admin endpoints =====================
 function tryParseJsonMaybe(s) {
   if (typeof s !== 'string') return null;
   const t = s.trim();
@@ -1833,7 +1890,6 @@ app.post('/api/admin/session', auth, async (req, res) => {
   if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
 
   const payloadJson = req.body?.payloadJson;
-
   let data = null;
   let photo = null;
 
@@ -1937,7 +1993,8 @@ const WEBAPP_HTML = `<!doctype html>
 <style>
 :root{--bg:#0b0f14;--card:#101826;--text:#e5e7eb;--muted:#9ca3af;--border:#223044;--input:#0f172a;--btn:#182235;--btnText:#e5e7eb;--accent:#22c55e;--danger:#ef4444}
 *{box-sizing:border-box}
-body{margin:0;padding:14px;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+html,body{background:var(--bg); overscroll-behavior: none;}
+body{margin:0;padding:14px;color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
 h2{margin:0 0 10px 0;font-size:18px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px;margin:10px 0}
 label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
@@ -1955,9 +2012,10 @@ button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;backg
 .tabs{display:flex;gap:8px;flex-wrap:wrap}
 .tabbtn{border-radius:999px;padding:8px 12px;font-size:13px}
 .tabbtn.active{border-color:var(--accent);color:var(--accent)}
-.sug{border:1px solid var(--border);border-radius:14px;overflow:auto;background:var(--card);max-height:380px;position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:1000000;box-shadow:0 14px 40px rgba(0,0,0,.45)}
+.sug{border:1px solid var(--border);border-radius:14px;overflow:auto;background:var(--card);max-height:380px;position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:1000000;box-shadow:0 14px 40px rgba(0,0,0,.45);-webkit-overflow-scrolling:touch}
 .field.open{z-index:999999}
 .sugHead{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--card);z-index:2}
+.sugHead b{font-size:13px}
 .sug .item{width:100%;text-align:left;border:0;background:transparent;padding:10px;display:flex;gap:10px;align-items:center}
 .sug .item:hover{background:rgba(255,255,255,.06)}
 .thumb{width:44px;height:44px;border-radius:14px;object-fit:cover;background:rgba(255,255,255,.06);border:1px solid var(--border);flex:0 0 auto}
@@ -1973,19 +2031,23 @@ button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;backg
 .loaderLine{display:none;align-items:center;gap:10px;color:var(--muted);font-size:12px;margin-top:10px}
 .spinner{width:16px;height:16px;border-radius:999px;border:3px solid rgba(255,255,255,.2);border-top-color:var(--accent);animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+
+/* bottom sheet */
 .sheetWrap{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:flex-end;justify-content:center;z-index:50000;padding:10px;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .18s ease,visibility .18s ease}
 .sheetWrap.show{opacity:1;visibility:visible;pointer-events:auto}
-.sheet{width:min(980px,96vw);height:min(80vh,860px);background:var(--card);border:1px solid var(--border);border-radius:22px 22px 14px 14px;padding:12px;box-shadow:0 30px 90px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:10px;transform:translateY(20px);transition:transform .18s ease}
+.sheet{width:min(980px,96vw);height:min(82vh,880px);background:var(--card);border:1px solid var(--border);border-radius:22px 22px 14px 14px;padding:12px;box-shadow:0 30px 90px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:10px;transform:translateY(20px);transition:transform .18s ease}
 .sheetWrap.show .sheet{transform:translateY(0)}
 .handle{width:44px;height:5px;border-radius:999px;background:rgba(255,255,255,.18);align-self:center}
 .sheetHeader{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
-.sheetBody{overflow:auto}
+.sheetBody{overflow:auto;-webkit-overflow-scrolling:touch}
 .sheetImg{width:100%;max-height:260px;object-fit:cover;border-radius:14px;border:1px solid var(--border);background:rgba(255,255,255,.03)}
 .kv{display:flex;gap:10px;flex-wrap:wrap}
 .kv .p{padding:6px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px;color:var(--muted)}
 .sale{border:1px solid var(--border);border-radius:12px;padding:10px;background:rgba(255,255,255,.02)}
 .purchRow{display:flex;gap:10px;align-items:center}
 .purchRow img{width:52px;height:52px;border-radius:14px;border:1px solid var(--border);object-fit:cover;background:rgba(255,255,255,.03);flex:0 0 auto}
+.swRow{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.dot{width:14px;height:14px;border-radius:999px;border:1px solid rgba(255,255,255,.18)}
 </style></head>
 <body>
 <h2>${APP_TITLE}</h2>
@@ -2041,7 +2103,8 @@ button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;backg
   <div class="row" style="margin-top:10px">
     <button id="apply" class="primary">Показать</button>
     <button id="refresh">Обновить</button>
-    <button id="toProfile" class="small">Покупки</button>
+    <button id="purchasesByFilters" class="small">История покупок (фильтры)</button>
+    <button id="toProfile" class="small">Профиль</button>
   </div>
 
   <div id="lotsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка лотов…</div></div>
@@ -2057,6 +2120,7 @@ button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;backg
   <div class="row">
     <button id="subCreate">Создать из текущих фильтров</button>
     <button id="subRefresh">Обновить</button>
+    <button id="subRebuildUi" class="small">Обновить картинки</button>
   </div>
   <div id="subsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка подписок…</div></div>
   <div id="subsList" style="margin-top:10px"></div>
@@ -2105,8 +2169,8 @@ button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;backg
     <div class="row" id="sheetBtns"></div>
 
     <div class="hr"></div>
-    <div><b>История продаж</b></div>
-    <div id="sheetSales" class="sheetBody"></div>
+    <div><b>История</b></div>
+    <div id="sheetBody" class="sheetBody"></div>
   </div>
 </div>
 
@@ -2145,6 +2209,14 @@ const WEBAPP_JS = `(() => {
     return data;
   }
 
+  function openTg(url){
+    if (!url) return;
+    try {
+      if (tg?.openTelegramLink) return tg.openTelegramLink(url);
+    } catch {}
+    window.open(url, '_blank');
+  }
+
   function setTab(name){
     ['market','subs','profile','admin'].forEach(x => el(x).style.display = (x===name?'block':'none'));
     document.querySelectorAll('.tabbtn').forEach(b => b.classList.toggle('active', b.dataset.tab===name));
@@ -2166,7 +2238,11 @@ const WEBAPP_JS = `(() => {
   function hideSug(id){ const b=el(id); b.style.display='none'; b.innerHTML=''; }
   function renderSug(id, title, items, isSelected, onToggle){
     const b=el(id);
-    if(!items||!items.length){ hideSug(id); return; }
+    if(!items||!items.length){
+      b.style.display='block';
+      b.innerHTML = '<div class="sugHead"><b>'+title+'</b><span class="muted">пусто</span></div>';
+      return;
+    }
 
     const head =
       '<div class="sugHead">' +
@@ -2191,6 +2267,10 @@ const WEBAPP_JS = `(() => {
     }).join('');
 
     b.style.display='block';
+
+    // prevent outer click-close
+    b.onpointerdown = (e) => { e.stopPropagation(); };
+
     b.onclick = (e) => {
       const btn = e.target.closest('button[data-v]');
       if(!btn) return;
@@ -2250,10 +2330,29 @@ const WEBAPP_JS = `(() => {
     timers[kind] = setTimeout(fn, ms);
   }
 
-  // IMPORTANT: re-render list immediately after toggle => checkmark appears instantly
+  // IMPORTANT: if input equals selected text => treat as "no search" to show full list
+  function giftQuery(){
+    const raw = el('gift').value.trim();
+    const selected = giftsInputText().trim();
+    if (raw === selected) return '';
+    return raw;
+  }
+  function modelQuery(){
+    const raw = el('model').value.trim();
+    const selected = listInputText(sel.models).trim();
+    if (raw === selected) return '';
+    return raw;
+  }
+  function backdropQuery(){
+    const raw = el('backdrop').value.trim();
+    const selected = listInputText(sel.backdrops).trim();
+    if (raw === selected) return '';
+    return raw;
+  }
+
   async function showGiftSug(){
     openField('giftField');
-    const q = el('gift').value.trim();
+    const q = giftQuery();
     const r = await api('/api/mrkt/collections?q='+encodeURIComponent(q));
     const items = r.items || [];
 
@@ -2270,7 +2369,7 @@ const WEBAPP_JS = `(() => {
         el('gift').value = giftsInputText();
         el('model').value = listInputText(sel.models);
         el('backdrop').value = listInputText(sel.backdrops);
-        rerender();
+        rerender(); // immediate checkmark
       }
     );
     rerender();
@@ -2280,7 +2379,7 @@ const WEBAPP_JS = `(() => {
     openField('modelField');
     if (sel.gifts.length !== 1) { hideSug('modelSug'); return; }
     const gift = sel.gifts[0];
-    const q = el('model').value.trim();
+    const q = modelQuery();
     const r = await api('/api/mrkt/suggest?kind=model&gift='+encodeURIComponent(gift)+'&q='+encodeURIComponent(q));
     const items = r.items || [];
 
@@ -2299,7 +2398,7 @@ const WEBAPP_JS = `(() => {
     openField('backdropField');
     if (sel.gifts.length !== 1) { hideSug('backdropSug'); return; }
     const gift = sel.gifts[0];
-    const q = el('backdrop').value.trim();
+    const q = backdropQuery();
     const r = await api('/api/mrkt/suggest?kind=backdrop&gift='+encodeURIComponent(gift)+'&q='+encodeURIComponent(q));
     const items = r.items || [];
 
@@ -2326,7 +2425,7 @@ const WEBAPP_JS = `(() => {
   el('backdrop').addEventListener('click', wrap('lots', ()=>showBackdropSug()));
   el('backdrop').addEventListener('input', ()=> debounce('backdrop', ()=>wrap('lots', ()=>showBackdropSug())(), 220));
 
-  document.addEventListener('click', (e) => {
+  document.addEventListener('pointerdown', (e) => {
     if(!e.target.closest('#gift,#model,#backdrop,.sug')) {
       hideSug('giftSug'); hideSug('modelSug'); hideSug('backdropSug');
       closeAllFields();
@@ -2348,15 +2447,16 @@ const WEBAPP_JS = `(() => {
     })();
   });
 
-  // bottom sheet
+  // sheet
   const sheetWrap = el('sheetWrap');
   const sheetTitle = el('sheetTitle');
   const sheetSub = el('sheetSub');
   const sheetTop = el('sheetTop');
   const sheetKV = el('sheetKV');
   const sheetBtns = el('sheetBtns');
-  const sheetSales = el('sheetSales');
+  const sheetBody = el('sheetBody');
   const sheetImg = el('sheetImg');
+
   el('sheetClose').onclick = ()=>sheetWrap.classList.remove('show');
   sheetWrap.addEventListener('click',(e)=>{ if(e.target===sheetWrap) sheetWrap.classList.remove('show'); });
 
@@ -2366,7 +2466,7 @@ const WEBAPP_JS = `(() => {
     sheetTop.textContent='';
     sheetKV.innerHTML='';
     sheetBtns.innerHTML='';
-    sheetSales.innerHTML='';
+    sheetBody.innerHTML='';
     sheetImg.style.display='none';
     sheetImg.src='';
     sheetWrap.classList.add('show');
@@ -2375,7 +2475,7 @@ const WEBAPP_JS = `(() => {
 
   function renderSales(resp){
     if(!resp || resp.ok===false){
-      sheetSales.innerHTML = '<i class="muted">Нет данных</i>';
+      sheetBody.innerHTML = '<i class="muted">Нет данных</i>';
       return;
     }
     const approx = resp.approxPriceTon;
@@ -2386,27 +2486,56 @@ const WEBAPP_JS = `(() => {
     const items = resp.sales || [];
     if(!items.length){
       html += '<i class="muted">Нет продаж</i>';
-      sheetSales.innerHTML = html;
+      sheetBody.innerHTML = html;
       return;
     }
 
     html += items.slice(0, 12).map(x=>{
       const dt = x.ts ? new Date(x.ts).toLocaleString('ru-RU',{timeZone:'Europe/Moscow'}) : '';
-      const btns =
-        '<div style="display:flex;gap:8px;margin-top:8px">' +
-          '<button class="small" onclick="window.open(\\''+x.urlMarket+'\\',\\'_blank\\')">MRKT</button>' +
-          '<button class="small" onclick="window.open(\\''+x.urlTelegram+'\\',\\'_blank\\')">NFT</button>' +
-        '</div>';
-
       return '<div class="sale">'+
         '<div style="display:flex;justify-content:space-between;gap:10px"><b>'+x.priceTon.toFixed(3)+' TON</b><span class="muted">'+dt+'</span></div>'+
         (x.model?'<div class="muted">Model: '+x.model+'</div>':'')+
         (x.backdrop?'<div class="muted">Backdrop: '+x.backdrop+'</div>':'')+
-        btns +
+        '<div style="display:flex;gap:8px;margin-top:8px">' +
+          '<button class="small" data-open="'+x.urlMarket+'">MRKT</button>' +
+          '<button class="small" data-open="'+x.urlTelegram+'">NFT</button>' +
+        '</div>'+
       '</div>';
     }).join('<div style="height:8px"></div>');
 
-    sheetSales.innerHTML = html;
+    sheetBody.innerHTML = html;
+    sheetBody.querySelectorAll('button[data-open]').forEach(btn=>{
+      btn.onclick = () => openTg(btn.getAttribute('data-open'));
+    });
+  }
+
+  function renderPurchasesList(resp){
+    const list = resp?.items || [];
+    if (!list.length){ sheetBody.innerHTML = '<i class="muted">Покупок по этим фильтрам нет</i>'; return; }
+
+    sheetBody.innerHTML = list.map(p=>{
+      const img = p.imgUrl ? '<img src="'+p.imgUrl+'" referrerpolicy="no-referrer" loading="lazy" style="width:52px;height:52px;border-radius:14px;border:1px solid rgba(255,255,255,.12);object-fit:cover"/>' : '<div class="thumb"></div>';
+      const links =
+        (p.urlMarket ? '<button class="small" data-open="'+p.urlMarket+'">MRKT</button>' : '') +
+        (p.urlTelegram ? '<button class="small" data-open="'+p.urlTelegram+'">NFT</button>' : '');
+      return '<div class="card">'+
+        '<div class="purchRow">'+img+
+          '<div style="min-width:0;flex:1">'+
+            '<div class="ellipsis"><b>'+p.title+'</b></div>'+
+            (p.model?'<div class="muted ellipsis">Model: '+p.model+'</div>':'')+
+            (p.backdrop?'<div class="muted ellipsis">Backdrop: '+p.backdrop+'</div>':'')+
+            (p.number!=null?'<div class="muted">Number: '+p.number+'</div>':'')+
+            '<div class="muted">Buy: '+(p.boughtMsk||'-')+'</div>'+
+            '<div class="muted">Price: '+Number(p.priceTon).toFixed(3)+' TON</div>'+
+          '</div>'+
+        '</div>'+
+        '<div class="row" style="margin-top:8px">'+links+'</div>'+
+      '</div>';
+    }).join('');
+
+    sheetBody.querySelectorAll('button[data-open]').forEach(btn=>{
+      btn.onclick = () => openTg(btn.getAttribute('data-open'));
+    });
   }
 
   function renderLots(resp){
@@ -2471,19 +2600,20 @@ const WEBAPP_JS = `(() => {
           sheetBtns.appendChild(b);
         };
 
-        mkBtn('Buy', async()=>{
-          const ok = confirm('Купить?\\n'+lot.name+'\\nЦена: '+lot.priceTon.toFixed(3)+' TON');
-          if(!ok) return;
-          const r = await api('/api/mrkt/buy', { method:'POST', body: JSON.stringify({ id: lot.id, priceNano: lot.priceNano, lot }) });
-          alert('Куплено: '+r.title+' за '+r.priceTon.toFixed(3)+' TON');
-        }, true);
-
-        mkBtn('MRKT', ()=> tg?.openTelegramLink ? tg.openTelegramLink(lot.urlMarket) : window.open(lot.urlMarket,'_blank'));
-        mkBtn('NFT', ()=> tg?.openTelegramLink ? tg.openTelegramLink(lot.urlTelegram) : window.open(lot.urlTelegram,'_blank'));
+        // Keep only MRKT + NFT buttons (you can re-add Buy later)
+        mkBtn('MRKT', ()=> openTg(lot.urlMarket));
+        mkBtn('NFT', ()=> openTg(lot.urlTelegram));
 
         renderSales(det?.salesHistory);
       });
     });
+  }
+
+  // Auto retry helper
+  function scheduleRetryIfWait(resp, fn){
+    const waitMs = resp && Number(resp.waitMs || 0);
+    if (!waitMs || waitMs < 500 || waitMs > 15000) return;
+    setTimeout(() => { fn().catch(()=>{}); }, waitMs + 150);
   }
 
   async function refreshState(){
@@ -2501,25 +2631,38 @@ const WEBAPP_JS = `(() => {
 
     if(st.api.isAdmin) el('adminTabBtn').style.display='inline-block';
 
-    // subs list (simple)
+    // subs list with pictures
     const subs=st.user.subscriptions||[];
     const box=el('subsList');
     if(!subs.length){ box.innerHTML='<i class="muted">Подписок нет</i>'; }
     else{
       box.innerHTML = subs.map(s=>{
-        const gifts = (s.filters.gifts||[]).join(', ');
+        const thumb = s.ui?.thumbKey ? '<img class="thumb" src="/img/cdn?key='+encodeURIComponent(s.ui.thumbKey)+'" referrerpolicy="no-referrer"/>' : '<div class="thumb"></div>';
+        const sw = (s.ui?.swatches||[]).map(h => '<span class="dot" style="background:'+h+'"></span>').join('');
+        const gifts = (s.filters.gifts||[]).slice(0,2).join(', ');
+        const more = (s.filters.gifts||[]).length>2 ? ' +' + ((s.filters.gifts||[]).length-2) : '';
+        const notifyTxt = (s.maxNotifyTon==null)?'∞':String(s.maxNotifyTon);
+        const buyTxt = (s.maxAutoBuyTon==null)?'-':String(s.maxAutoBuyTon);
+
         return '<div class="card">'+
-          '<b>#'+s.num+' '+(s.enabled?'ON':'OFF')+'</b>'+
-          '<div class="muted">'+gifts+'</div>'+
-          '<div class="muted">Notify max: '+(s.maxNotifyTon==null?'∞':s.maxNotifyTon)+' TON</div>'+
-          '<div class="muted">AutoBuy: '+(s.autoBuyEnabled?'ON':'OFF')+' | Max: '+(s.maxAutoBuyTon==null?'-':s.maxAutoBuyTon)+' TON</div>'+
+          '<div style="display:flex;gap:10px;align-items:center">'+thumb+
+            '<div style="min-width:0;flex:1">'+
+              '<div style="display:flex;justify-content:space-between;gap:10px;align-items:center">'+
+                '<b>#'+s.num+' '+(s.enabled?'ON':'OFF')+'</b>'+
+                '<button class="small" data-act="subInfo" data-id="'+s.id+'">Info</button>'+
+              '</div>'+
+              '<div class="muted ellipsis">'+gifts+more+'</div>'+
+              (sw?('<div class="swRow">'+sw+'</div>'):'')+
+              '<div class="muted" style="margin-top:6px">Notify max: '+notifyTxt+' TON</div>'+
+              '<div class="muted">AutoBuy: '+(s.autoBuyEnabled?'ON':'OFF')+' | Max: '+buyTxt+' TON</div>'+
+            '</div>'+
+          '</div>'+
           '<div class="row" style="margin-top:8px">'+
+            '<button class="small" data-act="subNotifyMax" data-id="'+s.id+'">Max Notify</button>'+
+            '<button class="small" data-act="subAutoMax" data-id="'+s.id+'">Max AutoBuy</button>'+
+            '<button class="small" data-act="subAutoToggle" data-id="'+s.id+'">'+(s.autoBuyEnabled?'AutoBuy OFF':'AutoBuy ON')+'</button>'+
             '<button class="small" data-act="subToggle" data-id="'+s.id+'">'+(s.enabled?'Disable':'Enable')+'</button>'+
             '<button class="small" data-act="subDel" data-id="'+s.id+'">Delete</button>'+
-            '<button class="small" data-act="subNotifyMax" data-id="'+s.id+'">Max Notify</button>'+
-            '<button class="small" data-act="subAutoToggle" data-id="'+s.id+'">'+(s.autoBuyEnabled?'AutoBuy OFF':'AutoBuy ON')+'</button>'+
-            '<button class="small" data-act="subAutoMax" data-id="'+s.id+'">Max AutoBuy</button>'+
-            '<button class="small" data-act="subInfo" data-id="'+s.id+'">Info</button>'+
           '</div>'+
         '</div>';
       }).join('');
@@ -2529,6 +2672,7 @@ const WEBAPP_JS = `(() => {
   async function refreshMarketData(){
     const lots = await api('/api/mrkt/lots');
     renderLots(lots);
+    scheduleRetryIfWait(lots, refreshMarketData);
   }
 
   async function refreshAll(){
@@ -2553,24 +2697,29 @@ const WEBAPP_JS = `(() => {
         ? list.map(p=>{
             const img = p.imgUrl ? '<img src="'+p.imgUrl+'" referrerpolicy="no-referrer" loading="lazy"/>' : '<div class="thumb"></div>';
             const links =
-              (p.urlMarket ? '<button class="small" onclick="window.open(\\''+p.urlMarket+'\\',\\'_blank\\')">MRKT</button>' : '') +
-              (p.urlTelegram ? '<button class="small" onclick="window.open(\\''+p.urlTelegram+'\\',\\'_blank\\')">NFT</button>' : '');
+              (p.urlMarket ? '<button class="small" data-open="'+p.urlMarket+'">MRKT</button>' : '') +
+              (p.urlTelegram ? '<button class="small" data-open="'+p.urlTelegram+'">NFT</button>' : '');
             return '<div class="card">'+
               '<div class="purchRow">'+img+
-                '<div style="min-width:0">'+
+                '<div style="min-width:0;flex:1">'+
                   '<div class="ellipsis"><b>'+p.title+'</b></div>'+
                   (p.model?'<div class="muted ellipsis">Model: '+p.model+'</div>':'')+
                   (p.backdrop?'<div class="muted ellipsis">Backdrop: '+p.backdrop+'</div>':'')+
+                  (p.number!=null?'<div class="muted">Number: '+p.number+'</div>':'')+
+                  '<div class="muted">Buy: '+(p.boughtMsk||'-')+(p.latencyMs!=null?(' · '+p.latencyMs+'ms'):'')+'</div>'+
+                  '<div class="muted">Price: '+Number(p.priceTon).toFixed(3)+' TON</div>'+
+                  (p.lotId?('<div class="muted">ID: '+p.lotId+'</div>'):'')+
                 '</div>'+
               '</div>'+
-              '<div class="muted" style="margin-top:8px">Found: '+(p.foundMsk||'-')+'</div>'+
-              '<div class="muted">Buy: '+(p.boughtMsk||'-')+(p.latencyMs!=null?(' · Latency '+p.latencyMs+' ms'):'')+'</div>'+
-              '<div class="muted">Price: '+Number(p.priceTon).toFixed(3)+' TON</div>'+
-              (p.lotId?('<div class="muted">ID: '+p.lotId+'</div>'):'')+
               '<div class="row" style="margin-top:8px">'+links+'</div>'+
             '</div>';
           }).join('')
         : '<i class="muted">Покупок пока нет</i>';
+
+      box.querySelectorAll('button[data-open]').forEach(btn=>{
+        btn.onclick = () => openTg(btn.getAttribute('data-open'));
+      });
+
     } finally {
       setLoading('profile', false);
     }
@@ -2588,14 +2737,23 @@ const WEBAPP_JS = `(() => {
       'refresh lastStatus: '+(r.refresh?.lastStatus||'-');
   }
 
-  // Main buttons
+  // Buttons
   el('apply').onclick = wrap('lots', async()=>{ await patchFilters(); await refreshAll(); });
   el('refresh').onclick = wrap('lots', async()=>{ await refreshAll(); });
+
   el('toProfile').onclick = async () => { setTab('profile'); await refreshProfile().catch(()=>{}); };
+
+  el('purchasesByFilters').onclick = wrap('lots', async()=>{
+    openSheet('Покупки', 'по текущим фильтрам');
+    sheetTop.innerHTML = '<div class="muted">Фильтры применены</div>';
+    const r = await api('/api/purchases/by_filters');
+    renderPurchasesList(r);
+  });
 
   // Subs buttons
   el('subCreate').onclick = wrap('subs', async()=>{ await api('/api/sub/create',{method:'POST'}); await refreshState(); });
   el('subRefresh').onclick = wrap('subs', async()=>{ await refreshState(); });
+  el('subRebuildUi').onclick = wrap('subs', async()=>{ await api('/api/sub/rebuild_ui',{method:'POST'}); await refreshState(); });
 
   // Subs actions
   document.body.addEventListener('click', (e) => {
@@ -2668,6 +2826,99 @@ const WEBAPP_JS = `(() => {
     await refreshAdmin();
   }));
 
-  // initial
+  // initial load
   wrap('lots', async()=>{ await refreshAll(); })();
 })();`;
+
+// ===================== Admin endpoints require these helpers =====================
+app.use(express.json({ limit: '4mb' }));
+
+// ===================== Admin endpoints (server-side) =====================
+function tryParseJsonMaybe(s) {
+  if (typeof s !== 'string') return null;
+  const t = s.trim();
+  if (!t) return null;
+  if (!(t.startsWith('{') || t.startsWith('['))) return null;
+  try { return JSON.parse(t); } catch { return null; }
+}
+
+app.get('/api/admin/status', auth, async (req, res) => {
+  if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
+  const sess = mrktSessionRuntime || (await loadMrktSessionFromRedis());
+  res.json({
+    ok: true,
+    mrktAuthSet: !!MRKT_AUTH_RUNTIME,
+    mrktAuthMask: MRKT_AUTH_RUNTIME ? maskToken(MRKT_AUTH_RUNTIME) : null,
+    mrktSessionSaved: !!sess,
+    mrktLastFail: mrktState.lastFailMsg || null,
+    pauseUntil: mrktState.pauseUntil || 0,
+    refresh: { ...mrktAuthDebug },
+  });
+});
+
+app.post('/api/admin/session', auth, async (req, res) => {
+  if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
+
+  const payloadJson = req.body?.payloadJson;
+  let data = null;
+  let photo = null;
+
+  if (typeof payloadJson === 'string' && payloadJson.trim()) {
+    const j = tryParseJsonMaybe(payloadJson);
+    if (!j || typeof j !== 'object') return res.status(400).json({ ok: false, reason: 'BAD_PAYLOAD_JSON' });
+    data = typeof j.data === 'string' ? j.data : null;
+    photo = (j.photo === undefined) ? null : j.photo;
+  } else {
+    data = typeof req.body?.data === 'string' ? req.body.data : null;
+    const rawPhoto = req.body?.photo;
+    if (rawPhoto == null || rawPhoto === '') photo = null;
+    else if (typeof rawPhoto === 'string') {
+      const pj = tryParseJsonMaybe(rawPhoto);
+      photo = pj != null ? pj : rawPhoto;
+    } else {
+      photo = rawPhoto;
+    }
+  }
+
+  if (!data || !String(data).includes('hash=')) return res.status(400).json({ ok: false, reason: 'BAD_DATA_NO_HASH' });
+
+  const sess = { data: String(data), photo };
+  mrktSessionRuntime = sess;
+  if (redis) await saveMrktSessionToRedis(sess);
+
+  const rr = await tryRefreshMrktToken('admin_save_session', { force: true });
+  if (!rr.ok) {
+    return res.status(400).json({
+      ok: false,
+      reason: `SESSION_SAVED_BUT_REFRESH_FAILED:${rr.reason}`,
+      refresh: { ...mrktAuthDebug },
+      lastFail: mrktState.lastFailMsg || null,
+    });
+  }
+
+  res.json({ ok: true, tokenMask: maskToken(MRKT_AUTH_RUNTIME), refresh: { ...mrktAuthDebug } });
+});
+
+app.post('/api/admin/refresh_token', auth, async (req, res) => {
+  if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
+  const rr = await tryRefreshMrktToken('admin_manual_refresh', { force: true });
+  if (!rr.ok) return res.status(400).json({ ok: false, reason: rr.reason, refresh: { ...mrktAuthDebug } });
+  res.json({ ok: true, tokenMask: maskToken(MRKT_AUTH_RUNTIME), refresh: { ...mrktAuthDebug } });
+});
+
+app.get('/api/admin/test_mrkt', auth, async (req, res) => {
+  if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
+  const cols = await mrktGetCollections();
+  res.json({ ok: true, collectionsCount: cols.length, tokenMask: MRKT_AUTH_RUNTIME ? maskToken(MRKT_AUTH_RUNTIME) : null, lastFail: mrktState.lastFailMsg || null, refresh: { ...mrktAuthDebug } });
+});
+
+// ===================== Telegram webhook/polling =====================
+if (PUBLIC_URL) {
+  const hookUrl = `${PUBLIC_URL.replace(/\/+$/, '')}/telegram-webhook`;
+  bot.setWebHook(hookUrl).then(() => console.log('Webhook set:', hookUrl)).catch((e) => console.error('setWebHook error:', e?.message || e));
+  app.post('/telegram-webhook', (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
+} else {
+  bot.deleteWebHook({ drop_pending_updates: true }).catch(() => {});
+  bot.startPolling({ interval: 300, autoStart: true });
+  console.log('Polling started (PUBLIC_URL not set)');
+}
