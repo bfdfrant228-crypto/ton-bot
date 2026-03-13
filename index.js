@@ -1624,7 +1624,7 @@ async function tryAutoBuyFromFeed(userId, sub) {
     modelNames: models,
     backdropNames: backdrops,
     cursor: '',
-    count: 20,
+    count: 30,
     ordering: 'Latest',
     types: ['listing', 'change_price'],
   });
@@ -1636,6 +1636,7 @@ async function tryAutoBuyFromFeed(userId, sub) {
   if (!r.items.length) return { ok: true, bought: false };
 
   const latestId = r.items[0]?.id || null;
+
   if (latestId && !st.autoBuyLastId && !sub.autoBuyAny) {
     subStates.set(stateKey, { ...st, autoBuyLastId: latestId });
     return { ok: true, bought: false };
@@ -1665,19 +1666,29 @@ async function tryAutoBuyFromFeed(userId, sub) {
   if (!candidates.length) return { ok: true, bought: false };
 
   candidates.sort((a, b) => a.priceTon - b.priceTon);
-
   const pick = candidates[0];
-  const lotId = String(pick.g.id);
 
+  const lotId = String(pick.g.id);
   const attemptKey = `${userId}:${lotId}`;
   const lastAttempt = autoBuyRecentAttempts.get(attemptKey);
-  if (lastAttempt && nowMs() - lastAttempt < AUTO_BUY_ATTEMPT_TTL_MS) return { ok: true, bought: false };
+  if (lastAttempt && nowMs() - lastAttempt < AUTO_BUY_ATTEMPT_TTL_MS) {
+    return { ok: true, bought: false };
+  }
   autoBuyRecentAttempts.set(attemptKey, nowMs());
 
-  if (AUTO_BUY_DRY_RUN) return { ok: true, bought: true, dry: true, priceTon: pick.priceTon };
+  const tsFound = Date.now();
+
+  if (AUTO_BUY_DRY_RUN) {
+    return { ok: true, bought: true, dry: true, priceTon: pick.priceTon, tsFound };
+  }
 
   const buyRes = await mrktBuy({ id: lotId, priceNano: pick.priceNano });
   if (!buyRes.ok) return { ok: true, bought: false, buyFail: buyRes };
+
+  const tsBought = Date.now();
+  const listedRaw = pick.it?.date ? Date.parse(pick.it.date) : NaN;
+  const tsListed = Number.isFinite(listedRaw) ? listedRaw : null;
+  const latencyMs = tsListed != null ? Math.max(0, tsBought - tsListed) : null;
 
   const base = (pick.g.collectionTitle || pick.g.collectionName || pick.g.title || f.gifts[0]).trim();
   const number = pick.g.number ?? null;
@@ -1694,9 +1705,10 @@ async function tryAutoBuyFromFeed(userId, sub) {
 
   const u = getOrCreateUser(userId);
   pushPurchase(u, {
-    tsFound: Date.now(),
-    tsBought: Date.now(),
-    latencyMs: null,
+    tsListed,
+    tsFound,
+    tsBought,
+    latencyMs,
     title,
     priceTon: pick.priceTon,
     urlTelegram,
@@ -1711,7 +1723,14 @@ async function tryAutoBuyFromFeed(userId, sub) {
   });
   scheduleSave();
 
-  return { ok: true, bought: true, priceTon: pick.priceTon, urlTelegram, urlMarket };
+  return {
+    ok: true,
+    bought: true,
+    priceTon: pick.priceTon,
+    urlTelegram,
+    urlMarket,
+    latencyMs,
+  };
 }
 
 async function autoBuyCycle() {
@@ -1734,17 +1753,32 @@ async function autoBuyCycle() {
         if (buysDone >= AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE) break;
 
         const r1 = await tryAutoBuyFromFeed(userId, sub);
+
         if (r1 && r1.bought) {
           buysDone++;
+
           if (AUTO_BUY_DRY_RUN) {
-            await sendMessageSafe(userChatId(userId), `AutoBuy (DRY) OK: ${Number(r1.priceTon).toFixed(3)} TON`, { disable_web_page_preview: true });
-          } else {
             await sendMessageSafe(
               userChatId(userId),
-              `✅ AutoBuy OK\nЦена: ${Number(r1.priceTon).toFixed(3)} TON\n${r1.urlTelegram || ''}`,
-              { disable_web_page_preview: false, reply_markup: mkReplyMarkupOpen(r1.urlMarket, 'MRKT') }
+              `AutoBuy (DRY) OK: ${Number(r1.priceTon).toFixed(3)} TON`,
+              { disable_web_page_preview: true }
             );
+          } else {
+            let msg =
+              `✅ AutoBuy OK\n` +
+              `Цена: ${Number(r1.priceTon).toFixed(3)} TON\n`;
+
+            if (r1.latencyMs != null) {
+              msg += `Latency: ${(Number(r1.latencyMs) / 1000).toFixed(2)}s\n`;
+            }
+            msg += `${r1.urlTelegram || ''}`;
+
+            await sendMessageSafe(userChatId(userId), msg, {
+              disable_web_page_preview: false,
+              reply_markup: mkReplyMarkupOpen(r1.urlMarket, 'MRKT'),
+            });
           }
+
           if (AUTO_BUY_DISABLE_AFTER_SUCCESS) {
             sub.autoBuyEnabled = false;
             scheduleSave();
@@ -1752,14 +1786,19 @@ async function autoBuyCycle() {
           continue;
         }
 
-        const maxBuy = Number(sub.maxAutoBuyTon);
-        if (!Number.isFinite(maxBuy) || maxBuy <= 0) continue;
-
         if (sub.autoBuyAny) {
+          const maxBuy = Number(sub.maxAutoBuyTon);
+          if (!Number.isFinite(maxBuy) || maxBuy <= 0) continue;
+
           const sf = normalizeFilters(sub.filters || {});
           if (!sf.gifts.length) continue;
 
-          const r = await mrktSearchLotsByFilters(sf, 1, { ordering: 'Latest', lowToHigh: false, count: 20 });
+          const r = await mrktSearchLotsByFilters(sf, 2, {
+            ordering: 'Price',
+            lowToHigh: true,
+            count: Math.max(MRKT_COUNT, 20),
+          });
+
           if (!r.ok || !r.gifts?.length) continue;
 
           const candidate = r.gifts.find((x) => x.priceTon <= maxBuy) || null;
@@ -1771,20 +1810,28 @@ async function autoBuyCycle() {
           autoBuyRecentAttempts.set(attemptKey, nowMs());
 
           if (AUTO_BUY_DRY_RUN) {
-            await sendMessageSafe(userChatId(userId), `AutoBuy (DRY) кандидат: ${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`, {
-              disable_web_page_preview: false,
-              reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
-            });
+            await sendMessageSafe(
+              userChatId(userId),
+              `AutoBuy (DRY) кандидат: ${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`,
+              {
+                disable_web_page_preview: false,
+                reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
+              }
+            );
             buysDone++;
             continue;
           }
 
+          const tsFound = Date.now();
           const buyRes = await mrktBuy({ id: candidate.id, priceNano: candidate.priceNano });
           if (buyRes.ok) {
+            const tsBought = Date.now();
+
             const u = getOrCreateUser(userId);
             pushPurchase(u, {
-              tsFound: Date.now(),
-              tsBought: Date.now(),
+              tsFound,
+              tsBought,
+              latencyMs: null,
               title: candidate.name,
               priceTon: candidate.priceTon,
               urlTelegram: candidate.urlTelegram,
@@ -1799,10 +1846,15 @@ async function autoBuyCycle() {
             });
             scheduleSave();
 
-            await sendMessageSafe(userChatId(userId), `✅ AutoBuy OK\n${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`, {
-              disable_web_page_preview: false,
-              reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
-            });
+            await sendMessageSafe(
+              userChatId(userId),
+              `✅ AutoBuy OK\n${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`,
+              {
+                disable_web_page_preview: false,
+                reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
+              }
+            );
+
             buysDone++;
             if (AUTO_BUY_DISABLE_AFTER_SUCCESS) {
               sub.autoBuyEnabled = false;
@@ -1811,7 +1863,9 @@ async function autoBuyCycle() {
           } else if (isNoFundsError(buyRes)) {
             for (const s2 of subs) if (s2) s2.autoBuyEnabled = false;
             scheduleSave();
-            await sendMessageSafe(userChatId(userId), `❌ AutoBuy stop: no funds`, { disable_web_page_preview: true });
+            await sendMessageSafe(userChatId(userId), `❌ AutoBuy stop: no funds`, {
+              disable_web_page_preview: true,
+            });
           }
         }
       }
@@ -2493,82 +2547,65 @@ const WEBAPP_JS = `(() => {
       scheduleRetryIfWait(r, () => refreshLots(true));
     }
 
-    async function refreshProfile(){
-      const r = await api('/api/profile');
-      const user = r.user || null;
-      const box = el('profileBox');
-      const pfp = el('pfp');
+  async function refreshProfile(){
+  const r = await api('/api/profile');
+  const user = r.user || null;
+  const box = el('profileBox');
+  const pfp = el('pfp');
 
-      if (user) {
-        const fn = user.first_name || '';
-        const un = user.username ? ('@' + user.username) : '';
-        box.textContent = (fn + ' ' + un).trim() || 'Пользователь';
-        if (user.photo_url) {
-          pfp.src = user.photo_url;
-          pfp.style.display = 'block';
-        } else {
-          pfp.style.display = 'none';
-        }
-      } else {
-        box.textContent = 'Пользователь';
-        pfp.style.display = 'none';
-      }
+  if (user) {
+    const fn = user.first_name || '';
+    const un = user.username ? ('@' + user.username) : '';
+    box.textContent = (fn + ' ' + un).trim() || 'Пользователь';
+    if (user.photo_url) {
+      pfp.src = user.photo_url;
+      pfp.style.display = 'block';
+    } else {
+      pfp.style.display = 'none';
+    }
+  } else {
+    box.textContent = 'Пользователь';
+    pfp.style.display = 'none';
+  }
 
-      const list = el('purchases');
-      const items = r.purchases || [];
-      if (!items.length) {
-        list.innerHTML = '<div class="muted">Покупок нет</div>';
-        return;
-      }
+  const list = el('purchases');
+  const items = r.purchases || [];
+  if (!items.length) {
+    list.innerHTML = '<div class="muted">Покупок нет</div>';
+    return;
+  }
 
-      list.innerHTML = items.map((p) => {
-        return '<div class="card" style="margin:0">' +
+  list.innerHTML = items.map((p) => {
+    const img = p.imgUrl
+      ? '<img src="' + p.imgUrl + '" referrerpolicy="no-referrer"/>'
+      : '<div style="width:52px;height:52px;border-radius:14px;border:1px solid var(--border);background:rgba(255,255,255,.03)"></div>';
+
+    const titleParts = [];
+    if (p.title) titleParts.push(p.title);
+    if (p.model) titleParts.push('Model: ' + p.model);
+    if (p.backdrop) titleParts.push('Backdrop: ' + p.backdrop);
+
+    const btns =
+      '<div class="linkBtns">' +
+        (p.urlMarket ? '<a class="linkBtn" href="' + p.urlMarket + '" target="_blank">MRKT</a>' : '') +
+        (p.urlTelegram ? '<a class="linkBtn" href="' + p.urlTelegram + '" target="_blank">NFT</a>' : '') +
+      '</div>';
+
+    return '<div class="card" style="margin:0">' +
+      '<div class="purchRow">' +
+        img +
+        '<div style="min-width:0;flex:1">' +
           '<div><b>' + (p.title || 'Gift') + '</b></div>' +
           '<div class="muted">Цена: ' + Number(p.priceTon || 0).toFixed(3) + ' TON</div>' +
           (p.boughtMsk ? '<div class="muted">' + p.boughtMsk + '</div>' : '') +
-          (p.urlTelegram ? '<div class="muted"><a href="' + p.urlTelegram + '" target="_blank" style="color:#7fffd4">Telegram</a></div>' : '') +
-        '</div>';
-      }).join('');
-    }
-
-    async function refreshSubs(){
-      const s = await api('/api/state');
-      currentState = s;
-      const list = el('subsList');
-      const subs = s.user?.subscriptions || [];
-      if (!subs.length) {
-        list.innerHTML = '<div class="muted">Подписок нет</div>';
-        return;
-      }
-
-      list.innerHTML = subs.map(sub => {
-        const f = sub.filters || {};
-        const gifts = (f.gifts || []).map(v => (f.giftLabels && f.giftLabels[v]) ? f.giftLabels[v] : v).join(', ') || '(не выбран)';
-        const models = (f.models || []).join(', ');
-        const backs = (f.backdrops || []).join(', ');
-        const notifyMax = sub.maxNotifyTon == null ? '∞' : sub.maxNotifyTon;
-        const autoMax = sub.maxAutoBuyTon == null ? '-' : sub.maxAutoBuyTon;
-        const mode = sub.autoBuyAny ? 'ANY' : 'NEW';
-
-        return '<div class="card" style="margin:10px 0">' +
-          '<div><b>#' + sub.num + '</b> ' + (sub.enabled ? 'ON' : 'OFF') + '</div>' +
-          '<div class="muted">Gifts: ' + gifts + '</div>' +
-          (models ? '<div class="muted">Models: ' + models + '</div>' : '') +
-          (backs ? '<div class="muted">Backdrops: ' + backs + '</div>' : '') +
-          (f.numberPrefix ? '<div class="muted">Number prefix: ' + f.numberPrefix + '</div>' : '') +
-          '<div class="muted">Notify max: ' + notifyMax + ' TON</div>' +
-          '<div class="muted">AutoBuy: ' + (sub.autoBuyEnabled ? 'ON' : 'OFF') + ' / max: ' + autoMax + ' TON / mode: ' + mode + '</div>' +
-          '<div class="row" style="margin-top:10px">' +
-            '<button class="small" data-sub-act="toggle" data-id="' + sub.id + '">' + (sub.enabled ? '⏸' : '▶️') + '</button>' +
-            '<button class="small" data-sub-act="delete" data-id="' + sub.id + '">🗑</button>' +
-            '<button class="small" data-sub-act="nmax" data-id="' + sub.id + '">Notify max</button>' +
-            '<button class="small" data-sub-act="ab" data-id="' + sub.id + '">AutoBuy</button>' +
-            '<button class="small" data-sub-act="amax" data-id="' + sub.id + '">Auto max</button>' +
-            '<button class="small" data-sub-act="mode" data-id="' + sub.id + '">Mode</button>' +
-          '</div>' +
-        '</div>';
-      }).join('');
-    }
+          (p.latencyMs != null ? '<div class="muted">Latency: ' + (Number(p.latencyMs) / 1000).toFixed(2) + 's</div>' : '') +
+          (titleParts.length > 1 ? '<div class="muted ellipsis">' + titleParts.slice(1).join(' · ') + '</div>' : '') +
+          btns +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
 
     async function refreshAdmin(){
       const r = await api('/api/admin/status');
@@ -3233,19 +3270,24 @@ app.post('/api/mrkt/buy', auth, async (req, res) => {
 // ===================== Profile =====================
 app.get('/api/profile', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
+
   const purchases = (u.purchases || []).slice(0, 120).map((p) => ({
     title: p.title,
     lotId: p.lotId || null,
     priceTon: p.priceTon,
     boughtMsk: p.tsBought ? new Date(p.tsBought).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }) : null,
     latencyMs: p.latencyMs ?? null,
-    imgUrl: p.giftName ? `/img/gift?name=${encodeURIComponent(p.giftName)}` : (p.thumbKey ? `/img/cdn?key=${encodeURIComponent(p.thumbKey)}` : null),
+    imgUrl: p.giftName
+      ? `/img/gift?name=${encodeURIComponent(p.giftName)}`
+      : (p.thumbKey ? `/img/cdn?key=${encodeURIComponent(p.thumbKey)}` : null),
     urlTelegram: p.urlTelegram || null,
     urlMarket: p.urlMarket || null,
     model: p.model || null,
     backdrop: p.backdrop || null,
+    collection: p.collection || null,
     number: p.number ?? null,
   }));
+
   res.json({ ok: true, user: req.tgUser, purchases });
 });
 
