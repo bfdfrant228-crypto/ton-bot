@@ -1,5 +1,15 @@
 /**
- * v30-stable-mrkt-panel
+ * v31 (MRKT stable panel)
+ * - Fixed NO_INIT_DATA handling with Telegram WebApp script + wait/fallback
+ * - Admin tab preserved
+ * - MRKT token refresh via session payload preserved
+ * - Subscriptions preserved
+ * - AutoBuy preserved + mode NEW / ANY
+ * - Lot sheet: sales are NOT auto-loaded; Gift/Model/Backdrop clickable
+ * - Sales list has MRKT / NFT buttons
+ * - Sub cards have image + backdrop swatches + pause/delete top-right
+ * - Backdrop fallback from saling when /gifts/backdrops is empty
+ *
  * Node 18+
  * deps: express, node-telegram-bot-api, redis(optional)
  */
@@ -26,6 +36,7 @@ const PUBLIC_URL =
 
 const WEBAPP_AUTH_MAX_AGE_SEC = Number(process.env.WEBAPP_AUTH_MAX_AGE_SEC || 86400);
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID ? Number(process.env.ADMIN_USER_ID) : null;
+
 const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL || null;
 
 // MRKT
@@ -54,7 +65,7 @@ const WEBAPP_SUGGEST_LIMIT = Number(process.env.WEBAPP_SUGGEST_LIMIT || 120);
 
 // global scan
 const GLOBAL_SCAN_COLLECTIONS = Number(process.env.GLOBAL_SCAN_COLLECTIONS || 1);
-const GLOBAL_SCAN_CACHE_TTL_MS = Number(process.env.GLOBAL_SCAN_CACHE_TTL_MS || 120_000);
+const GLOBAL_SCAN_CACHE_TTL_MS = Number(process.env.GLOBAL_SCAN_CACHE_TTL_MS || 120000);
 
 // caches
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60_000);
@@ -95,7 +106,7 @@ const SALES_HISTORY_TIME_BUDGET_MS = Number(process.env.SALES_HISTORY_TIME_BUDGE
 // MRKT auth refresh
 const MRKT_AUTH_REFRESH_COOLDOWN_MS = Number(process.env.MRKT_AUTH_REFRESH_COOLDOWN_MS || 8000);
 
-// manual buy button
+// manual buy
 const MANUAL_BUY_ENABLED = String(process.env.MANUAL_BUY_ENABLED || '0') === '1';
 
 // Redis keys
@@ -103,7 +114,7 @@ const REDIS_KEY_STATE = 'bot:state:main';
 const REDIS_KEY_MRKT_AUTH = 'mrkt:auth:token';
 const REDIS_KEY_MRKT_SESSION = 'mrkt:session:admin';
 
-console.log('v30-stable-mrkt-panel start', {
+console.log('v31 start', {
   MODE,
   PUBLIC_URL: !!PUBLIC_URL,
   WEBAPP_URL: !!WEBAPP_URL,
@@ -266,7 +277,7 @@ function verifyTelegramWebAppInitData(initData) {
   const pairs = [];
   for (const [k, v] of params.entries()) pairs.push([k, v]);
   pairs.sort((a, b) => a[0].localeCompare(b[0]));
-  const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join('\n');
+  const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join('\\n');
 
   const secretKey = crypto.createHmac('sha256', 'WebAppData').update(TELEGRAM_TOKEN).digest();
   const calcHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
@@ -310,10 +321,7 @@ async function redisSet(key, val, opts) {
 
 // ===================== Telegram bot =====================
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
-const MAIN_KEYBOARD = {
-  keyboard: [[{ text: '📌 Статус' }]],
-  resize_keyboard: true,
-};
+const MAIN_KEYBOARD = { keyboard: [[{ text: '📌 Статус' }]], resize_keyboard: true };
 
 async function sendMessageSafe(chatId, text, opts) {
   while (true) {
@@ -358,7 +366,7 @@ async function sendPhotoSafe(chatId, photoUrl, caption, reply_markup) {
 
 // ===================== State =====================
 const users = new Map();
-const subStates = new Map(); // key -> { floor, emptyStreak, feedLastId, autoBuyLastId }
+const subStates = new Map();
 const autoBuyRecentAttempts = new Map();
 
 function normalizeFilters(f) {
@@ -423,7 +431,6 @@ function pushPurchase(user, entry) {
   });
   user.purchases = user.purchases.slice(0, 500);
 }
-
 function exportState() {
   const out = { users: {} };
   for (const [userId, u] of users.entries()) {
@@ -437,7 +444,6 @@ function exportState() {
   }
   return out;
 }
-
 function importState(parsed) {
   const objUsers = parsed?.users && typeof parsed.users === 'object' ? parsed.users : {};
   for (const [idStr, u] of Object.entries(objUsers)) {
@@ -533,11 +539,7 @@ async function loadMrktSessionFromRedis() {
 
 async function mrktAuthWithSession(session) {
   const url = `${MRKT_API_URL}/auth`;
-  const body = {
-    appId: null,
-    data: String(session?.data || ''),
-    photo: session?.photo ?? null,
-  };
+  const body = { appId: null, data: String(session?.data || ''), photo: session?.photo ?? null };
 
   const res = await fetchWithTimeout(url, {
     method: 'POST',
@@ -569,7 +571,6 @@ async function mrktAuthWithSession(session) {
 
   const token = data?.token || null;
   if (!token) return { ok: false, status: res.status, reason: 'NO_TOKEN_IN_RESPONSE', text: txt };
-
   return { ok: true, status: res.status, token: String(token) };
 }
 
@@ -674,7 +675,6 @@ function markMrktFail(endpoint, status, txt) {
   mrktState.lastFailStatus = status || null;
   mrktState.lastFailMsg = extractMrktErrorMessage(txt) || (status ? `HTTP ${status}` : 'MRKT error');
 }
-
 async function mrktGateCheckOrWait() {
   const now = nowMs();
   const pauseMs = (mrktState.pauseUntil && now < mrktState.pauseUntil) ? (mrktState.pauseUntil - now) : 0;
@@ -687,7 +687,6 @@ async function mrktGateCheckOrWait() {
   mrktState.nextAllowedAt = nowMs() + MRKT_MIN_GAP_MS;
   return { ok: true, waitMs: 0 };
 }
-
 function mrktHeadersCommon() {
   return {
     ...(MRKT_AUTH_RUNTIME ? { Authorization: MRKT_AUTH_RUNTIME } : {}),
@@ -704,7 +703,6 @@ function bodyLooksLikeRpsLimit(txt) {
   const s = String(txt || '').toLowerCase();
   return s.includes('more rps') || (s.includes('rps') && s.includes('support'));
 }
-
 async function mrktGetJson(path, { retry = true } = {}) {
   return mrktRunExclusive(async () => {
     if (!MRKT_AUTH_RUNTIME) {
@@ -749,7 +747,6 @@ async function mrktGetJson(path, { retry = true } = {}) {
     return { ok: true, status: res.status, data, text: txt };
   });
 }
-
 async function mrktPostJson(path, bodyObj, { retry = true } = {}) {
   return mrktRunExclusive(async () => {
     if (!MRKT_AUTH_RUNTIME) {
@@ -869,26 +866,53 @@ async function mrktGetBackdropsForGift(giftName) {
   const cached = backdropsCache.get(giftName);
   if (cached && nowMs() - cached.time < CACHE_TTL_MS) return cached.items;
 
-  const r = await mrktPostJson('/gifts/backdrops', { collections: [giftName] });
-  if (!r.ok) return cached?.items || [];
-
-  const arr = Array.isArray(r.data) ? r.data : [];
   const map = new Map();
-  for (const it of arr) {
-    const name = it.backdropName || it.name || null;
-    if (!name) continue;
-    const key = normTraitName(name);
 
-    const v = it.backdropColorsCenterColor ?? it.colorsCenterColor ?? it.centerColor ?? null;
-    const num = Number(v);
-    const hex = Number.isFinite(num)
-      ? ('#' + ((num >>> 0).toString(16).padStart(6, '0')).slice(-6))
-      : null;
+  const fillFromArr = (arr) => {
+    for (const it of arr || []) {
+      const name = it?.backdropName || it?.name || null;
+      if (!name) continue;
+      const key = normTraitName(name);
 
-    if (!map.has(key)) map.set(key, { name: String(name), centerHex: hex });
+      const v = it?.backdropColorsCenterColor ?? it?.colorsCenterColor ?? it?.centerColor ?? null;
+      const num = Number(v);
+      const hex = Number.isFinite(num)
+        ? ('#' + ((num >>> 0).toString(16).padStart(6, '0')).slice(-6))
+        : null;
+
+      if (!map.has(key)) map.set(key, { name: String(name), centerHex: hex });
+    }
+  };
+
+  const r = await mrktPostJson('/gifts/backdrops', { collections: [giftName] });
+  if (r.ok) {
+    const arr = Array.isArray(r.data) ? r.data : [];
+    fillFromArr(arr);
   }
 
-  const items = Array.from(map.values());
+  if (map.size === 0) {
+    const rr = await mrktFetchSalingPage({
+      collectionNames: [giftName],
+      modelNames: [],
+      backdropNames: [],
+      cursor: '',
+      ordering: 'Latest',
+      lowToHigh: false,
+      count: 100,
+      number: null,
+    });
+
+    if (rr.ok && Array.isArray(rr.gifts)) {
+      for (const g of rr.gifts) {
+        const name = g?.backdropName || null;
+        if (!name) continue;
+        const key = normTraitName(name);
+        if (!map.has(key)) map.set(key, { name: String(name), centerHex: null });
+      }
+    }
+  }
+
+  const items = Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
   backdropsCache.set(giftName, { time: nowMs(), items });
   return items;
 }
@@ -902,18 +926,16 @@ function buildSalingBody({
   ordering = 'Price',
   lowToHigh = true,
   number = null,
+  maxPrice = null,
+  minPrice = null,
 } = {}) {
   return {
-    count,
-    cursor,
-    collectionNames,
-    modelNames,
-    backdropNames,
+    count, cursor,
+    collectionNames, modelNames, backdropNames,
     symbolNames: [],
-    ordering,
-    lowToHigh,
-    maxPrice: null,
-    minPrice: null,
+    ordering, lowToHigh,
+    maxPrice: maxPrice ?? null,
+    minPrice: minPrice ?? null,
     number: number != null ? Number(number) : null,
     query: null,
     promotedFirst: false,
@@ -933,15 +955,7 @@ async function mrktFetchSalingPage({ collectionNames, modelNames, backdropNames,
   });
 
   const r = await mrktPostJson('/gifts/saling', body);
-  if (!r.ok) {
-    return {
-      ok: false,
-      reason: r.status === 429 ? 'RPS_WAIT' : 'ERROR',
-      waitMs: r.waitMs || 0,
-      gifts: [],
-      cursor: '',
-    };
-  }
+  if (!r.ok) return { ok: false, reason: r.status === 429 ? 'RPS_WAIT' : 'ERROR', waitMs: r.waitMs || 0, gifts: [], cursor: '' };
 
   const gifts = Array.isArray(r.data?.gifts) ? r.data.gifts : [];
   const nextCursor = r.data?.cursor || r.data?.nextCursor || '';
@@ -951,9 +965,7 @@ async function mrktFetchSalingPage({ collectionNames, modelNames, backdropNames,
 function salingGiftToLot(g) {
   const nanoA = g?.salePriceWithoutFee ?? null;
   const nanoB = g?.salePrice ?? null;
-  const nano = (nanoA != null && Number(nanoA) > 0)
-    ? Number(nanoA)
-    : (nanoB != null ? Number(nanoB) : NaN);
+  const nano = (nanoA != null && Number(nanoA) > 0) ? Number(nanoA) : (nanoB != null ? Number(nanoB) : NaN);
 
   const priceTon = Number(nano) / 1e9;
   if (!Number.isFinite(priceTon) || priceTon <= 0) return null;
@@ -963,9 +975,7 @@ function salingGiftToLot(g) {
   const displayName = numberVal != null ? `${baseName} #${numberVal}` : baseName;
 
   const giftName = g.name || giftNameFallbackFromCollectionAndNumber(baseName, numberVal) || null;
-  const urlTelegram = giftName && String(giftName).includes('-')
-    ? `https://t.me/nft/${giftName}`
-    : 'https://t.me/mrkt';
+  const urlTelegram = giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : 'https://t.me/mrkt';
   const urlMarket = g.id ? mrktLotUrlFromId(g.id) : 'https://t.me/mrkt';
 
   const thumbKey =
@@ -1068,12 +1078,7 @@ async function mrktOrdersFetch({ gift, model, backdrop }) {
     return { ok: false, orders: [], reason: r.status === 429 ? 'RPS_WAIT' : 'ORDERS_ERROR', waitMs: r.waitMs || 0 };
   }
 
-  const out = {
-    ok: true,
-    orders: Array.isArray(r.data?.orders) ? r.data.orders : [],
-    reason: 'OK',
-    waitMs: 0,
-  };
+  const out = { ok: true, orders: Array.isArray(r.data?.orders) ? r.data.orders : [], reason: 'OK', waitMs: 0 };
   offersCache.set(key, { time: now, data: out });
   return out;
 }
@@ -1163,10 +1168,7 @@ async function mrktFeedSales({ gift, modelNames = [], backdropNames = [] }) {
       });
 
       if (!r.ok) {
-        if (r.reason === 'RPS_WAIT') {
-          if (cached) return { ...cached.data, note: `RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}`, waitMs: r.waitMs || 1000 };
-          return { ok: true, approxPriceTon: null, sales: [], note: `RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}`, waitMs: r.waitMs || 1000 };
-        }
+        if (r.reason === 'RPS_WAIT') return { ok: true, approxPriceTon: null, sales: [], note: `RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}`, waitMs: r.waitMs || 1000 };
         break;
       }
 
@@ -1188,11 +1190,9 @@ async function mrktFeedSales({ gift, modelNames = [], backdropNames = [] }) {
         const title = number != null ? `${base} #${number}` : base;
 
         const giftName = g.name || giftNameFallbackFromCollectionAndNumber(base, number) || null;
-
         const urlTelegram = giftName && String(giftName).includes('-')
           ? `https://t.me/nft/${giftName}`
           : 'https://t.me/mrkt';
-
         const urlMarket = g.id ? mrktLotUrlFromId(g.id) : 'https://t.me/mrkt';
 
         const thumbKey =
@@ -1285,7 +1285,7 @@ async function mrktGlobalCheapestLotsReal() {
   return { ok: true, lots: globalCheapestCache.lots, note: globalCheapestCache.note };
 }
 
-// ===================== Sub UI =====================
+// ===================== Sub UI build =====================
 async function buildSubUi(sub) {
   try {
     const f = normalizeFilters(sub.filters || {});
@@ -1333,6 +1333,8 @@ function lotImgUrl(lot) {
 function mkReplyMarkupOpen(urlMarket, label = 'MRKT') {
   return urlMarket ? { inline_keyboard: [[{ text: label, url: urlMarket }]] } : undefined;
 }
+
+// ===================== Subscription notifications =====================
 async function notifyTextOrPhoto(chatId, imgUrl, text, reply_markup) {
   if (SUBS_SEND_PHOTO && imgUrl) {
     const abs = absoluteUrlMaybe(imgUrl);
@@ -1341,7 +1343,6 @@ async function notifyTextOrPhoto(chatId, imgUrl, text, reply_markup) {
   return sendMessageSafe(chatId, text, { disable_web_page_preview: false, reply_markup });
 }
 
-// ===================== Subscription notifications =====================
 async function notifyFloorToUser(userId, sub, lot, newFloor) {
   const chatId = userChatId(userId);
 
@@ -1355,7 +1356,7 @@ async function notifyFloorToUser(userId, sub, lot, newFloor) {
   lines.push(lot?.urlTelegram || 'https://t.me/mrkt');
 
   const reply_markup = mkReplyMarkupOpen(lot?.urlMarket, 'MRKT');
-  await notifyTextOrPhoto(chatId, lotImgUrl(lot), lines.join('\n'), reply_markup);
+  await notifyTextOrPhoto(chatId, lotImgUrl(lot), lines.join('\\n'), reply_markup);
 }
 
 function feedItemToEvent(it) {
@@ -1381,7 +1382,6 @@ function feedItemToEvent(it) {
   const urlTelegram = giftName && String(giftName).includes('-')
     ? `https://t.me/nft/${giftName}`
     : 'https://t.me/mrkt';
-
   const urlMarket = g.id ? mrktLotUrlFromId(g.id) : 'https://t.me/mrkt';
 
   const thumbKey =
@@ -1424,7 +1424,7 @@ async function notifyFeedEvent(userId, sub, ev) {
   lines.push(ev.urlTelegram || 'https://t.me/mrkt');
 
   const reply_markup = mkReplyMarkupOpen(ev.urlMarket, 'MRKT');
-  await notifyTextOrPhoto(chatId, ev.imgUrl, lines.join('\n'), reply_markup);
+  await notifyTextOrPhoto(chatId, ev.imgUrl, lines.join('\\n'), reply_markup);
 }
 
 // ===================== Subs worker =====================
@@ -1541,6 +1541,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
                 }
               } else {
                 emptyStreak = 0;
+
                 const prevFloor = prev.floor;
                 const maxNotify = sub.maxNotifyTon != null ? Number(sub.maxNotifyTon) : null;
                 const canNotify = (maxNotify == null || newFloor <= maxNotify);
@@ -1576,6 +1577,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
 
 // ===================== AutoBuy =====================
 let isAutoBuying = false;
+const autoBuyLastRpsNotify = new Map();
 
 function isNoFundsError(obj) {
   const s = JSON.stringify(obj?.data || obj || '').toLowerCase();
@@ -1590,9 +1592,10 @@ async function mrktBuy({ id, priceNano }) {
   const data = r.data;
   const okItem = Array.isArray(data)
     ? data.find((x) =>
-      x?.source?.type === 'buy_gift' &&
-      x?.userGift?.isMine === true &&
-      String(x?.userGift?.id || '') === String(id))
+        x?.source?.type === 'buy_gift' &&
+        x?.userGift?.isMine === true &&
+        String(x?.userGift?.id || '') === String(id)
+      )
     : null;
 
   if (!okItem) return { ok: false, reason: 'BUY_NOT_CONFIRMED', data };
@@ -1734,6 +1737,13 @@ async function autoBuyCycle() {
         if (buysDone >= AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE) break;
 
         const r1 = await tryAutoBuyFromFeed(userId, sub);
+        if (r1?.rps) {
+          const last = autoBuyLastRpsNotify.get(userId) || 0;
+          if (nowMs() - last > 30000) {
+            autoBuyLastRpsNotify.set(userId, nowMs());
+          }
+        }
+
         if (r1 && r1.bought) {
           buysDone++;
           if (AUTO_BUY_DRY_RUN) {
@@ -1824,7 +1834,7 @@ async function autoBuyCycle() {
 }
 
 // ===================== Telegram commands =====================
-bot.onText(/^\/start\b/, async (msg) => {
+bot.onText(/^\\/start\\b/, async (msg) => {
   const u = getOrCreateUser(msg.from.id);
   u.chatId = msg.chat.id;
   scheduleSave();
@@ -1836,11 +1846,7 @@ bot.onText(/^\/start\b/, async (msg) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: msg.chat.id,
-          menu_button: {
-            type: 'web_app',
-            text: APP_TITLE,
-            web_app: { url: WEBAPP_URL },
-          },
+          menu_button: { type: 'web_app', text: APP_TITLE, web_app: { url: WEBAPP_URL } },
         }),
       });
     } catch {}
@@ -1884,8 +1890,7 @@ bot.on('message', async (msg) => {
 // ===================== WebApp HTML =====================
 const WEBAPP_HTML = `<!doctype html>
 <html lang="ru"><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>${APP_TITLE}</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
@@ -1897,7 +1902,7 @@ h2{margin:0 0 10px 0;font-size:18px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px;margin:10px 0}
 label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
-.field{position:relative;flex:1 1 220px;min-width:150px}
+.field{position:relative;flex:1 1 200px;min-width:140px}
 .inpWrap{position:relative}
 input,textarea{width:100%;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--input);color:var(--text);outline:none;font-size:13px}
 button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:var(--btn);color:var(--text);cursor:pointer}
@@ -1945,6 +1950,15 @@ button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;backg
 .purchRow img{width:52px;height:52px;border-radius:14px;border:1px solid var(--border);object-fit:cover;background:rgba(255,255,255,.03);flex:0 0 auto}
 .swRow{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
 .dot{width:14px;height:14px;border-radius:999px;border:1px solid rgba(255,255,255,.18)}
+.subTop{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.subLeft{display:flex;gap:10px;min-width:0;flex:1}
+.subPreview{width:56px;height:56px;border-radius:14px;border:1px solid var(--border);object-fit:cover;background:rgba(255,255,255,.03);flex:0 0 auto}
+.subActions{display:flex;gap:8px;flex:0 0 auto}
+.iconBtn{width:38px;height:38px;padding:0;display:flex;align-items:center;justify-content:center;font-size:18px;border-radius:12px}
+.linkBtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.linkBtn{display:inline-flex;align-items:center;justify-content:center;padding:7px 10px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.03);color:var(--text);text-decoration:none;font-size:12px}
+.filterLink{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--border);border-radius:999px;background:rgba(255,255,255,.03);cursor:pointer}
+.filterLink:hover{background:rgba(255,255,255,.06)}
 *::-webkit-scrollbar{width:10px;height:10px}
 *::-webkit-scrollbar-track{background:rgba(255,255,255,.06)}
 *::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:999px;border:2px solid rgba(0,0,0,.0)}
@@ -2081,31 +2095,30 @@ button{padding:10px 12px;border:1px solid var(--border);border-radius:12px;backg
 // ===================== WebApp JS =====================
 const WEBAPP_JS = `(() => {
   const APP_TITLE = ${JSON.stringify(APP_TITLE)};
-
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const el = (id) => document.getElementById(id);
-
-  const lotsLoading = () => el('lotsLoading');
-  const subsLoading = () => el('subsLoading');
-  const profileLoading = () => el('profileLoading');
-
-  function setLoading(which, on){
-    if(which==='lots' && lotsLoading()) lotsLoading().style.display = on ? 'flex' : 'none';
-    if(which==='subs' && subsLoading()) subsLoading().style.display = on ? 'flex' : 'none';
-    if(which==='profile' && profileLoading()) profileLoading().style.display = on ? 'flex' : 'none';
-  }
 
   function showErr(msg){
     const box = el('err');
     if (!box) return;
-    box.style.display='block';
-    box.textContent=String(msg||'');
+    box.style.display = 'block';
+    box.textContent = String(msg || '');
   }
   function hideErr(){
     const box = el('err');
     if (!box) return;
-    box.style.display='none';
-    box.textContent='';
+    box.style.display = 'none';
+    box.textContent = '';
+  }
+
+  function setLoading(which, on){
+    const ids = {
+      lots: 'lotsLoading',
+      subs: 'subsLoading',
+      profile: 'profileLoading'
+    };
+    const node = el(ids[which]);
+    if (node) node.style.display = on ? 'flex' : 'none';
   }
 
   function parseInitDataFromLocation() {
@@ -2154,12 +2167,13 @@ const WEBAPP_JS = `(() => {
       const host = location.host || '-';
       const platform = tg ? (tg.platform || '-') : 'no-telegram-object';
       const version = tg ? (tg.version || '-') : '-';
+
       document.body.innerHTML =
         '<div style="padding:16px;font-family:system-ui;color:#fff;background:#0b0f14">' +
           '<h3 style="margin:0 0 10px 0">NO_INIT_DATA</h3>' +
           '<div style="opacity:.9;line-height:1.5">' +
             'Открой панель ИМЕННО из Telegram через бота: /start -> кнопка меню / кнопка открытия WebApp.<br><br>' +
-            'Если открываешь из Telegram и ошибка всё равно есть, проверь домен в BotFather /setdomain:<br>' +
+            'Если уже открываешь из Telegram и ошибка всё равно есть, проверь домен в BotFather /setdomain:<br>' +
             '<b>' + host + '</b><br><br>' +
             'Debug:<br>platform=' + platform + '<br>version=' + version +
           '</div>' +
@@ -2171,7 +2185,7 @@ const WEBAPP_JS = `(() => {
       const res = await fetch(path, {
         ...opts,
         headers: {
-          'Content-Type':'application/json',
+          'Content-Type': 'application/json',
           'X-Tg-Init-Data': initData,
           ...(opts.headers || {})
         }
@@ -2185,16 +2199,18 @@ const WEBAPP_JS = `(() => {
 
     function openTg(url){
       if (!url) return;
-      try { if (tg && tg.openTelegramLink) return tg.openTelegramLink(url); } catch {}
+      try {
+        if (tg && tg.openTelegramLink) return tg.openTelegramLink(url);
+      } catch {}
       window.open(url, '_blank');
     }
 
     function setTab(name){
       ['market','subs','profile','admin'].forEach(x => {
         const node = el(x);
-        if (node) node.style.display = (x===name ? 'block' : 'none');
+        if (node) node.style.display = (x === name ? 'block' : 'none');
       });
-      document.querySelectorAll('.tabbtn').forEach(b => b.classList.toggle('active', b.dataset.tab===name));
+      document.querySelectorAll('.tabbtn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
     }
 
     document.querySelectorAll('.tabbtn').forEach(b => b.onclick = async () => {
@@ -2211,15 +2227,13 @@ const WEBAPP_JS = `(() => {
       if (!sel.gifts.length) return '';
       return sel.gifts.map(v => sel.giftLabels[v] || v).join(', ');
     }
-    function listInputText(arr){
-      return (arr || []).join(', ');
-    }
+    function listInputText(arr){ return (arr || []).join(', '); }
     function isSelectedNorm(arr, v){
-      const k = String(v||'').toLowerCase().trim();
+      const k = String(v || '').toLowerCase().trim();
       return (arr || []).some(x => String(x).toLowerCase().trim() === k);
     }
     function toggleIn(arr, v){
-      const k = String(v||'').toLowerCase().trim();
+      const k = String(v || '').toLowerCase().trim();
       const out = [];
       let removed = false;
       for (const x of arr || []) {
@@ -2256,7 +2270,7 @@ const WEBAPP_JS = `(() => {
     }
 
     const timers = { gift: null, model: null, backdrop: null };
-    function debounce(kind, fn, ms=220){
+    function debounce(kind, fn, ms = 220){
       clearTimeout(timers[kind]);
       timers[kind] = setTimeout(fn, ms);
     }
@@ -2274,8 +2288,8 @@ const WEBAPP_JS = `(() => {
     function hideSug(id){
       const b = el(id);
       if (!b) return;
-      b.style.display='none';
-      b.innerHTML='';
+      b.style.display = 'none';
+      b.innerHTML = '';
     }
 
     function renderSug(id, title, items, isSelected, onToggle){
@@ -2407,7 +2421,7 @@ const WEBAPP_JS = `(() => {
     el('backdrop').addEventListener('focus', ()=> debounce('backdrop', ()=>showBackdropSug().catch(err=>showErr(err.message||String(err)))));
     el('backdrop').addEventListener('input', ()=> debounce('backdrop', ()=>showBackdropSug().catch(err=>showErr(err.message||String(err)))));
 
-    document.querySelectorAll('[data-clear]').forEach(btn=>{
+    document.querySelectorAll('[data-clear]').forEach(btn => {
       btn.onclick = () => {
         const what = btn.dataset.clear;
         if (what === 'gift') {
@@ -2548,23 +2562,42 @@ const WEBAPP_JS = `(() => {
         const backs = (f.backdrops || []).join(', ');
         const notifyMax = sub.maxNotifyTon == null ? '∞' : sub.maxNotifyTon;
         const autoMax = sub.maxAutoBuyTon == null ? '-' : sub.maxAutoBuyTon;
-        const mode = sub.autoBuyAny ? 'ANY' : 'NEW';
+        const mode = sub.autoBuyAny ? 'Любые' : 'Новые';
+
+        const imgUrl = sub.ui?.thumbKey ? '/img/cdn?key=' + encodeURIComponent(sub.ui.thumbKey) : null;
+        const swatches = Array.isArray(sub.ui?.swatches)
+          ? sub.ui.swatches.map(c => '<span class="dot" style="background:' + c + '"></span>').join('')
+          : '';
+
+        const preview = imgUrl
+          ? '<img class="subPreview" src="' + imgUrl + '" referrerpolicy="no-referrer"/>'
+          : '<div class="subPreview"></div>';
 
         return '<div class="card" style="margin:10px 0">' +
-          '<div><b>#' + sub.num + '</b> ' + (sub.enabled ? 'ON' : 'OFF') + '</div>' +
-          '<div class="muted">Gifts: ' + gifts + '</div>' +
-          (models ? '<div class="muted">Models: ' + models + '</div>' : '') +
-          (backs ? '<div class="muted">Backdrops: ' + backs + '</div>' : '') +
-          (f.numberPrefix ? '<div class="muted">Number prefix: ' + f.numberPrefix + '</div>' : '') +
-          '<div class="muted">Notify max: ' + notifyMax + ' TON</div>' +
-          '<div class="muted">AutoBuy: ' + (sub.autoBuyEnabled ? 'ON' : 'OFF') + ' / max: ' + autoMax + ' TON / mode: ' + mode + '</div>' +
+          '<div class="subTop">' +
+            '<div class="subLeft">' +
+              preview +
+              '<div style="min-width:0;flex:1">' +
+                '<div><b>#' + sub.num + '</b> ' + (sub.enabled ? 'ON' : 'OFF') + '</div>' +
+                '<div class="muted">Gifts: ' + gifts + '</div>' +
+                (models ? '<div class="muted">Models: ' + models + '</div>' : '') +
+                (backs ? '<div class="muted">Backdrops: ' + backs + '</div>' : '') +
+                (f.numberPrefix ? '<div class="muted">Number prefix: ' + f.numberPrefix + '</div>' : '') +
+                (swatches ? '<div class="swRow">' + swatches + '</div>' : '') +
+                '<div class="muted" style="margin-top:6px">Notify max: ' + notifyMax + ' TON</div>' +
+                '<div class="muted">AutoBuy: ' + (sub.autoBuyEnabled ? 'ON' : 'OFF') + ' / max: ' + autoMax + ' TON / режим: ' + mode + '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="subActions">' +
+              '<button class="iconBtn" title="Пауза" data-sub-act="toggle" data-id="' + sub.id + '">' + (sub.enabled ? '⏸' : '▶️') + '</button>' +
+              '<button class="iconBtn" title="Удалить" data-sub-act="delete" data-id="' + sub.id + '">🗑</button>' +
+            '</div>' +
+          '</div>' +
           '<div class="row" style="margin-top:10px">' +
-            '<button class="small" data-sub-act="toggle" data-id="' + sub.id + '">' + (sub.enabled ? '⏸' : '▶️') + '</button>' +
-            '<button class="small" data-sub-act="delete" data-id="' + sub.id + '">🗑</button>' +
             '<button class="small" data-sub-act="nmax" data-id="' + sub.id + '">Notify max</button>' +
-            '<button class="small" data-sub-act="ab" data-id="' + sub.id + '">AutoBuy</button>' +
+            '<button class="small" data-sub-act="ab" data-id="' + sub.id + '">AutoBuy ' + (sub.autoBuyEnabled ? 'ON' : 'OFF') + '</button>' +
             '<button class="small" data-sub-act="amax" data-id="' + sub.id + '">Auto max</button>' +
-            '<button class="small" data-sub-act="mode" data-id="' + sub.id + '">Mode</button>' +
+            '<button class="small" data-sub-act="mode" data-id="' + sub.id + '">' + mode + '</button>' +
           '</div>' +
         '</div>';
       }).join('');
@@ -2603,6 +2636,12 @@ const WEBAPP_JS = `(() => {
           ? '<img src="' + s.imgUrl + '" referrerpolicy="no-referrer"/>'
           : '<div style="width:60px;height:60px;border-radius:14px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.03)"></div>';
 
+        const btns =
+          '<div class="linkBtns">' +
+            (s.urlMarket ? '<a class="linkBtn" href="' + s.urlMarket + '" target="_blank">MRKT</a>' : '') +
+            (s.urlTelegram ? '<a class="linkBtn" href="' + s.urlTelegram + '" target="_blank">NFT</a>' : '') +
+          '</div>';
+
         return '<div class="saleCard"><div class="saleRow">' +
           img +
           '<div style="min-width:0;flex:1">' +
@@ -2611,6 +2650,7 @@ const WEBAPP_JS = `(() => {
             '<div class="muted ellipsis">' + (s.title || '') + '</div>' +
             (s.model ? '<div class="muted ellipsis">Model: ' + s.model + '</div>' : '') +
             (s.backdrop ? '<div class="muted ellipsis">Backdrop: ' + s.backdrop + '</div>' : '') +
+            btns +
           '</div>' +
         '</div></div>';
       }).join('');
@@ -2630,19 +2670,23 @@ const WEBAPP_JS = `(() => {
       }
 
       let top = '';
-      if (lot.collectionName) top += '<div>Gift: <b>' + lot.collectionName + '</b></div>';
-      if (lot.model) top += '<div>Model: <b>' + lot.model + '</b></div>';
-      if (lot.backdrop) top += '<div>Backdrop: <b>' + lot.backdrop + '</b></div>';
-      if (lot.number != null) top += '<div>Number: <b>' + lot.number + '</b></div>';
-      el('sheetTop').innerHTML = top || '<div class="muted">Без атрибутов</div>';
+      top += '<div class="row" style="align-items:flex-start;gap:8px;flex-wrap:wrap">';
+      if (lot.collectionName) top += '<div class="filterLink" id="fltGift"><b>Gift:</b> ' + lot.collectionName + '</div>';
+      if (lot.model) top += '<div class="filterLink" id="fltModel"><b>Model:</b> ' + lot.model + '</div>';
+      if (lot.backdrop) top += '<div class="filterLink" id="fltBackdrop"><b>Backdrop:</b> ' + lot.backdrop + '</div>';
+      if (lot.number != null) top += '<div class="badge">Number: ' + lot.number + '</div>';
+      top += '</div>';
+      el('sheetTop').innerHTML = top;
 
       el('sheetBtns').innerHTML =
-        '<button class="small" id="sheetTgBtn">Telegram</button>' +
+        '<button class="small" id="sheetTgBtn">NFT</button>' +
         '<button class="small" id="sheetMrktBtn">MRKT</button>' +
-        '<button class="small" id="sheetApplyBtn">Применить фильтры</button>';
+        '<button class="small" id="sheetApplyBtn">Применить фильтры</button>' +
+        '<button class="small" id="sheetSalesBtn">История продаж</button>';
 
       el('sheetTgBtn').onclick = () => openTg(lot.urlTelegram || 'https://t.me/mrkt');
       el('sheetMrktBtn').onclick = () => window.open(lot.urlMarket || 'https://t.me/mrkt', '_blank');
+
       el('sheetApplyBtn').onclick = async () => {
         sel.gifts = lot.collectionName ? [lot.collectionName] : [];
         sel.giftLabels = lot.collectionName ? { [lot.collectionName]: lot.collectionName } : {};
@@ -2658,7 +2702,72 @@ const WEBAPP_JS = `(() => {
         closeSheet();
       };
 
-      el('sheetBody').innerHTML = '<div class="muted">Загрузка истории продаж…</div>';
+      if (el('fltGift')) {
+        el('fltGift').onclick = async () => {
+          sel.gifts = lot.collectionName ? [lot.collectionName] : [];
+          sel.giftLabels = lot.collectionName ? { [lot.collectionName]: lot.collectionName } : {};
+          sel.models = [];
+          sel.backdrops = [];
+          el('gift').value = giftsInputText();
+          el('model').value = '';
+          el('backdrop').value = '';
+          el('number').value = '';
+          await patchFilters();
+          await refreshSummary(true);
+          await refreshLots(true);
+          closeSheet();
+        };
+      }
+
+      if (el('fltModel')) {
+        el('fltModel').onclick = async () => {
+          sel.gifts = lot.collectionName ? [lot.collectionName] : [];
+          sel.giftLabels = lot.collectionName ? { [lot.collectionName]: lot.collectionName } : {};
+          sel.models = lot.model ? [lot.model] : [];
+          sel.backdrops = [];
+          el('gift').value = giftsInputText();
+          el('model').value = listInputText(sel.models);
+          el('backdrop').value = '';
+          el('number').value = '';
+          await patchFilters();
+          await refreshSummary(true);
+          await refreshLots(true);
+          closeSheet();
+        };
+      }
+
+      if (el('fltBackdrop')) {
+        el('fltBackdrop').onclick = async () => {
+          sel.gifts = lot.collectionName ? [lot.collectionName] : [];
+          sel.giftLabels = lot.collectionName ? { [lot.collectionName]: lot.collectionName } : {};
+          sel.models = [];
+          sel.backdrops = lot.backdrop ? [lot.backdrop] : [];
+          el('gift').value = giftsInputText();
+          el('model').value = '';
+          el('backdrop').value = listInputText(sel.backdrops);
+          el('number').value = '';
+          await patchFilters();
+          await refreshSummary(true);
+          await refreshLots(true);
+          closeSheet();
+        };
+      }
+
+      el('sheetSalesBtn').onclick = async () => {
+        el('sheetBody').innerHTML = '<div class="muted">Загрузка истории продаж…</div>';
+        try {
+          const s = await api('/api/lot/sales', {
+            method:'POST',
+            body: JSON.stringify({ lot })
+          });
+          const hist = s.salesHistory || { approxPriceTon: null, sales: [] };
+          renderSalesList(hist);
+        } catch (e) {
+          el('sheetBody').innerHTML = '<div class="muted">Ошибка: ' + (e.message || String(e)) + '</div>';
+        }
+      };
+
+      el('sheetBody').innerHTML = '<div class="muted">Нажми “История продаж”, если хочешь открыть продажи именно по этому лоту.</div>';
 
       try {
         const d = await api('/api/lot/details', {
@@ -2671,20 +2780,6 @@ const WEBAPP_JS = `(() => {
           '<div>Max offer (exact): <b>' + (off.exact != null ? Number(off.exact).toFixed(3) : '—') + ' TON</b></div>' +
           '<div>Max offer (collection): <b>' + (off.collection != null ? Number(off.collection).toFixed(3) : '—') + ' TON</b></div>';
       } catch (e) {}
-
-      try {
-        const s = await api('/api/lot/sales', {
-          method:'POST',
-          body: JSON.stringify({ lot })
-        });
-        const hist = s.salesHistory || { approxPriceTon: null, sales: [] };
-        el('sheetSub').textContent =
-          (lot.priceTon != null ? Number(lot.priceTon).toFixed(3) + ' TON' : '') +
-          (hist.approxPriceTon != null ? (' · median ' + Number(hist.approxPriceTon).toFixed(3) + ' TON') : '');
-        renderSalesList(hist);
-      } catch (e) {
-        el('sheetBody').innerHTML = '<div class="muted">Ошибка: ' + (e.message || String(e)) + '</div>';
-      }
     }
 
     async function openSalesByFilters(){
@@ -2702,7 +2797,6 @@ const WEBAPP_JS = `(() => {
           el('sheetSub').textContent = 'Медиана: ' + Number(r.approxPriceTon).toFixed(3) + ' TON';
         }
         renderSalesList(r);
-        scheduleRetryIfWait(r, openSalesByFilters);
       } catch (e) {
         el('sheetBody').innerHTML = '<div class="muted">Ошибка: ' + (e.message || String(e)) + '</div>';
       }
@@ -2794,11 +2888,6 @@ const WEBAPP_JS = `(() => {
         await refreshSubs();
       })();
     });
-
-    async function refreshAdmin() {
-      const r = await api('/api/admin/status');
-      el('adminStatus').textContent = JSON.stringify(r, null, 2);
-    }
 
     el('sessSave').onclick = wrap('subs', async () => {
       const payloadJson = el('payloadJson').value.trim();
@@ -2896,11 +2985,11 @@ app.get('/img/gift', async (req, res) => {
 
 // ===================== UI =====================
 app.get('/', (req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Type','text/html; charset=utf-8');
   res.send(WEBAPP_HTML);
 });
 app.get('/app.js', (req, res) => {
-  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Content-Type','application/javascript; charset=utf-8');
   res.send(WEBAPP_JS);
 });
 
@@ -3029,12 +3118,7 @@ app.get('/api/mrkt/lots', auth, async (req, res) => {
     note = r.note || null;
     lots = (r.lots || []).slice(0, WEBAPP_LOTS_LIMIT);
   } else {
-    const r = await mrktSearchLotsByFilters(f, WEBAPP_LOTS_PAGES || MRKT_PAGES, {
-      ordering: 'Price',
-      lowToHigh: true,
-      count: MRKT_COUNT,
-    });
-
+    const r = await mrktSearchLotsByFilters(f, WEBAPP_LOTS_PAGES || MRKT_PAGES, { ordering: 'Price', lowToHigh: true, count: MRKT_COUNT });
     if (!r.ok) {
       note = `MRKT RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}`;
       waitMs = r.waitMs || 1000;
@@ -3046,9 +3130,7 @@ app.get('/api/mrkt/lots', auth, async (req, res) => {
 
   const mapped = lots.map((lot) => ({
     ...lot,
-    imgUrl: lot.giftName
-      ? `/img/gift?name=${encodeURIComponent(lot.giftName)}`
-      : (lot.thumbKey ? `/img/cdn?key=${encodeURIComponent(lot.thumbKey)}` : null),
+    imgUrl: lot.giftName ? `/img/gift?name=${encodeURIComponent(lot.giftName)}` : (lot.thumbKey ? `/img/cdn?key=${encodeURIComponent(lot.thumbKey)}` : null),
     canBuy: MANUAL_BUY_ENABLED,
   }));
 
@@ -3448,7 +3530,7 @@ app.get('/api/admin/test_mrkt', auth, async (req, res) => {
 
 // ===================== webhook/polling =====================
 if (PUBLIC_URL) {
-  const hookUrl = `${PUBLIC_URL.replace(/\/+$/, '')}/telegram-webhook`;
+  const hookUrl = `${PUBLIC_URL.replace(/\\/+$/, '')}/telegram-webhook`;
   bot.setWebHook(hookUrl)
     .then(() => console.log('Webhook set:', hookUrl))
     .catch((e) => console.error('setWebHook error:', e?.message || e));
@@ -3463,7 +3545,7 @@ if (PUBLIC_URL) {
   console.log('Polling started (PUBLIC_URL not set)');
 }
 
-// ===================== start server + intervals + bootstrap =====================
+// ===================== Start =====================
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
 
