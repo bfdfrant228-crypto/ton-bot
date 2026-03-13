@@ -393,8 +393,11 @@ function getOrCreateUser(userId) {
 function userChatId(userId) {
   const u = users.get(userId);
   const cid = u?.chatId;
+
   if (cid && Number.isFinite(Number(cid))) return Number(cid);
-  return userId;
+
+  // fallback: личка по userId
+  return Number(userId);
 }
 function renumberSubs(user) {
   const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
@@ -1335,11 +1338,12 @@ function mkReplyMarkupOpen(urlMarket, label = 'MRKT') {
   return urlMarket ? { inline_keyboard: [[{ text: label, url: urlMarket }]] } : undefined;
 }
 async function notifyTextOrPhoto(chatId, imgUrl, text, reply_markup) {
-  if (SUBS_SEND_PHOTO && imgUrl) {
-    const abs = absoluteUrlMaybe(imgUrl);
-    if (abs) return sendPhotoSafe(chatId, abs, text, reply_markup);
-  }
-  return sendMessageSafe(chatId, text, { disable_web_page_preview: false, reply_markup });
+  // Всегда шлём ТЕКСТ, без sendPhoto.
+  // Тогда Telegram сам покажет превью/анимацию по ссылке на nft.
+  return sendMessageSafe(chatId, text, {
+    disable_web_page_preview: false,
+    reply_markup,
+  });
 }
 
 // ===================== Subscription notifications =====================
@@ -1753,6 +1757,7 @@ async function autoBuyCycle() {
       for (const sub of eligible) {
         if (buysDone >= AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE) break;
 
+        // 1) сначала быстрый путь: feed listing/change_price
         const r1 = await tryAutoBuyFromFeed(userId, sub);
 
         if (r1 && r1.bought) {
@@ -1787,87 +1792,89 @@ async function autoBuyCycle() {
           continue;
         }
 
-        if (sub.autoBuyAny) {
-          const maxBuy = Number(sub.maxAutoBuyTon);
-          if (!Number.isFinite(maxBuy) || maxBuy <= 0) continue;
+        // 2) если включён режим "Любые" — добираем уже существующие лоты
+        if (!sub.autoBuyAny) continue;
 
-          const sf = normalizeFilters(sub.filters || {});
-          if (!sf.gifts.length) continue;
+        const maxBuy = Number(sub.maxAutoBuyTon);
+        if (!Number.isFinite(maxBuy) || maxBuy <= 0) continue;
 
-          const r = await mrktSearchLotsByFilters(sf, 2, {
-            ordering: 'Price',
-            lowToHigh: true,
-            count: Math.max(MRKT_COUNT, 20),
-          });
+        const sf = normalizeFilters(sub.filters || {});
+        if (!sf.gifts.length) continue;
 
-          if (!r.ok || !r.gifts?.length) continue;
+        const r = await mrktSearchLotsByFilters(sf, 2, {
+          ordering: 'Price',
+          lowToHigh: true,
+          count: Math.max(MRKT_COUNT, 20),
+        });
 
-          const candidate = r.gifts.find((x) => x.priceTon <= maxBuy) || null;
-          if (!candidate) continue;
+        if (!r.ok || !r.gifts?.length) continue;
 
-          const attemptKey = `${userId}:${candidate.id}`;
-          const lastAttempt = autoBuyRecentAttempts.get(attemptKey);
-          if (lastAttempt && nowMs() - lastAttempt < AUTO_BUY_ATTEMPT_TTL_MS) continue;
-          autoBuyRecentAttempts.set(attemptKey, nowMs());
+        const candidate = r.gifts.find((x) => x.priceTon <= maxBuy) || null;
+        if (!candidate) continue;
 
-          if (AUTO_BUY_DRY_RUN) {
-            await sendMessageSafe(
-              userChatId(userId),
-              `AutoBuy (DRY) кандидат: ${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`,
-              {
-                disable_web_page_preview: false,
-                reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
-              }
-            );
-            buysDone++;
-            continue;
-          }
+        const attemptKey = `${userId}:${candidate.id}`;
+        const lastAttempt = autoBuyRecentAttempts.get(attemptKey);
+        if (lastAttempt && nowMs() - lastAttempt < AUTO_BUY_ATTEMPT_TTL_MS) continue;
+        autoBuyRecentAttempts.set(attemptKey, nowMs());
 
-          const tsFound = Date.now();
-          const buyRes = await mrktBuy({ id: candidate.id, priceNano: candidate.priceNano });
-          if (buyRes.ok) {
-            const tsBought = Date.now();
-
-            const u = getOrCreateUser(userId);
-            pushPurchase(u, {
-              tsFound,
-              tsBought,
-              latencyMs: null,
-              title: candidate.name,
-              priceTon: candidate.priceTon,
-              urlTelegram: candidate.urlTelegram,
-              urlMarket: candidate.urlMarket,
-              lotId: candidate.id,
-              giftName: candidate.giftName || '',
-              thumbKey: candidate.thumbKey || '',
-              model: candidate.model || '',
-              backdrop: candidate.backdrop || '',
-              collection: candidate.collectionName || '',
-              number: candidate.number ?? null,
-            });
-            scheduleSave();
-
-            await sendMessageSafe(
-              userChatId(userId),
-              `✅ AutoBuy OK\n${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`,
-              {
-                disable_web_page_preview: false,
-                reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
-              }
-            );
-
-            buysDone++;
-            if (AUTO_BUY_DISABLE_AFTER_SUCCESS) {
-              sub.autoBuyEnabled = false;
-              scheduleSave();
+        if (AUTO_BUY_DRY_RUN) {
+          await sendMessageSafe(
+            userChatId(userId),
+            `AutoBuy (DRY) кандидат: ${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`,
+            {
+              disable_web_page_preview: false,
+              reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
             }
-          } else if (isNoFundsError(buyRes)) {
-            for (const s2 of subs) if (s2) s2.autoBuyEnabled = false;
+          );
+          buysDone++;
+          continue;
+        }
+
+        const tsFound = Date.now();
+        const buyRes = await mrktBuy({ id: candidate.id, priceNano: candidate.priceNano });
+
+        if (buyRes.ok) {
+          const tsBought = Date.now();
+
+          const u = getOrCreateUser(userId);
+          pushPurchase(u, {
+            tsFound,
+            tsBought,
+            latencyMs: null,
+            title: candidate.name,
+            priceTon: candidate.priceTon,
+            urlTelegram: candidate.urlTelegram,
+            urlMarket: candidate.urlMarket,
+            lotId: candidate.id,
+            giftName: candidate.giftName || '',
+            thumbKey: candidate.thumbKey || '',
+            model: candidate.model || '',
+            backdrop: candidate.backdrop || '',
+            collection: candidate.collectionName || '',
+            number: candidate.number ?? null,
+          });
+          scheduleSave();
+
+          await sendMessageSafe(
+            userChatId(userId),
+            `✅ AutoBuy OK\n${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`,
+            {
+              disable_web_page_preview: false,
+              reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
+            }
+          );
+
+          buysDone++;
+          if (AUTO_BUY_DISABLE_AFTER_SUCCESS) {
+            sub.autoBuyEnabled = false;
             scheduleSave();
-            await sendMessageSafe(userChatId(userId), `❌ AutoBuy stop: no funds`, {
-              disable_web_page_preview: true,
-            });
           }
+        } else if (isNoFundsError(buyRes)) {
+          for (const s2 of subs) if (s2) s2.autoBuyEnabled = false;
+          scheduleSave();
+          await sendMessageSafe(userChatId(userId), `❌ AutoBuy stop: no funds`, {
+            disable_web_page_preview: true,
+          });
         }
       }
     }
@@ -3356,19 +3363,18 @@ app.get('/api/profile', auth, async (req, res) => {
 
 // ===================== Subs endpoints =====================
 app.post('/api/sub/create', auth, async (req, res) => {
- const u = getOrCreateUser(req.userId);
+  const u = getOrCreateUser(req.userId);
 
-const filtersSig = JSON.stringify(normalizeFilters(u.filters || {}));
-const createKey = `${req.userId}|${filtersSig}`;
-const lastCreateAt = recentSubCreates.get(createKey) || 0;
-
-if (nowMs() - lastCreateAt < 3000) {
-  return res.json({ ok: true, duplicateIgnored: true });
-}
-recentSubCreates.set(createKey, nowMs());
-
-const r = makeSubFromCurrentFilters(u);
+  // сохраняем chatId косвенно через user state, если уже был /start или любое сообщение
+  const r = makeSubFromCurrentFilters(u);
   if (!r.ok) return res.status(400).json({ ok: false, reason: r.reason });
+
+  // защита от дублей одной и той же подписки подряд
+  const sig = JSON.stringify(normalizeFilters(r.sub.filters || {}));
+  const exists = (u.subscriptions || []).find((x) => x && JSON.stringify(normalizeFilters(x.filters || {})) === sig);
+  if (exists) {
+    return res.json({ ok: true, alreadyExists: true });
+  }
 
   r.sub.ui = await buildSubUi(r.sub);
 
@@ -3376,17 +3382,24 @@ const r = makeSubFromCurrentFilters(u);
   renumberSubs(u);
   scheduleSave();
 
+  // сразу пытаемся прислать стартовый флор
   setTimeout(async () => {
     try {
       const sf = normalizeFilters(r.sub.filters || {});
-      const rLots = await mrktSearchLotsByFilters(sf, 1, { ordering: 'Price', lowToHigh: true, count: MRKT_COUNT });
+      const rLots = await mrktSearchLotsByFilters(sf, 1, {
+        ordering: 'Price',
+        lowToHigh: true,
+        count: MRKT_COUNT,
+      });
+
       const lot = (rLots.ok && rLots.gifts && rLots.gifts[0]) ? rLots.gifts[0] : null;
       if (!lot) return;
+
       await notifyFloorToUser(req.userId, r.sub, lot, lot.priceTon);
     } catch (e) {
       console.error('sub create notify error:', e?.message || e);
     }
-  }, 120);
+  }, 250);
 
   res.json({ ok: true });
 });
