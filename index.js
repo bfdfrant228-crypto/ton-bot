@@ -360,6 +360,7 @@ async function sendPhotoSafe(chatId, photoUrl, caption, reply_markup) {
 const users = new Map();
 const subStates = new Map(); // key -> { floor, emptyStreak, feedLastId, autoBuyLastId }
 const autoBuyRecentAttempts = new Map();
+const recentSubCreates = new Map();
 
 function normalizeFilters(f) {
   const gifts = uniqNorm(ensureArray(f?.gifts || f?.gift));
@@ -2407,7 +2408,6 @@ const WEBAPP_JS = `(() => {
         }
       );
       rerender();
-      scheduleRetryIfWait(r, showGiftSug);
     }
 
     async function showModelSug(){
@@ -2426,7 +2426,6 @@ const WEBAPP_JS = `(() => {
         }
       );
       rerender();
-      scheduleRetryIfWait(r, showModelSug);
     }
 
     async function showBackdropSug(){
@@ -2445,7 +2444,6 @@ const WEBAPP_JS = `(() => {
         }
       );
       rerender();
-      scheduleRetryIfWait(r, showBackdropSug);
     }
 
     document.addEventListener('click', (e)=>{
@@ -2536,7 +2534,6 @@ const WEBAPP_JS = `(() => {
         '<div class="sumPill">Max offer (exact): <b>' + (offers.exact != null ? Number(offers.exact).toFixed(3) : '—') + ' TON</b></div>' +
         '<div class="sumPill">Max offer (collection): <b>' + (offers.collection != null ? Number(offers.collection).toFixed(3) : '—') + ' TON</b></div>' +
         (r.note ? '<div class="sumPill">' + r.note + '</div>' : '');
-      scheduleRetryIfWait(r, () => refreshSummary(true));
     }
 
     async function refreshLots(force = false){
@@ -2544,7 +2541,6 @@ const WEBAPP_JS = `(() => {
       currentLots = r.lots || [];
       el('status').textContent = r.note || '';
       el('lots').innerHTML = currentLots.length ? currentLots.map(lotCard).join('') : '<div class="muted">Ничего не найдено</div>';
-      scheduleRetryIfWait(r, () => refreshLots(true));
     }
 
   async function refreshProfile(){
@@ -2834,10 +2830,18 @@ async function refreshSubs(){
       await openSalesByFilters();
     };
 
-    el('subCreate').onclick = wrap('subs', async () => {
-      await api('/api/sub/create', { method:'POST' });
-      await refreshSubs();
-    });
+   let subCreateBusy = false;
+
+el('subCreate').onclick = wrap('subs', async () => {
+  if (subCreateBusy) return;
+  subCreateBusy = true;
+  try {
+    await api('/api/sub/create', { method:'POST' });
+    await refreshSubs();
+  } finally {
+    subCreateBusy = false;
+  }
+});
 
     el('subRefresh').onclick = wrap('subs', async () => {
       await refreshSubs();
@@ -3352,8 +3356,18 @@ app.get('/api/profile', auth, async (req, res) => {
 
 // ===================== Subs endpoints =====================
 app.post('/api/sub/create', auth, async (req, res) => {
-  const u = getOrCreateUser(req.userId);
-  const r = makeSubFromCurrentFilters(u);
+ const u = getOrCreateUser(req.userId);
+
+const filtersSig = JSON.stringify(normalizeFilters(u.filters || {}));
+const createKey = `${req.userId}|${filtersSig}`;
+const lastCreateAt = recentSubCreates.get(createKey) || 0;
+
+if (nowMs() - lastCreateAt < 3000) {
+  return res.json({ ok: true, duplicateIgnored: true });
+}
+recentSubCreates.set(createKey, nowMs());
+
+const r = makeSubFromCurrentFilters(u);
   if (!r.ok) return res.status(400).json({ ok: false, reason: r.reason });
 
   r.sub.ui = await buildSubUi(r.sub);
