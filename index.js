@@ -2607,6 +2607,65 @@ const WEBAPP_JS = `(() => {
   }).join('');
 }
 
+async function refreshSubs(){
+  const s = await api('/api/state');
+  currentState = s;
+  const list = el('subsList');
+  const subs = s.user?.subscriptions || [];
+
+  if (!subs.length) {
+    list.innerHTML = '<div class="muted">Подписок нет</div>';
+    return;
+  }
+
+  list.innerHTML = subs.map(sub => {
+    const f = sub.filters || {};
+    const gifts = (f.gifts || []).map(v => (f.giftLabels && f.giftLabels[v]) ? f.giftLabels[v] : v).join(', ') || '(не выбран)';
+    const models = (f.models || []).join(', ');
+    const backs = (f.backdrops || []).join(', ');
+    const notifyMax = sub.maxNotifyTon == null ? '∞' : sub.maxNotifyTon;
+    const autoMax = sub.maxAutoBuyTon == null ? '-' : sub.maxAutoBuyTon;
+    const mode = sub.autoBuyAny ? 'Любые' : 'Новые';
+
+    const imgUrl = sub.ui?.thumbKey ? '/img/cdn?key=' + encodeURIComponent(sub.ui.thumbKey) : null;
+    const swatches = Array.isArray(sub.ui?.swatches)
+      ? sub.ui.swatches.map(c => '<span class="dot" style="background:' + c + '"></span>').join('')
+      : '';
+
+    const preview = imgUrl
+      ? '<img class="subPreview" src="' + imgUrl + '" referrerpolicy="no-referrer"/>'
+      : '<div class="subPreview"></div>';
+
+    return '<div class="card" style="margin:10px 0">' +
+      '<div class="subTop">' +
+        '<div class="subLeft">' +
+          preview +
+          '<div style="min-width:0;flex:1">' +
+            '<div><b>#' + sub.num + '</b> ' + (sub.enabled ? 'ON' : 'OFF') + '</div>' +
+            '<div class="muted">Gifts: ' + gifts + '</div>' +
+            (models ? '<div class="muted">Models: ' + models + '</div>' : '') +
+            (backs ? '<div class="muted">Backdrops: ' + backs + '</div>' : '') +
+            (f.numberPrefix ? '<div class="muted">Number prefix: ' + f.numberPrefix + '</div>' : '') +
+            (swatches ? '<div class="swRow">' + swatches + '</div>' : '') +
+            '<div class="muted" style="margin-top:6px">Notify max: ' + notifyMax + ' TON</div>' +
+            '<div class="muted">AutoBuy: ' + (sub.autoBuyEnabled ? 'ON' : 'OFF') + ' / max: ' + autoMax + ' TON / режим: ' + mode + '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="subActions">' +
+          '<button class="iconBtn" title="Пауза" data-sub-act="toggle" data-id="' + sub.id + '">' + (sub.enabled ? '⏸' : '▶️') + '</button>' +
+          '<button class="iconBtn" title="Удалить" data-sub-act="delete" data-id="' + sub.id + '">🗑</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="row" style="margin-top:10px">' +
+        '<button class="small" data-sub-act="nmax" data-id="' + sub.id + '">Notify max</button>' +
+        '<button class="small" data-sub-act="ab" data-id="' + sub.id + '">AutoBuy ' + (sub.autoBuyEnabled ? 'ON' : 'OFF') + '</button>' +
+        '<button class="small" data-sub-act="amax" data-id="' + sub.id + '">Auto max</button>' +
+        '<button class="small" data-sub-act="mode" data-id="' + sub.id + '">' + mode + '</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
     async function refreshAdmin(){
       const r = await api('/api/admin/status');
       el('adminStatus').textContent = JSON.stringify(r, null, 2);
