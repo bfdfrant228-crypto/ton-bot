@@ -75,7 +75,7 @@ const SUBS_FEED_TYPES = new Set(
 );
 const SUBS_FEED_MAX_EVENTS_PER_CYCLE = Number(process.env.SUBS_FEED_MAX_EVENTS_PER_CYCLE || 20);
 // пауза между подписками чтобы не получать 429
-const SUBS_BETWEEN_PAUSE_MS = Number(process.env.SUBS_BETWEEN_PAUSE_MS || 800);
+const SUBS_BETWEEN_PAUSE_MS = Number(process.env.SUBS_BETWEEN_PAUSE_MS || 400);
 
 // Telegram notifications
 const SUBS_SEND_PHOTO = String(process.env.SUBS_SEND_PHOTO || '0') === '1';
@@ -83,7 +83,7 @@ const SUBS_SEND_PHOTO = String(process.env.SUBS_SEND_PHOTO || '0') === '1';
 // AutoBuy
 const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '0') === '1';
 const AUTO_BUY_DRY_RUN = String(process.env.AUTO_BUY_DRY_RUN || '1') === '1';
-const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 3000);
+const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 5000);
 const AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE = Number(process.env.AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE || 1);
 const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 60_000);
 const AUTO_BUY_DISABLE_AFTER_SUCCESS = String(process.env.AUTO_BUY_DISABLE_AFTER_SUCCESS || '0') === '1';
@@ -1645,23 +1645,37 @@ async function mrktFeedFetchBackground({ collectionNames = [], modelNames = [], 
     collectionNames: Array.isArray(collectionNames) ? collectionNames : [],
     modelNames: Array.isArray(modelNames) ? modelNames : [],
     backdropNames: Array.isArray(backdropNames) ? backdropNames : [],
+    symbolNames: [],
     lowToHigh: false,
     maxPrice: null,
     minPrice: null,
     number: null,
     ordering: 'Latest',
     query: null,
+    promotedFirst: false,
     type: Array.isArray(types) ? types : [],
     types: Array.isArray(types) ? types : [],
   };
 
   const r = await mrktPostJsonBackground('/feed', body);
   if (!r.ok) {
-    return { ok: false, reason: r.status === 429 ? 'RPS_WAIT' : 'FEED_ERROR', waitMs: r.waitMs || 0, items: [], cursor: '' };
+    // Логируем реальный ответ от MRKT чтобы понять в чём проблема
+    console.log(`[BG FEED ERROR] status=${r.status} text=${String(r.text || '').slice(0, 200)}`);
+    if (r.status === 429 || r.text === 'RPS_WAIT') {
+      return { ok: false, reason: 'RPS_WAIT', waitMs: r.waitMs || 8000, items: [], cursor: '' };
+    }
+    if (r.status === 401 || r.status === 403) {
+      // Токен протух — пробуем обновить
+      console.log('[BG FEED] 401/403 — пробуем обновить токен');
+      await tryRefreshMrktToken('bg_feed_401', { force: true });
+      return { ok: false, reason: 'AUTH_ERROR', waitMs: 0, items: [], cursor: '' };
+    }
+    return { ok: false, reason: 'FEED_ERROR', waitMs: 0, items: [], cursor: '' };
   }
 
   const items = Array.isArray(r.data?.items) ? r.data.items : [];
   const nextCursor = r.data?.cursor || r.data?.nextCursor || '';
+  console.log(`[BG FEED OK] items=${items.length} cursor=${!!nextCursor}`);
   return { ok: true, reason: 'OK', items, cursor: nextCursor };
 }
 
@@ -1719,16 +1733,20 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
 
       console.log(`[SUBS] userId=${userId}: активных подписок=${active.length}`);
 
+      // Ждём паузу ОДИН РАЗ если был 429 — перед всем циклом
+      if (bgState.pauseUntil > nowMs()) {
+        const waitFor = Math.min(bgState.pauseUntil - nowMs() + 200, 15000);
+        console.log(`[SUBS] 429 пауза ${Math.round(waitFor/1000)}s перед циклом подписок`);
+        await sleep(waitFor);
+      }
+
       for (const sub of active) {
         processedSubs++;
         console.log(`[SUBS] Обрабатываем sub #${sub.num} id=${sub.id} gifts=${JSON.stringify(sub.filters?.gifts)}`);
 
-        // Адаптивная пауза: если был 429 — ждём дольше
+        // Небольшая пауза между подписками — только базовая
         if (processedSubs > 1) {
-          const bgPause = bgState.pauseUntil > nowMs()
-            ? Math.min(bgState.pauseUntil - nowMs() + 500, 20000)
-            : SUBS_BETWEEN_PAUSE_MS;
-          if (bgPause > 0) await sleep(bgPause);
+          await sleep(SUBS_BETWEEN_PAUSE_MS);
         }
 
         // Feed уведомления — идут ПЕРВЫМИ (быстрее чем поиск лотов)
@@ -1893,10 +1911,13 @@ async function tryAutoBuyFromFeed(userId, sub, feedCache = new Map()) {
     subStates.set(stateKey, st);
   }
 
-  // Используем кэш feed — если уже запрашивали этот gift в текущем цикле
+  // Используем кэш feed с TTL — не спамим MRKT одинаковыми запросами
   const feedCacheKey = `${f.gifts.join(',')}|${models.join(',')}|${backdrops.join(',')}`;
-  let r = feedCache.get(feedCacheKey);
-  if (!r) {
+  const cached = feedCache.get(feedCacheKey);
+  let r;
+  if (cached && (nowMs() - cached.time) < AUTO_BUY_FEED_CACHE_TTL) {
+    r = cached.data;
+  } else {
     r = await mrktFeedFetchBackground({
       collectionNames: f.gifts,
       modelNames: models,
@@ -1905,7 +1926,7 @@ async function tryAutoBuyFromFeed(userId, sub, feedCache = new Map()) {
       count: 50,
       types: ['listing', 'change_price'],
     });
-    feedCache.set(feedCacheKey, r);
+    feedCache.set(feedCacheKey, { time: nowMs(), data: r });
   }
 
   if (!r.ok) {
@@ -2032,6 +2053,10 @@ async function tryAutoBuyFromFeed(userId, sub, feedCache = new Map()) {
   };
 }
 
+// Глобальный кэш feed для AutoBuy — TTL 4 секунды
+const autoBuyFeedCache = new Map(); // giftKey -> { time, items }
+const AUTO_BUY_FEED_CACHE_TTL = 4000;
+
 async function autoBuyCycle() {
   if (!AUTO_BUY_GLOBAL) return;
   if (MODE !== 'real') return;
@@ -2047,10 +2072,8 @@ async function autoBuyCycle() {
       const eligible = subs.filter((s) => s && s.enabled && s.autoBuyEnabled && s.maxAutoBuyTon != null);
       if (!eligible.length) continue;
 
-      console.log(`[AUTOBUY] Проверяем userId=${userId}, подписок с автобаем: ${eligible.length}`);
-
-      // Кэш feed по gift — чтобы не делать дублирующие запросы для одного gift
-      const feedCache = new Map();
+      // Используем глобальный кэш чтобы не дублировать запросы между циклами
+      const feedCache = autoBuyFeedCache;
 
       let buysDone = 0;
       for (const sub of eligible) {
