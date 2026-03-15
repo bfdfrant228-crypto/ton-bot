@@ -36,11 +36,10 @@ const FRAGMENT_GIFT_IMG_BASE = (process.env.FRAGMENT_GIFT_IMG_BASE || 'https://n
 let MRKT_AUTH_RUNTIME = (process.env.MRKT_AUTH || '').trim() || null;
 
 // throttling / RPS
-const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 12000);
-// Если в Railway выставлено слишком большое значение — ограничиваем до 800ms
+const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 20000);
 const MRKT_MIN_GAP_MS = Math.min(Number(process.env.MRKT_MIN_GAP_MS || 400), 800);
 const MRKT_429_DEFAULT_PAUSE_MS = Number(process.env.MRKT_429_DEFAULT_PAUSE_MS || 4500);
-const MRKT_HTTP_MAX_WAIT_MS = Number(process.env.MRKT_HTTP_MAX_WAIT_MS || 2500);
+const MRKT_HTTP_MAX_WAIT_MS = Number(process.env.MRKT_HTTP_MAX_WAIT_MS || 3000);
 
 // sizes
 const MRKT_COUNT = Number(process.env.MRKT_COUNT || 12);
@@ -60,8 +59,8 @@ const GLOBAL_SCAN_CACHE_TTL_MS = Number(process.env.GLOBAL_SCAN_CACHE_TTL_MS || 
 // caches
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60_000);
 const OFFERS_CACHE_TTL_MS = Number(process.env.OFFERS_CACHE_TTL_MS || 25_000);
-const LOTS_CACHE_TTL_MS = Number(process.env.LOTS_CACHE_TTL_MS || 8000);
-const DETAILS_CACHE_TTL_MS = Number(process.env.DETAILS_CACHE_TTL_MS || 8000);
+const LOTS_CACHE_TTL_MS = Number(process.env.LOTS_CACHE_TTL_MS || 30000);
+const DETAILS_CACHE_TTL_MS = Number(process.env.DETAILS_CACHE_TTL_MS || 30000);
 const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 25_000);
 const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
@@ -3284,11 +3283,29 @@ const WEBAPP_JS = `(() => {
     }
 
     async function refreshLots(force) {
-      const r = await api('/api/mrkt/lots' + (force ? '?force=1' : ''));
-      currentLots = r.lots || [];
-      const statusEl = el('status');
-      if (statusEl) statusEl.textContent = r.note || '';
+      // Показываем текущие лоты из кэша пока грузится
       const lotsEl = el('lots');
+      const statusEl = el('status');
+
+      // Retry до 3 раз
+      let r = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        if (attempt > 1) {
+          if (statusEl) statusEl.textContent = 'Поиск... (попытка ' + attempt + '/3)';
+          await sleep(1200);
+        }
+        try {
+          r = await api('/api/mrkt/lots' + (force ? '?force=1' : ''));
+          if (r && (r.lots || []).length > 0) break;
+          if (r && r.note && !r.note.includes('кэш')) break;
+        } catch(e) {
+          if (attempt === 3) throw e;
+          continue;
+        }
+      }
+
+      currentLots = r.lots || [];
+      if (statusEl) statusEl.textContent = r.note || '';
       if (lotsEl) {
         lotsEl.innerHTML = currentLots.length
           ? currentLots.map(lotCard).join('')
@@ -3653,6 +3670,8 @@ const WEBAPP_JS = `(() => {
       if (sel.gifts.length !== 1) { sel.models = []; sel.backdrops = []; el('model').value = ''; el('backdrop').value = ''; }
       hideSug('giftSug'); hideSug('modelSug'); hideSug('backdropSug');
       await patchFilters();
+      // Показываем кэш сразу, потом обновляем
+      refreshLots(false).catch(() => {});
       await Promise.all([refreshSummary(true).catch(()=>{}), refreshLots(true)]);
     });
     el('refresh').onclick = wrap('lots', async () => {
@@ -3727,6 +3746,9 @@ const WEBAPP_JS = `(() => {
         refreshLots(forceLots).catch(e => showErr(e.message || String(e))),
       ]);
     }
+
+    // Prefetch коллекций в фоне для быстрого открытия дропдауна
+    api('/api/mrkt/collections?q=').catch(() => {});
 
     await wrap('lots', async () => { await refreshAll(true); })();
   })();
@@ -3902,13 +3924,27 @@ app.get('/api/mrkt/lots', auth, async (req, res) => {
     note = r.note || null;
     lots = (r.lots || []).slice(0, WEBAPP_LOTS_LIMIT);
   } else {
-    const r = await mrktSearchLotsByFilters(f, WEBAPP_LOTS_PAGES || MRKT_PAGES, {
-      ordering: 'Price',
-      lowToHigh: true,
-      count: MRKT_COUNT,
-    });
+    // Retry до 3 раз при ошибке
+    let r = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      r = await mrktSearchLotsByFilters(f, WEBAPP_LOTS_PAGES || MRKT_PAGES, {
+        ordering: 'Price',
+        lowToHigh: true,
+        count: MRKT_COUNT,
+      });
+      if (r.ok) break;
+      if (attempt < 3) {
+        console.log(`[LOTS] Попытка ${attempt} не удалась (${r.reason}), retry через 1.5с...`);
+        await sleep(1500);
+      }
+    }
     if (!r.ok) {
-      note = `MRKT RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}`;
+      // Возвращаем кэш если есть
+      if (cached) {
+        console.log('[LOTS] Возвращаем кэш после 3 неудачных попыток');
+        return res.json({ ...cached.data, note: 'Из кэша (MRKT недоступен)' });
+      }
+      note = `MRKT недоступен, попробуй ещё раз`;
       waitMs = r.waitMs || 1000;
       lots = [];
     } else {
