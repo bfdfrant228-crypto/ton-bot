@@ -4324,7 +4324,6 @@ async function notifyAdmin(text) {
 }
 
 // ===================== Auto token refresh =====================
-const TOKEN_REFRESH_INTERVAL_MS = 20 * 60 * 60 * 1000; // каждые 20 часов
 const REDIS_KEY_TOKEN_REFRESHED_AT = 'mrkt:token:refreshed_at';
 
 async function autoRefreshToken() {
