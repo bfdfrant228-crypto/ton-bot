@@ -66,7 +66,7 @@ const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 25_000);
 const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
 // subs
-const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 30000);
+const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 20000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 20);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
 const SUBS_FEED_TYPES_RAW = String(process.env.SUBS_FEED_TYPES || 'sale,listing,change_price');
@@ -75,7 +75,7 @@ const SUBS_FEED_TYPES = new Set(
 );
 const SUBS_FEED_MAX_EVENTS_PER_CYCLE = Number(process.env.SUBS_FEED_MAX_EVENTS_PER_CYCLE || 20);
 // пауза между подписками чтобы не получать 429
-const SUBS_BETWEEN_PAUSE_MS = Number(process.env.SUBS_BETWEEN_PAUSE_MS || 3000);
+const SUBS_BETWEEN_PAUSE_MS = Number(process.env.SUBS_BETWEEN_PAUSE_MS || 1500);
 
 // Telegram notifications
 const SUBS_SEND_PHOTO = String(process.env.SUBS_SEND_PHOTO || '0') === '1';
@@ -1703,7 +1703,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         }
 
         // Пауза между feed и floor запросами
-        await sleep(1500);
+        await sleep(800);
 
         // Флор уведомления — только если feed не нашёл ничего нового
         const sf = normalizeFilters(sub.filters || {});
@@ -1781,17 +1781,30 @@ let isAutoBuying = false;
 
 function isNoFundsError(obj) {
   const s = JSON.stringify(obj?.data || obj || '').toLowerCase();
-  return s.includes('not enough') || s.includes('insufficient') || s.includes('balance');
+  const t = String(obj?.text || obj?.reason || '').toLowerCase();
+  return s.includes('not enough') || s.includes('insufficient') || s.includes('balance') ||
+    t.includes('not enough') || t.includes('insufficient') || t.includes('balance') ||
+    s.includes('funds') || t.includes('funds');
 }
 
 async function mrktBuy({ id, priceNano }) {
   const body = { ids: [id], prices: { [id]: priceNano } };
   const r = await mrktPostJson('/gifts/buy', body);
-  if (!r.ok) return { ok: false, reason: r.status === 429 ? 'RPS_WAIT' : (mrktState.lastFailMsg || 'BUY_ERROR'), waitMs: r.waitMs || 0, data: r.data };
+
+  // Проверяем ошибку недостатка средств ДО всего остального
+  if (!r.ok) {
+    const noFunds = isNoFundsError({ data: r.data, text: r.text });
+    if (noFunds) return { ok: false, reason: 'NO_FUNDS', noFunds: true, data: r.data };
+    return { ok: false, reason: r.status === 429 ? 'RPS_WAIT' : (mrktState.lastFailMsg || 'BUY_ERROR'), waitMs: r.waitMs || 0, data: r.data };
+  }
 
   const data = r.data;
-  // ИСПРАВЛЕНИЕ: MRKT может вернуть разные форматы ответа на покупку
-  // Проверяем несколько вариантов подтверждения
+
+  // Проверяем нет ли ошибки средств в теле успешного ответа
+  if (isNoFundsError({ data })) {
+    return { ok: false, reason: 'NO_FUNDS', noFunds: true, data };
+  }
+
   let okItem = null;
   if (Array.isArray(data)) {
     okItem = data.find((x) =>
@@ -1800,13 +1813,11 @@ async function mrktBuy({ id, priceNano }) {
       (x?.status === 'success' && String(x?.id || '') === String(id))
     );
   } else if (data && typeof data === 'object') {
-    // Если ответ не массив — считаем успехом если нет ошибки
     if (!data.error && !data.message) okItem = data;
   }
 
   if (!okItem) {
     console.warn('[BUY] Не нашли подтверждение в ответе, data=', JSON.stringify(data).slice(0, 300));
-    // Мягкая проверка — если статус 200 и нет явной ошибки, считаем успехом
     if (data && !data.error && !data.message) {
       return { ok: true, okItem: data, data };
     }
@@ -1917,6 +1928,9 @@ async function tryAutoBuyFromFeed(userId, sub) {
   const buyRes = await mrktBuy({ id: lotId, priceNano: pick.priceNano });
   if (!buyRes.ok) {
     console.error(`[AUTOBUY] Покупка не удалась: ${buyRes.reason}`);
+    if (buyRes.noFunds) {
+      return { ok: true, bought: false, noFunds: true, priceTon: pick.priceTon };
+    }
     return { ok: true, bought: false, buyFail: buyRes };
   }
 
@@ -2001,17 +2015,29 @@ async function autoBuyCycle() {
         // 1) Быстрый путь: feed listing/change_price
         const r1 = await tryAutoBuyFromFeed(userId, sub);
 
+        // Нет денег — останавливаем автопокупку, НЕ пишем в историю
+        if (r1 && r1.noFunds) {
+          console.warn(`[AUTOBUY] Нет средств userId=${userId} sub=#${sub.num} price=${r1.priceTon} TON`);
+          for (const s2 of eligible) if (s2) s2.autoBuyEnabled = false;
+          scheduleSave();
+          await sendMessageSafe(userChatId(userId),
+            `⚠️ AutoBuy остановлен\nНедостаточно средств на балансе MRKT\nПопытка покупки: ${Number(r1.priceTon || 0).toFixed(3)} TON\nПополни баланс и включи AutoBuy снова`,
+            { disable_web_page_preview: true }
+          );
+          break;
+        }
+
         if (r1 && r1.bought) {
           buysDone++;
 
           if (AUTO_BUY_DRY_RUN) {
             await sendMessageSafe(
               userChatId(userId),
-              `AutoBuy (DRY RUN)\nЦена: ${Number(r1.priceTon).toFixed(3)} TON\nLot: ${r1.lotId || ''}`,
+              `🔍 AutoBuy DRY RUN\nНашёл лот: ${Number(r1.priceTon).toFixed(3)} TON\nLot: ${r1.lotId || ''}\n(реальная покупка выключена — AUTO_BUY_DRY_RUN=1)`,
               { disable_web_page_preview: true }
             );
           } else {
-            let msg = `AutoBuy выполнен\nЦена: ${Number(r1.priceTon).toFixed(3)} TON\n`;
+            let msg = `✅ AutoBuy выполнен\nЦена: ${Number(r1.priceTon).toFixed(3)} TON\n`;
             if (r1.latencyMs != null) {
               msg += `Latency: ${(Number(r1.latencyMs) / 1000).toFixed(2)}s\n`;
             }
@@ -2115,12 +2141,15 @@ async function autoBuyCycle() {
             sub.autoBuyEnabled = false;
             scheduleSave();
           }
-        } else if (isNoFundsError(buyRes)) {
+        } else if (buyRes.noFunds || isNoFundsError(buyRes)) {
           for (const s2 of subs) if (s2) s2.autoBuyEnabled = false;
           scheduleSave();
-          await sendMessageSafe(userChatId(userId), `AutoBuy остановлен: недостаточно средств`, {
-            disable_web_page_preview: true,
-          });
+          await sendMessageSafe(userChatId(userId),
+            `⚠️ AutoBuy остановлен\nНедостаточно средств на балансе MRKT\nПопытка покупки: ${candidate.priceTon.toFixed(3)} TON\nПополни баланс и включи AutoBuy снова`,
+            { disable_web_page_preview: true }
+          );
+        } else {
+          console.warn(`[AUTOBUY FALLBACK] Покупка не удалась: ${buyRes.reason}`);
         }
       }
     }
