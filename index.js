@@ -57,7 +57,7 @@ const GLOBAL_SCAN_COLLECTIONS = Number(process.env.GLOBAL_SCAN_COLLECTIONS || 1)
 const GLOBAL_SCAN_CACHE_TTL_MS = Number(process.env.GLOBAL_SCAN_CACHE_TTL_MS || 120_000);
 
 // caches
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60_000);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60_000);
 const OFFERS_CACHE_TTL_MS = Number(process.env.OFFERS_CACHE_TTL_MS || 25_000);
 const LOTS_CACHE_TTL_MS = Number(process.env.LOTS_CACHE_TTL_MS || 8000);
 const DETAILS_CACHE_TTL_MS = Number(process.env.DETAILS_CACHE_TTL_MS || 8000);
@@ -2063,9 +2063,9 @@ body{margin:0;padding:0;color:var(--text);font-family:-apple-system,BlinkMacSyst
   cursor:pointer;font-size:10px;font-weight:500;letter-spacing:.2px;
   transition:color .15s;min-width:0;
 }
-.tabbtn .tabIcon{font-size:22px;line-height:1;transition:transform .15s,filter .15s;}
+.tabbtn .tabIcon{width:22px;height:22px;transition:transform .15s,filter .15s;flex-shrink:0;}
 .tabbtn.active{color:var(--accent2);}
-.tabbtn.active .tabIcon{transform:scale(1.1);filter:drop-shadow(0 0 6px var(--accent));}
+.tabbtn.active .tabIcon{transform:scale(1.1);filter:drop-shadow(0 0 5px var(--accent));}
 .tabbtn:hover:not(.active){color:var(--text)}
 
 /* Main content */
@@ -2460,10 +2460,22 @@ button:hover{background:rgba(255,255,255,.06)}
 </div>
 
 <nav class="bottomNav">
-  <button class="tabbtn active" data-tab="market"><span class="tabIcon">🛍</span>Market</button>
-  <button class="tabbtn" data-tab="subs"><span class="tabIcon">🔔</span>Подписки</button>
-  <button class="tabbtn" data-tab="profile"><span class="tabIcon">👤</span>Профиль</button>
-  <button class="tabbtn" data-tab="admin" id="adminTabBtn" style="display:none"><span class="tabIcon">⚙️</span>Admin</button>
+  <button class="tabbtn active" data-tab="market">
+    <svg class="tabIcon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg>
+    Market
+  </button>
+  <button class="tabbtn" data-tab="subs">
+    <svg class="tabIcon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+    Подписки
+  </button>
+  <button class="tabbtn" data-tab="profile">
+    <svg class="tabIcon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+    Профиль
+  </button>
+  <button class="tabbtn" data-tab="admin" id="adminTabBtn" style="display:none">
+    <svg class="tabIcon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
+    Admin
+  </button>
 </nav>
 
 <!-- BOTTOM SHEET -->
@@ -2595,6 +2607,7 @@ const WEBAPP_JS = `(() => {
     }
 
     document.querySelectorAll('.tabbtn').forEach(b => b.onclick = async () => {
+      hideSug('giftSug'); hideSug('modelSug'); hideSug('backdropSug');
       setTab(b.dataset.tab);
       if (b.dataset.tab === 'profile') await refreshProfile().catch(() => {});
       if (b.dataset.tab === 'admin') await refreshAdmin().catch(() => {});
@@ -2810,10 +2823,12 @@ const WEBAPP_JS = `(() => {
     }
 
     document.addEventListener('click', e => {
-      if (!e.target.closest('#giftSug') && e.target !== el('gift')) hideSug('giftSug');
-      if (!e.target.closest('#modelSug') && e.target !== el('model')) hideSug('modelSug');
-      if (!e.target.closest('#backdropSug') && e.target !== el('backdrop')) hideSug('backdropSug');
+      if (!e.target.closest('#giftSug') && !e.target.closest('#giftField')) hideSug('giftSug');
+      if (!e.target.closest('#modelSug') && !e.target.closest('#modelField')) hideSug('modelSug');
+      if (!e.target.closest('#backdropSug') && !e.target.closest('#backdropField')) hideSug('backdropSug');
     });
+    // Закрывать dropdown при скролле
+    window.addEventListener('scroll', () => { hideSug('giftSug'); hideSug('modelSug'); hideSug('backdropSug'); }, { passive: true });
 
     el('gift').addEventListener('focus', () => debounce('gift', () => showGiftSug().catch(e => showErr(e.message || String(e)))));
     el('gift').addEventListener('input', () => debounce('gift', () => showGiftSug().catch(e => showErr(e.message || String(e)))));
@@ -3253,9 +3268,13 @@ const WEBAPP_JS = `(() => {
 
     el('apply').onclick = wrap('lots', async () => {
       if (sel.gifts.length !== 1) { sel.models = []; sel.backdrops = []; el('model').value = ''; el('backdrop').value = ''; }
-      await patchFilters(); await refreshSummary(true); await refreshLots(true);
+      hideSug('giftSug'); hideSug('modelSug'); hideSug('backdropSug');
+      await patchFilters();
+      await Promise.all([refreshSummary(true).catch(()=>{}), refreshLots(true)]);
     });
-    el('refresh').onclick = wrap('lots', async () => { await refreshSummary(true); await refreshLots(true); });
+    el('refresh').onclick = wrap('lots', async () => {
+      await Promise.all([refreshSummary(true).catch(()=>{}), refreshLots(true)]);
+    });
     el('salesByFilters').onclick = async (e) => { e.stopPropagation(); hideErr(); await openSalesByFilters(); };
 
     let subCreateBusy = false;
@@ -3319,8 +3338,11 @@ const WEBAPP_JS = `(() => {
     async function refreshAll(forceLots) {
       hideErr();
       await refreshState();
-      await refreshSummary(forceLots);
-      await refreshLots(forceLots);
+      // Параллельная загрузка — быстрее
+      await Promise.all([
+        refreshSummary(forceLots).catch(() => {}),
+        refreshLots(forceLots).catch(e => showErr(e.message || String(e))),
+      ]);
     }
 
     await wrap('lots', async () => { await refreshAll(true); })();
