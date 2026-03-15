@@ -66,7 +66,7 @@ const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 25_000);
 const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
 // subs
-const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 20000);
+const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 12000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 20);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
 const SUBS_FEED_TYPES_RAW = String(process.env.SUBS_FEED_TYPES || 'sale,listing,change_price');
@@ -75,7 +75,7 @@ const SUBS_FEED_TYPES = new Set(
 );
 const SUBS_FEED_MAX_EVENTS_PER_CYCLE = Number(process.env.SUBS_FEED_MAX_EVENTS_PER_CYCLE || 20);
 // пауза между подписками чтобы не получать 429
-const SUBS_BETWEEN_PAUSE_MS = Number(process.env.SUBS_BETWEEN_PAUSE_MS || 1500);
+const SUBS_BETWEEN_PAUSE_MS = Number(process.env.SUBS_BETWEEN_PAUSE_MS || 800);
 
 // Telegram notifications
 const SUBS_SEND_PHOTO = String(process.env.SUBS_SEND_PHOTO || '0') === '1';
@@ -83,7 +83,7 @@ const SUBS_SEND_PHOTO = String(process.env.SUBS_SEND_PHOTO || '0') === '1';
 // AutoBuy
 const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '0') === '1';
 const AUTO_BUY_DRY_RUN = String(process.env.AUTO_BUY_DRY_RUN || '1') === '1';
-const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 4500);
+const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 3000);
 const AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE = Number(process.env.AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE || 1);
 const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 60_000);
 const AUTO_BUY_DISABLE_AFTER_SUCCESS = String(process.env.AUTO_BUY_DISABLE_AFTER_SUCCESS || '0') === '1';
@@ -1365,19 +1365,29 @@ async function notifyTextOrPhoto(chatId, imgUrl, text, reply_markup) {
 }
 
 // ===================== Subscription notifications =====================
-async function notifyFloorToUser(userId, sub, lot, newFloor) {
+async function notifyFloorToUser(userId, sub, lot, newFloor, prevFloor) {
   const chatId = userChatId(userId);
   console.log(`[NOTIFY FLOOR] userId=${userId} chatId=${chatId} sub=#${sub.num} floor=${newFloor}`);
 
+  const isFirst = prevFloor == null;
+  const went = !isFirst ? (newFloor < prevFloor ? '📉' : newFloor > prevFloor ? '📈' : '➡️') : '🆕';
+
   const lines = [];
-  lines.push(`Подписка #${sub.num}`);
+  lines.push(`🔔 Подписка #${sub.num} — Флор ${went}`);
   lines.push(`Gift: ${subGiftTitle(sub)}`);
-  lines.push(`Флор: ${newFloor.toFixed(3)} TON`);
+  lines.push(`Цена: ${newFloor.toFixed(3)} TON${!isFirst ? ` (было ${Number(prevFloor).toFixed(3)})` : ''}`);
   if (lot?.model) lines.push(`Model: ${lot.model}`);
   if (lot?.backdrop) lines.push(`Backdrop: ${lot.backdrop}`);
+  if (lot?.number != null) lines.push(`#${lot.number}`);
+  lines.push('');
   lines.push(lot?.urlTelegram || 'https://t.me/mrkt');
 
-  const reply_markup = mkReplyMarkupOpen(lot?.urlMarket, 'MRKT');
+  const reply_markup = {
+    inline_keyboard: [[
+      ...(lot?.urlTelegram ? [{ text: '🎁 NFT', url: lot.urlTelegram }] : []),
+      ...(lot?.urlMarket ? [{ text: '🛍 MRKT', url: lot.urlMarket }] : []),
+    ]]
+  };
   await notifyTextOrPhoto(chatId, lotImgUrl(lot), lines.join('\n'), reply_markup);
 }
 
@@ -1438,15 +1448,24 @@ async function notifyFeedEvent(userId, sub, ev) {
   const chatId = userChatId(userId);
   console.log(`[NOTIFY FEED] userId=${userId} chatId=${chatId} sub=#${sub.num} type=${ev.type} price=${ev.priceTon}`);
 
+  const typeIcon = ev.type === 'sale' ? '💰' : ev.type === 'listing' ? '🏷' : ev.type === 'change_price' ? '✏️' : '📌';
+
   const lines = [];
-  lines.push(`Подписка #${sub.num} — ${ev.typeLabel}`);
+  lines.push(`🔔 Подписка #${sub.num} — ${typeIcon} ${ev.typeLabel}`);
   lines.push(`Gift: ${subGiftTitle(sub)}`);
   if (ev.priceTon != null) lines.push(`Цена: ${ev.priceTon.toFixed(3)} TON`);
   if (ev.model) lines.push(`Model: ${ev.model}`);
   if (ev.backdrop) lines.push(`Backdrop: ${ev.backdrop}`);
+  if (ev.title) lines.push(`${ev.title}`);
+  lines.push('');
   lines.push(ev.urlTelegram || 'https://t.me/mrkt');
 
-  const reply_markup = mkReplyMarkupOpen(ev.urlMarket, 'MRKT');
+  const reply_markup = {
+    inline_keyboard: [[
+      ...(ev.urlTelegram ? [{ text: '🎁 NFT', url: ev.urlTelegram }] : []),
+      ...(ev.urlMarket ? [{ text: '🛍 MRKT', url: ev.urlMarket }] : []),
+    ]]
+  };
   await notifyTextOrPhoto(chatId, ev.imgUrl, lines.join('\n'), reply_markup);
 }
 
@@ -1703,7 +1722,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         }
 
         // Пауза между feed и floor запросами
-        await sleep(800);
+        await sleep(400);
 
         // Флор уведомления — только если feed не нашёл ничего нового
         const sf = normalizeFilters(sub.filters || {});
@@ -1749,8 +1768,8 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
                 console.log(`[SUBS FLOOR] sub #${sub.num}: newFloor=${newFloor} prevFloor=${prevFloor} canNotify=${canNotify} maxNotify=${maxNotify}`);
 
                 if (canNotify && (prevFloor == null || Math.abs(Number(prevFloor) - Number(newFloor)) > 0.0001)) {
-                  console.log(`[SUBS FLOOR] Отправляем флор уведомление userId=${userId} sub #${sub.num} floor=${newFloor}`);
-                  await notifyFloorToUser(userId, sub, lot, newFloor);
+                  console.log(`[SUBS FLOOR] Отправляем флор уведомление userId=${userId} sub #${sub.num} floor=${newFloor} prev=${prevFloor}`);
+                  await notifyFloorToUser(userId, sub, lot, newFloor, prevFloor);
                   floorNotifs++;
                 }
 
@@ -2057,8 +2076,8 @@ async function autoBuyCycle() {
           continue;
         }
 
-        // 2) Fallback: режим "Любые" — поиск уже существующих лотов по цене
-        if (!sub.autoBuyAny) continue;
+        // Режим "Любые" убран — работаем только с новыми лотами из feed
+        continue;
 
         const maxBuy = Number(sub.maxAutoBuyTon);
         if (!Number.isFinite(maxBuy) || maxBuy <= 0) continue;
@@ -3232,8 +3251,6 @@ const WEBAPP_JS = `(() => {
           const backs = (f.backdrops || []).join(', ');
           const notifyMax = sub.maxNotifyTon == null ? '∞' : sub.maxNotifyTon + ' TON';
           const autoMax = sub.maxAutoBuyTon == null ? '—' : sub.maxAutoBuyTon + ' TON';
-          const mode = sub.autoBuyAny ? 'Любые лоты' : 'Только новые';
-
           const imgHtml = sub.ui && sub.ui.thumbKey
             ? '<img class="subImg" src="/img/cdn?key=' + encodeURIComponent(sub.ui.thumbKey) + '" referrerpolicy="no-referrer" loading="lazy"/>'
             : '<div class="subImgPlaceholder">◇</div>';
@@ -3263,19 +3280,21 @@ const WEBAPP_JS = `(() => {
                 '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">' +
                   '<span style="font-size:11px;color:var(--muted)">Notify max: <b style="color:var(--text)">' + notifyMax + '</b></span>' +
                   (sub.autoBuyEnabled ? '<span style="font-size:11px;color:var(--muted)">AutoBuy max: <b style="color:var(--yellow)">' + autoMax + '</b></span>' : '') +
-                  (sub.autoBuyEnabled ? '<span style="font-size:11px;color:var(--muted)">Режим: <b style="color:var(--text)">' + mode + '</b></span>' : '') +
                 '</div>' +
               '</div>' +
               '<div class="subActions">' +
-                '<button class="iconBtn" title="' + (sub.enabled ? 'Пауза' : 'Включить') + '" data-sub-act="toggle" data-id="' + sub.id + '" style="font-size:13px">' + (sub.enabled ? '⏸' : '▶') + '</button>' +
-                '<button class="iconBtn danger" title="Удалить" data-sub-act="delete" data-id="' + sub.id + '" style="font-size:13px">✕</button>' +
+                '<button class="iconBtn" title="' + (sub.enabled ? 'Пауза' : 'Включить') + '" data-sub-act="toggle" data-id="' + sub.id + '">' +
+                  (sub.enabled
+                    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="4" width="4" height="16" rx="1"/><rect x="15" y="4" width="4" height="16" rx="1"/></svg>'
+                    : '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v14l11-7-11-7z"/></svg>') +
+                '</button>' +
+                '<button class="iconBtn danger" title="Удалить" data-sub-act="delete" data-id="' + sub.id + '">✕</button>' +
               '</div>' +
             '</div>' +
             '<div class="subActions2">' +
               '<button class="btn-sm" data-sub-act="nmax" data-id="' + sub.id + '">Notify max</button>' +
               '<button class="btn-sm' + (sub.autoBuyEnabled ? ' btn-green' : '') + '" data-sub-act="ab" data-id="' + sub.id + '">AutoBuy ' + (sub.autoBuyEnabled ? 'ON' : 'OFF') + '</button>' +
               (sub.autoBuyEnabled ? '<button class="btn-sm" data-sub-act="amax" data-id="' + sub.id + '">Auto max</button>' : '') +
-              (sub.autoBuyEnabled ? '<button class="btn-sm" data-sub-act="mode" data-id="' + sub.id + '">' + (sub.autoBuyAny ? 'Режим: Любые' : 'Режим: Новые') + '</button>' : '') +
             '</div>' +
           '</div>';
         }).join('');
@@ -3533,7 +3552,7 @@ const WEBAPP_JS = `(() => {
           if (v == null) return;
           await api('/api/sub/set_autobuy_max', { method: 'POST', body: JSON.stringify({ id, maxAutoBuyTon: v }) });
         }
-        if (act === 'mode') await api('/api/sub/toggle_autobuy_any', { method: 'POST', body: JSON.stringify({ id }) });
+        // mode button removed — always "Новые" mode
         await refreshSubs();
       })();
     });
