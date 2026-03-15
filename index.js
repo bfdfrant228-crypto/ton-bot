@@ -66,7 +66,7 @@ const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 25_000);
 const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
 // subs
-const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 12000);
+const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 8000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 20);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
 // change_price невалидный тип для MRKT /feed API — убираем из дефолта
@@ -76,7 +76,7 @@ const SUBS_FEED_TYPES = new Set(
 );
 const SUBS_FEED_MAX_EVENTS_PER_CYCLE = Number(process.env.SUBS_FEED_MAX_EVENTS_PER_CYCLE || 20);
 // пауза между подписками чтобы не получать 429
-const SUBS_BETWEEN_PAUSE_MS = Number(process.env.SUBS_BETWEEN_PAUSE_MS || 400);
+const SUBS_BETWEEN_PAUSE_MS = Number(process.env.SUBS_BETWEEN_PAUSE_MS || 200);
 
 // Telegram notifications
 const SUBS_SEND_PHOTO = String(process.env.SUBS_SEND_PHOTO || '0') === '1';
@@ -84,7 +84,7 @@ const SUBS_SEND_PHOTO = String(process.env.SUBS_SEND_PHOTO || '0') === '1';
 // AutoBuy
 const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '0') === '1';
 const AUTO_BUY_DRY_RUN = String(process.env.AUTO_BUY_DRY_RUN || '1') === '1';
-const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 5000);
+const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 3000);
 const AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE = Number(process.env.AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE || 1);
 const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 60_000);
 const AUTO_BUY_DISABLE_AFTER_SUCCESS = String(process.env.AUTO_BUY_DISABLE_AFTER_SUCCESS || '0') === '1';
@@ -1612,8 +1612,8 @@ async function mrktPostJsonBackground(path, bodyObj) {
   }
   if (waitMs0 > 0) await sleep(waitMs0);
 
-  // Минимальный gap между фоновыми запросами — 1.5 секунды
-  bgState.nextAllowedAt = nowMs() + 1500;
+  // Минимальный gap между фоновыми запросами — 500ms
+  bgState.nextAllowedAt = nowMs() + 500;
 
   const reqVal = makeReq();
   const body = { ...(bodyObj || {}), req: reqVal };
@@ -1720,123 +1720,170 @@ async function mrktSearchLotsBackground(collectionNames, modelNames, backdropNam
 }
 
 async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
-  if (MODE !== 'real') {
-    console.log('[SUBS] Пропуск: MODE=', MODE, '(нужно real)');
-    return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
-  }
+  if (MODE !== 'real') return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
   if (isSubsChecking && !manual) return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
 
-  // Диагностика — видим что происходит в каждом цикле
-  const totalUsers = users.size;
-  const totalSubs = Array.from(users.values()).reduce((acc, u) => acc + (u.subscriptions?.length || 0), 0);
   const totalActive = Array.from(users.values()).reduce((acc, u) =>
     acc + (u.subscriptions || []).filter(s => s && s.enabled).length, 0);
-  console.log(`[SUBS CYCLE] users=${totalUsers} totalSubs=${totalSubs} activeSubs=${totalActive} auth=${!!MRKT_AUTH_RUNTIME}`);
+  console.log(`[SUBS CYCLE] users=${users.size} activeSubs=${totalActive} auth=${!!MRKT_AUTH_RUNTIME}`);
 
   isSubsChecking = true;
   try {
     let processedSubs = 0;
     let floorNotifs = 0;
     let feedNotifs = 0;
-    let feedBudget = SUBS_FEED_MAX_EVENTS_PER_CYCLE;
 
     for (const [userId, user] of users.entries()) {
       if (!user.enabled) continue;
-
       const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
       const active = subs.filter((s) => s && s.enabled);
       if (!active.length) continue;
 
-      console.log(`[SUBS] userId=${userId}: активных подписок=${active.length}`);
+      // === ШАГ 1: Группируем подписки по gift и делаем ОДИН запрос на каждый gift ===
+      // Вместо 8 запросов feed делаем 4-5 (по количеству уникальных gifts)
+      const giftFeedCache = new Map(); // giftKey -> { items, ok }
 
-      // Ждём паузу ОДИН РАЗ если был 429 — перед всем циклом
+      const getGiftKey = (sub) => {
+        const f = normalizeFilters(sub.filters || {});
+        return f.gifts.slice().sort().join('|') + '::' +
+          (f.gifts.length === 1 ? f.models.slice().sort().join('|') : '') + '::' +
+          (f.gifts.length === 1 ? f.backdrops.slice().sort().join('|') : '');
+      };
+
+      // Собираем уникальные комбинации
+      const uniqueKeys = new Map();
+      for (const sub of active) {
+        const key = getGiftKey(sub);
+        if (!uniqueKeys.has(key)) {
+          const f = normalizeFilters(sub.filters || {});
+          uniqueKeys.set(key, {
+            collectionNames: f.gifts,
+            modelNames: f.gifts.length === 1 ? f.models : [],
+            backdropNames: f.gifts.length === 1 ? f.backdrops : [],
+          });
+        }
+      }
+
+      // Делаем feed запросы для каждой уникальной комбинации
+      console.log(`[SUBS] userId=${userId}: ${active.length} подписок, ${uniqueKeys.size} уникальных gift-групп`);
+
+      // Пауза если был 429
       if (bgState.pauseUntil > nowMs()) {
-        const waitFor = Math.min(bgState.pauseUntil - nowMs() + 200, 15000);
-        console.log(`[SUBS] 429 пауза ${Math.round(waitFor/1000)}s перед циклом подписок`);
+        const waitFor = Math.min(bgState.pauseUntil - nowMs() + 100, 12000);
+        console.log(`[SUBS] 429 пауза ${Math.round(waitFor/1000)}s`);
         await sleep(waitFor);
       }
 
+      for (const [key, params] of uniqueKeys.entries()) {
+        const r = await mrktFeedFetchBackground({
+          collectionNames: params.collectionNames,
+          modelNames: params.modelNames,
+          backdropNames: params.backdropNames,
+          cursor: '',
+          count: 50,
+          types: [],
+        });
+        giftFeedCache.set(key, r);
+        // Минимальная пауза между уникальными gift запросами
+        if (uniqueKeys.size > 1) await sleep(600);
+      }
+
+      // === ШАГ 2: Обрабатываем каждую подписку используя кэшированный feed ===
       for (const sub of active) {
         processedSubs++;
-        console.log(`[SUBS] Обрабатываем sub #${sub.num} id=${sub.id} gifts=${JSON.stringify(sub.filters?.gifts)}`);
+        const key = getGiftKey(sub);
+        const feedResult = giftFeedCache.get(key) || { ok: false, items: [], reason: 'NO_CACHE' };
 
-        // Небольшая пауза между подписками — только базовая
-        if (processedSubs > 1) {
-          await sleep(SUBS_BETWEEN_PAUSE_MS);
-        }
-
-        // Feed уведомления — идут ПЕРВЫМИ (быстрее чем поиск лотов)
-        if (feedBudget > 0) {
+        // Feed уведомления — из кэша, без доп запросов
+        if (feedResult.ok && feedResult.items.length > 0) {
           const stateKeyFeed = `${userId}:${sub.id}:feed`;
           try {
-            const sent = await processFeedForSub(userId, sub, stateKeyFeed, feedBudget);
-            feedBudget -= sent;
-            feedNotifs += sent;
+            let st = subStates.get(stateKeyFeed);
+            if (!st) {
+              const saved = await redisGet(`sub:feed:${stateKeyFeed}`).catch(() => null);
+              st = saved ? (JSON.parse(saved) || { feedLastId: null }) : { feedLastId: null };
+              subStates.set(stateKeyFeed, st);
+            }
+
+            const latestId = feedResult.items[0]?.id || null;
+            if (latestId && !st.feedLastId) {
+              // Первый запуск — запоминаем позицию
+              const newSt = { feedLastId: latestId };
+              subStates.set(stateKeyFeed, newSt);
+              if (redis) redisSet(`sub:feed:${stateKeyFeed}`, JSON.stringify(newSt), { EX: 86400 * 7 }).catch(() => {});
+            } else if (latestId && latestId !== st.feedLastId) {
+              // Есть новые события
+              const newItems = [];
+              for (const it of feedResult.items) {
+                if (!it?.id) continue;
+                if (it.id === st.feedLastId) break;
+                newItems.push(it);
+              }
+
+              if (newItems.length > 0) {
+                console.log(`[FEED] Sub #${sub.num}: найдено новых событий: ${newItems.length}`);
+                newItems.reverse();
+                let sent = 0;
+                for (const it of newItems) {
+                  if (sent >= 5) break;
+                  const type = String(it?.type || '').toLowerCase();
+                  if (!SUBS_FEED_TYPES.has(type)) continue;
+                  const ev = feedItemToEvent(it);
+                  if (!ev) continue;
+                  if (sub.maxNotifyTon != null && ev.priceTon != null && Number(ev.priceTon) > Number(sub.maxNotifyTon)) continue;
+                  try { await notifyFeedEvent(userId, sub, ev); sent++; feedNotifs++; } catch {}
+                }
+              }
+
+              const newSt2 = { feedLastId: latestId };
+              subStates.set(stateKeyFeed, newSt2);
+              if (redis) redisSet(`sub:feed:${stateKeyFeed}`, JSON.stringify(newSt2), { EX: 86400 * 7 }).catch(() => {});
+            }
           } catch (e) {
-            console.error(`[SUBS] Ошибка feed sub #${sub.num} userId=${userId}:`, e?.message || e);
+            console.error(`[SUBS] Feed ошибка sub #${sub.num}:`, e?.message);
           }
         }
 
-        // Небольшая пауза между feed и floor
-        await sleep(300);
-
-        // Флор уведомления — только если feed не нашёл ничего нового
+        // === ШАГ 3: Флор — тоже кэшируем по gift ===
         const sf = normalizeFilters(sub.filters || {});
-        if (sf.gifts.length) {
-          const stateKeyFloor = `${userId}:${sub.id}:floor`;
-          let prev = subStates.get(stateKeyFloor);
-          if (!prev) {
-            const saved = await redisGet(`sub:floor:${stateKeyFloor}`).catch(() => null);
-            if (saved) { try { prev = JSON.parse(saved); } catch { prev = { floor: null, emptyStreak: 0 }; } }
-            else { prev = { floor: null, emptyStreak: 0 }; }
-            subStates.set(stateKeyFloor, prev);
+        if (!sf.gifts.length) continue;
+
+        const floorKey = sf.gifts.slice().sort().join('|');
+        if (!giftFeedCache.has('floor:' + floorKey)) {
+          const rLots = await mrktSearchLotsBackground(
+            sf.gifts,
+            sf.gifts.length === 1 ? sf.models : [],
+            sf.gifts.length === 1 ? sf.backdrops : [],
+            5
+          );
+          giftFeedCache.set('floor:' + floorKey, rLots);
+          if (uniqueKeys.size > 1) await sleep(400);
+        }
+
+        const rLots = giftFeedCache.get('floor:' + floorKey);
+        if (!rLots?.ok) continue;
+
+        const lotsSorted = (rLots.gifts || []).map(g => salingGiftToLot(g)).filter(Boolean).sort((a,b) => a.priceTon - b.priceTon);
+        const lot = lotsSorted[0] || null;
+        const newFloor = lot ? lot.priceTon : null;
+
+        const stateKeyFloor = `${userId}:${sub.id}:floor`;
+        let prev = subStates.get(stateKeyFloor);
+        if (!prev) {
+          const saved = await redisGet(`sub:floor:${stateKeyFloor}`).catch(() => null);
+          prev = saved ? (JSON.parse(saved) || { floor: null, emptyStreak: 0 }) : { floor: null, emptyStreak: 0 };
+          subStates.set(stateKeyFloor, prev);
+        }
+
+        if (newFloor != null) {
+          const maxNotify = sub.maxNotifyTon != null ? Number(sub.maxNotifyTon) : null;
+          const canNotify = maxNotify == null || newFloor <= maxNotify;
+          if (canNotify && (prev.floor == null || Math.abs(Number(prev.floor) - newFloor) > 0.0001)) {
+            try { await notifyFloorToUser(userId, sub, lot, newFloor, prev.floor); floorNotifs++; } catch {}
           }
-
-          try {
-            const rLots = await mrktSearchLotsBackground(
-              sf.gifts,
-              sf.gifts.length === 1 ? (sf.models || []) : [],
-              sf.gifts.length === 1 ? (sf.backdrops || []) : [],
-              5
-            );
-            const r = {
-              ok: rLots.ok,
-              gifts: rLots.ok ? rLots.gifts.map(g => salingGiftToLot(g)).filter(Boolean).sort((a,b) => a.priceTon - b.priceTon) : []
-            };
-            console.log(`[SUBS FLOOR] sub #${sub.num}: ok=${r.ok} lots=${r.gifts?.length} prevFloor=${prev.floor}`);
-            if (r.ok) {
-              const lot = r.gifts?.length ? r.gifts[0] : null;
-              const newFloor = lot ? lot.priceTon : null;
-
-              let emptyStreak = prev.emptyStreak || 0;
-
-              if (newFloor == null) {
-                emptyStreak++;
-                const newSt = { ...prev, emptyStreak, floor: emptyStreak >= SUBS_EMPTY_CONFIRM ? null : prev.floor };
-                subStates.set(stateKeyFloor, newSt);
-                if (redis) redisSet(`sub:floor:${stateKeyFloor}`, JSON.stringify(newSt), { EX: 86400 * 7 }).catch(() => {});
-              } else {
-                emptyStreak = 0;
-                const prevFloor = prev.floor;
-                const maxNotify = sub.maxNotifyTon != null ? Number(sub.maxNotifyTon) : null;
-                const canNotify = (maxNotify == null || newFloor <= maxNotify);
-
-                console.log(`[SUBS FLOOR] sub #${sub.num}: newFloor=${newFloor} prevFloor=${prevFloor} canNotify=${canNotify} maxNotify=${maxNotify}`);
-
-                if (canNotify && (prevFloor == null || Math.abs(Number(prevFloor) - Number(newFloor)) > 0.0001)) {
-                  console.log(`[SUBS FLOOR] Отправляем флор уведомление userId=${userId} sub #${sub.num} floor=${newFloor} prev=${prevFloor}`);
-                  await notifyFloorToUser(userId, sub, lot, newFloor, prevFloor);
-                  floorNotifs++;
-                }
-
-                const newFloorSt = { ...prev, floor: newFloor, emptyStreak };
-                subStates.set(stateKeyFloor, newFloorSt);
-                if (redis) redisSet(`sub:floor:${stateKeyFloor}`, JSON.stringify(newFloorSt), { EX: 86400 * 7 }).catch(() => {});
-              }
-            }
-          } catch (e) {
-            console.error(`[SUBS] Ошибка флора sub #${sub.num} userId=${userId}:`, e?.message || e);
-          }
+          const newSt = { floor: newFloor, emptyStreak: 0 };
+          subStates.set(stateKeyFloor, newSt);
+          if (redis) redisSet(`sub:floor:${stateKeyFloor}`, JSON.stringify(newSt), { EX: 86400 * 7 }).catch(() => {});
         }
       }
     }
@@ -2071,9 +2118,9 @@ async function tryAutoBuyFromFeed(userId, sub, feedCache = new Map()) {
   };
 }
 
-// Глобальный кэш feed для AutoBuy — TTL 4 секунды
+// Глобальный кэш feed для AutoBuy — TTL 2 секунды
 const autoBuyFeedCache = new Map(); // giftKey -> { time, items }
-const AUTO_BUY_FEED_CACHE_TTL = 4000;
+const AUTO_BUY_FEED_CACHE_TTL = 2000;
 
 async function autoBuyCycle() {
   if (!AUTO_BUY_GLOBAL) return;
