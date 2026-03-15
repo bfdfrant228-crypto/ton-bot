@@ -635,6 +635,7 @@ async function ensureMrktAuth() {
 }
 
 // ===================== MRKT queue + gate =====================
+// Отдельный state для веб-запросов (от пользователя через WebApp)
 const mrktState = {
   lastOkAt: 0,
   lastFailAt: 0,
@@ -643,6 +644,13 @@ const mrktState = {
   lastFailEndpoint: null,
   pauseUntil: 0,
   nextAllowedAt: 0,
+};
+// Отдельный state для фоновых запросов (подписки, AutoBuy)
+// Полностью изолирован от веб-запросов — 429 в фоне не блокирует WebApp и наоборот
+const bgState = {
+  pauseUntil: 0,
+  nextAllowedAt: 0,
+  lastFailMsg: null,
 };
 
 let mrktQueue = Promise.resolve();
@@ -1578,13 +1586,20 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
 async function mrktPostJsonBackground(path, bodyObj) {
   if (!MRKT_AUTH_RUNTIME) return { ok: false, status: 401, data: null, text: 'NO_AUTH' };
 
-  // Ждём если MRKT поставил паузу
+  // Используем ОТДЕЛЬНЫЙ bgState — изолирован от веб-запросов
   const now = nowMs();
-  const pauseMs = (mrktState.pauseUntil && now < mrktState.pauseUntil) ? (mrktState.pauseUntil - now) : 0;
-  if (pauseMs > 0) {
-    if (pauseMs > 15000) return { ok: false, status: 429, data: null, text: 'RPS_WAIT', waitMs: pauseMs };
-    await sleep(pauseMs);
+  const pauseMs = (bgState.pauseUntil && now < bgState.pauseUntil) ? (bgState.pauseUntil - now) : 0;
+  const gapMs = (bgState.nextAllowedAt && now < bgState.nextAllowedAt) ? (bgState.nextAllowedAt - now) : 0;
+  const waitMs0 = Math.max(pauseMs, gapMs);
+
+  if (pauseMs > 20000) {
+    console.log(`[BG] Пауза слишком долгая (${Math.round(pauseMs/1000)}s), пропускаем запрос`);
+    return { ok: false, status: 429, data: null, text: 'RPS_WAIT', waitMs: pauseMs };
   }
+  if (waitMs0 > 0) await sleep(waitMs0);
+
+  // Минимальный gap между фоновыми запросами — 1 секунда
+  bgState.nextAllowedAt = nowMs() + 1000;
 
   const reqVal = makeReq();
   const body = { ...(bodyObj || {}), req: reqVal };
@@ -1604,18 +1619,22 @@ async function mrktPostJsonBackground(path, bodyObj) {
 
   if (!res.ok) {
     if (res.status === 429 || bodyLooksLikeRpsLimit(txt)) {
-      setPauseFrom429(res);
-      const waitMs = mrktState.pauseUntil - nowMs();
-      console.log(`[BG] 429 на ${path}, пауза ${Math.round(waitMs/1000)}s`);
-      return { ok: false, status: 429, data, text: txt, waitMs };
+      // Ставим паузу ТОЛЬКО в bgState — не трогаем веб-запросы
+      const ra = res.headers?.get?.('retry-after');
+      const pauseDur = ra ? (Number(ra) * 1000) : 8000;
+      bgState.pauseUntil = nowMs() + pauseDur;
+      bgState.lastFailMsg = 'RPS_WAIT';
+      console.log(`[BG] 429 на ${path}, пауза ${Math.round(pauseDur/1000)}s (изолировано от веб)`);
+      return { ok: false, status: 429, data, text: txt, waitMs: pauseDur };
     }
     if (res.status === 401 || res.status === 403) {
       await tryRefreshMrktToken(`BG_${res.status}`, { force: false });
     }
+    bgState.lastFailMsg = `HTTP_${res.status}`;
     return { ok: false, status: res.status, data, text: txt };
   }
 
-  markMrktOk();
+  bgState.lastFailMsg = null;
   return { ok: true, status: res.status, data, text: txt };
 }
 
@@ -1704,9 +1723,12 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         processedSubs++;
         console.log(`[SUBS] Обрабатываем sub #${sub.num} id=${sub.id} gifts=${JSON.stringify(sub.filters?.gifts)}`);
 
-        // Пауза между подписками — главная защита от 429
+        // Адаптивная пауза: если был 429 — ждём дольше
         if (processedSubs > 1) {
-          await sleep(SUBS_BETWEEN_PAUSE_MS);
+          const bgPause = bgState.pauseUntil > nowMs()
+            ? Math.min(bgState.pauseUntil - nowMs() + 500, 20000)
+            : SUBS_BETWEEN_PAUSE_MS;
+          if (bgPause > 0) await sleep(bgPause);
         }
 
         // Feed уведомления — идут ПЕРВЫМИ (быстрее чем поиск лотов)
@@ -1721,8 +1743,8 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
           }
         }
 
-        // Пауза между feed и floor запросами
-        await sleep(400);
+        // Небольшая пауза между feed и floor
+        await sleep(300);
 
         // Флор уведомления — только если feed не нашёл ничего нового
         const sf = normalizeFilters(sub.filters || {});
@@ -1852,7 +1874,7 @@ function extractListingPriceNanoFromGift(g) {
   return Number.isFinite(nano) && nano > 0 ? nano : null;
 }
 
-async function tryAutoBuyFromFeed(userId, sub) {
+async function tryAutoBuyFromFeed(userId, sub, feedCache = new Map()) {
   const maxBuy = Number(sub.maxAutoBuyTon);
   if (!Number.isFinite(maxBuy) || maxBuy <= 0) return { ok: true, bought: false };
 
@@ -1871,14 +1893,20 @@ async function tryAutoBuyFromFeed(userId, sub) {
     subStates.set(stateKey, st);
   }
 
-  const r = await mrktFeedFetchBackground({
-    collectionNames: f.gifts,
-    modelNames: models,
-    backdropNames: backdrops,
-    cursor: '',
-    count: 50,
-    types: ['listing', 'change_price'],
-  });
+  // Используем кэш feed — если уже запрашивали этот gift в текущем цикле
+  const feedCacheKey = `${f.gifts.join(',')}|${models.join(',')}|${backdrops.join(',')}`;
+  let r = feedCache.get(feedCacheKey);
+  if (!r) {
+    r = await mrktFeedFetchBackground({
+      collectionNames: f.gifts,
+      modelNames: models,
+      backdropNames: backdrops,
+      cursor: '',
+      count: 50,
+      types: ['listing', 'change_price'],
+    });
+    feedCache.set(feedCacheKey, r);
+  }
 
   if (!r.ok) {
     if (r.reason === 'RPS_WAIT') return { ok: true, bought: false, rps: true, waitMs: r.waitMs || 0 };
@@ -2006,14 +2034,8 @@ async function tryAutoBuyFromFeed(userId, sub) {
 
 async function autoBuyCycle() {
   if (!AUTO_BUY_GLOBAL) return;
-  if (MODE !== 'real') {
-    console.log('[AUTOBUY] Пропуск: MODE=', MODE);
-    return;
-  }
-  if (!MRKT_AUTH_RUNTIME) {
-    console.log('[AUTOBUY] Пропуск: нет MRKT_AUTH_RUNTIME');
-    return;
-  }
+  if (MODE !== 'real') return;
+  if (!MRKT_AUTH_RUNTIME) return;
   if (isAutoBuying) return;
 
   isAutoBuying = true;
@@ -2027,14 +2049,15 @@ async function autoBuyCycle() {
 
       console.log(`[AUTOBUY] Проверяем userId=${userId}, подписок с автобаем: ${eligible.length}`);
 
+      // Кэш feed по gift — чтобы не делать дублирующие запросы для одного gift
+      const feedCache = new Map();
+
       let buysDone = 0;
       for (const sub of eligible) {
         if (buysDone >= AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE) break;
 
-        // 1) Быстрый путь: feed listing/change_price
-        const r1 = await tryAutoBuyFromFeed(userId, sub);
+        const r1 = await tryAutoBuyFromFeed(userId, sub, feedCache);
 
-        // Нет денег — останавливаем автопокупку, НЕ пишем в историю
         if (r1 && r1.noFunds) {
           console.warn(`[AUTOBUY] Нет средств userId=${userId} sub=#${sub.num} price=${r1.priceTon} TON`);
           for (const s2 of eligible) if (s2) s2.autoBuyEnabled = false;
@@ -2048,136 +2071,33 @@ async function autoBuyCycle() {
 
         if (r1 && r1.bought) {
           buysDone++;
-
           if (AUTO_BUY_DRY_RUN) {
-            await sendMessageSafe(
-              userChatId(userId),
-              `🔍 AutoBuy DRY RUN\nНашёл лот: ${Number(r1.priceTon).toFixed(3)} TON\nLot: ${r1.lotId || ''}\n(реальная покупка выключена — AUTO_BUY_DRY_RUN=1)`,
+            await sendMessageSafe(userChatId(userId),
+              `🔍 AutoBuy DRY RUN\nНашёл: ${Number(r1.priceTon).toFixed(3)} TON\n${r1.lotId || ''}`,
               { disable_web_page_preview: true }
             );
           } else {
-            let msg = `✅ AutoBuy выполнен\nЦена: ${Number(r1.priceTon).toFixed(3)} TON\n`;
-            if (r1.latencyMs != null) {
-              msg += `Latency: ${(Number(r1.latencyMs) / 1000).toFixed(2)}s\n`;
-            }
+            let msg = `✅ AutoBuy OK\nЦена: ${Number(r1.priceTon).toFixed(3)} TON\n`;
+            if (r1.latencyMs != null) msg += `Latency: ${(r1.latencyMs/1000).toFixed(2)}s\n`;
             if (r1.title) msg += `${r1.title}\n`;
-            msg += `${r1.urlTelegram || ''}`;
-
+            msg += r1.urlTelegram || '';
             await sendMessageSafe(userChatId(userId), msg, {
               disable_web_page_preview: false,
               reply_markup: mkReplyMarkupOpen(r1.urlMarket, 'MRKT'),
             });
           }
-
-          if (AUTO_BUY_DISABLE_AFTER_SUCCESS) {
-            sub.autoBuyEnabled = false;
-            scheduleSave();
-          }
-          continue;
-        }
-
-        // Режим "Любые" убран — работаем только с новыми лотами из feed
-        continue;
-
-        const maxBuy = Number(sub.maxAutoBuyTon);
-        if (!Number.isFinite(maxBuy) || maxBuy <= 0) continue;
-
-        const sf = normalizeFilters(sub.filters || {});
-        if (!sf.gifts.length) continue;
-
-        const rBg = await mrktSearchLotsBackground(
-          sf.gifts,
-          sf.gifts.length === 1 ? (sf.models || []) : [],
-          sf.gifts.length === 1 ? (sf.backdrops || []) : [],
-          20
-        );
-        const r = {
-          ok: rBg.ok,
-          gifts: rBg.ok ? rBg.gifts.map(g => salingGiftToLot(g)).filter(Boolean).sort((a,b) => a.priceTon - b.priceTon) : []
-        };
-
-        if (!r.ok || !r.gifts?.length) continue;
-
-        const candidate = r.gifts.find((x) => x.priceTon <= maxBuy) || null;
-        if (!candidate) continue;
-
-        const attemptKey = `${userId}:${candidate.id}`;
-        const lastAttempt = autoBuyRecentAttempts.get(attemptKey);
-        if (lastAttempt && nowMs() - lastAttempt < AUTO_BUY_ATTEMPT_TTL_MS) continue;
-        autoBuyRecentAttempts.set(attemptKey, nowMs());
-
-        console.log(`[AUTOBUY FALLBACK] userId=${userId} sub=#${sub.num} кандидат: ${candidate.priceTon} TON`);
-
-        if (AUTO_BUY_DRY_RUN) {
-          await sendMessageSafe(
-            userChatId(userId),
-            `AutoBuy (DRY RUN) кандидат\n${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`,
-            {
-              disable_web_page_preview: false,
-              reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
-            }
-          );
-          buysDone++;
-          continue;
-        }
-
-        const tsFound = Date.now();
-        const buyRes = await mrktBuy({ id: candidate.id, priceNano: candidate.priceNano });
-
-        if (buyRes.ok) {
-          const tsBought = Date.now();
-
-          const u = getOrCreateUser(userId);
-          pushPurchase(u, {
-            tsFound,
-            tsBought,
-            latencyMs: null,
-            title: candidate.name,
-            priceTon: candidate.priceTon,
-            urlTelegram: candidate.urlTelegram,
-            urlMarket: candidate.urlMarket,
-            lotId: candidate.id,
-            giftName: candidate.giftName || '',
-            thumbKey: candidate.thumbKey || '',
-            model: candidate.model || '',
-            backdrop: candidate.backdrop || '',
-            collection: candidate.collectionName || '',
-            number: candidate.number ?? null,
-          });
-          scheduleSave();
-
-          await sendMessageSafe(
-            userChatId(userId),
-            `AutoBuy выполнен\n${candidate.priceTon.toFixed(3)} TON\n${candidate.name}\n${candidate.urlTelegram}`,
-            {
-              disable_web_page_preview: false,
-              reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
-            }
-          );
-
-          buysDone++;
-          if (AUTO_BUY_DISABLE_AFTER_SUCCESS) {
-            sub.autoBuyEnabled = false;
-            scheduleSave();
-          }
-        } else if (buyRes.noFunds || isNoFundsError(buyRes)) {
-          for (const s2 of subs) if (s2) s2.autoBuyEnabled = false;
-          scheduleSave();
-          await sendMessageSafe(userChatId(userId),
-            `⚠️ AutoBuy остановлен\nНедостаточно средств на балансе MRKT\nПопытка покупки: ${candidate.priceTon.toFixed(3)} TON\nПополни баланс и включи AutoBuy снова`,
-            { disable_web_page_preview: true }
-          );
-        } else {
-          console.warn(`[AUTOBUY FALLBACK] Покупка не удалась: ${buyRes.reason}`);
+          if (AUTO_BUY_DISABLE_AFTER_SUCCESS) { sub.autoBuyEnabled = false; scheduleSave(); }
         }
       }
     }
   } catch (e) {
-    console.error('autoBuyCycle error:', e);
+    console.error('[AUTOBUY] Ошибка цикла:', e?.message || e);
   } finally {
     isAutoBuying = false;
   }
 }
+
+
 
 // ===================== Telegram commands =====================
 bot.onText(/^\/start\b/, async (msg) => {
