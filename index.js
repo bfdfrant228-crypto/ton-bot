@@ -98,6 +98,8 @@ const SALES_HISTORY_TIME_BUDGET_MS = Number(process.env.SALES_HISTORY_TIME_BUDGE
 
 // MRKT auth refresh
 const MRKT_AUTH_REFRESH_COOLDOWN_MS = Number(process.env.MRKT_AUTH_REFRESH_COOLDOWN_MS || 8000);
+// Авторефреш токена каждые 2 часа
+const TOKEN_REFRESH_INTERVAL_MS = 2 * 60 * 60 * 1000;
 
 // manual buy button
 const MANUAL_BUY_ENABLED = String(process.env.MANUAL_BUY_ENABLED || '0') === '1';
@@ -633,6 +635,44 @@ async function ensureMrktAuth() {
   if (MRKT_AUTH_RUNTIME) return true;
   const r = await tryRefreshMrktToken('NO_AUTH', { force: false });
   return !!r.ok;
+}
+
+// Автосохранение initData как сессии при открытии WebApp
+let lastAutoSaveAt = 0;
+async function tryAutoSaveInitDataAsSession(initData) {
+  // Не чаще раза в 10 минут
+  if (nowMs() - lastAutoSaveAt < 10 * 60 * 1000) return;
+  if (!initData || !initData.includes('hash=')) return;
+  lastAutoSaveAt = nowMs();
+
+  const sess = { data: initData, photo: null };
+  mrktSessionRuntime = sess;
+  if (redis) await redisSet(REDIS_KEY_MRKT_SESSION, JSON.stringify(sess), { EX: 86400 * 7 }).catch(() => {});
+  console.log('[AUTO SESSION] initData сохранён как сессия');
+}
+
+// Проактивный авторефреш токена каждые 2 часа
+async function autoRefreshToken() {
+  console.log('[AUTO REFRESH] Проактивное обновление токена...');
+  const r = await tryRefreshMrktToken('auto_proactive', { force: true });
+  if (r.ok) {
+    console.log('[AUTO REFRESH] Токен успешно обновлён:', maskToken(MRKT_AUTH_RUNTIME));
+    // Уведомляем только админа
+    if (ADMIN_USER_ID) {
+      sendMessageSafe(ADMIN_USER_ID,
+        `🔑 Токен MRKT обновлён автоматически\n${maskToken(MRKT_AUTH_RUNTIME)}`
+      ).catch(() => {});
+    }
+  } else {
+    console.error('[AUTO REFRESH] Не удалось обновить токен:', r.reason);
+    // Уведомляем только админа об ошибке
+    if (ADMIN_USER_ID) {
+      sendMessageSafe(ADMIN_USER_ID,
+        `⚠️ Не удалось автоматически обновить токен MRKT\nПричина: ${r.reason}\n\nОткрой WebApp чтобы обновить сессию`
+      ).catch(() => {});
+    }
+  }
+  return r;
 }
 
 // ===================== MRKT queue + gate =====================
@@ -4410,5 +4450,5 @@ app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
     autoRefreshToken().catch((e) => console.error('[AUTO REFRESH] boot error:', e));
   }, 30000);
 
-  console.log('[BOOT] Авторефреш токена: каждые 20 часов');
+  console.log('[BOOT] Авторефреш токена: каждые 2 часа');
 })();
