@@ -1784,8 +1784,8 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
           types: [],
         });
         giftFeedCache.set(key, r);
-        // Минимальная пауза между уникальными gift запросами
-        if (uniqueKeys.size > 1) await sleep(200);
+        // Небольшая пауза только если много подписок
+        if (uniqueKeys.size > 3) await sleep(150);
       }
 
       // === ШАГ 2: Обрабатываем каждую подписку используя кэшированный feed ===
@@ -1943,51 +1943,12 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
           } catch (e) { console.error(`[AUTOBUY] ошибка sub #${sub.num}:`, e?.message); }
         }
 
-        // === ШАГ 3: Флор — тоже кэшируем по gift ===
-        const sf = normalizeFilters(sub.filters || {});
-        if (!sf.gifts.length) continue;
-
-        const floorKey = sf.gifts.slice().sort().join('|');
-        if (!giftFeedCache.has('floor:' + floorKey)) {
-          const rLots = await mrktSearchLotsBackground(
-            sf.gifts,
-            sf.gifts.length === 1 ? sf.models : [],
-            sf.gifts.length === 1 ? sf.backdrops : [],
-            5
-          );
-          giftFeedCache.set('floor:' + floorKey, rLots);
-          if (uniqueKeys.size > 1) await sleep(400);
-        }
-
-        const rLots = giftFeedCache.get('floor:' + floorKey);
-        if (!rLots?.ok) continue;
-
-        const lotsSorted = (rLots.gifts || []).map(g => salingGiftToLot(g)).filter(Boolean).sort((a,b) => a.priceTon - b.priceTon);
-        const lot = lotsSorted[0] || null;
-        const newFloor = lot ? lot.priceTon : null;
-
-        const stateKeyFloor = `${userId}:${sub.id}:floor`;
-        let prev = subStates.get(stateKeyFloor);
-        if (!prev) {
-          const saved = await redisGet(`sub:floor:${stateKeyFloor}`).catch(() => null);
-          prev = saved ? (JSON.parse(saved) || { floor: null, emptyStreak: 0 }) : { floor: null, emptyStreak: 0 };
-          subStates.set(stateKeyFloor, prev);
-        }
-
-        if (newFloor != null) {
-          const maxNotify = sub.maxNotifyTon != null ? Number(sub.maxNotifyTon) : null;
-          const canNotify = maxNotify == null || newFloor <= maxNotify;
-          if (canNotify && (prev.floor == null || Math.abs(Number(prev.floor) - newFloor) > 0.0001)) {
-            try { await notifyFloorToUser(userId, sub, lot, newFloor, prev.floor); floorNotifs++; } catch {}
-          }
-          const newSt = { floor: newFloor, emptyStreak: 0 };
-          subStates.set(stateKeyFloor, newSt);
-          if (redis) redisSet(`sub:floor:${stateKeyFloor}`, JSON.stringify(newSt), { EX: 86400 * 7 }).catch(() => {});
-        }
+        // Floor проверяется в отдельном медленном цикле (checkFloorForAllUsers)
+        // Здесь ничего не делаем — только feed и autobuy
       }
     }
 
-    console.log(`[SUBS] Итого: processedSubs=${processedSubs} floorNotifs=${floorNotifs} feedNotifs=${feedNotifs}`);
+    console.log(`[SUBS] Итого: processedSubs=${processedSubs} feedNotifs=${feedNotifs}`);
     return { processedSubs, floorNotifs, feedNotifs };
   } catch (e) {
     console.error('subs error:', e);
@@ -1995,6 +1956,75 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
   } finally {
     isSubsChecking = false;
   }
+}
+
+// ===================== Floor checker (медленный цикл, раз в 60 сек) =====================
+let isFloorChecking = false;
+
+async function checkFloorForAllUsers() {
+  if (MODE !== 'real') return;
+  if (isFloorChecking) return;
+  if (!MRKT_AUTH_RUNTIME) return;
+  isFloorChecking = true;
+  try {
+    const floorCache = new Map(); // giftKey -> lots
+    for (const [userId, user] of users.entries()) {
+      if (!user.enabled) continue;
+      const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
+      const active = subs.filter(s => s && s.enabled);
+      if (!active.length) continue;
+
+      for (const sub of active) {
+        const sf = normalizeFilters(sub.filters || {});
+        if (!sf.gifts.length) continue;
+
+        const floorKey = sf.gifts.slice().sort().join('|') + '::' +
+          (sf.gifts.length === 1 ? sf.models.slice().sort().join('|') : '') + '::' +
+          (sf.gifts.length === 1 ? sf.backdrops.slice().sort().join('|') : '');
+
+        if (!floorCache.has(floorKey)) {
+          // Ждём если был 429
+          if (bgState.pauseUntil > nowMs()) {
+            await sleep(Math.min(bgState.pauseUntil - nowMs() + 200, 20000));
+          }
+          const rLots = await mrktSearchLotsBackground(
+            sf.gifts,
+            sf.gifts.length === 1 ? sf.models : [],
+            sf.gifts.length === 1 ? sf.backdrops : [],
+            5
+          );
+          floorCache.set(floorKey, rLots);
+          await sleep(1000); // пауза между floor запросами чтобы не получить 429
+        }
+
+        const rLots = floorCache.get(floorKey);
+        if (!rLots?.ok) continue;
+
+        const lotsSorted = (rLots.gifts || []).map(g => salingGiftToLot(g)).filter(Boolean).sort((a,b) => a.priceTon - b.priceTon);
+        const lot = lotsSorted[0] || null;
+        const newFloor = lot ? lot.priceTon : null;
+        if (newFloor == null) continue;
+
+        const stateKeyFloor = `${userId}:${sub.id}:floor`;
+        let prev = subStates.get(stateKeyFloor);
+        if (!prev) {
+          const saved = await redisGet(`sub:floor:${stateKeyFloor}`).catch(() => null);
+          prev = saved ? (JSON.parse(saved) || { floor: null }) : { floor: null };
+          subStates.set(stateKeyFloor, prev);
+        }
+
+        const maxNotify = sub.maxNotifyTon != null ? Number(sub.maxNotifyTon) : null;
+        const canNotify = maxNotify == null || newFloor <= maxNotify;
+        if (canNotify && (prev.floor == null || Math.abs(Number(prev.floor) - newFloor) > 0.0001)) {
+          try { await notifyFloorToUser(userId, sub, lot, newFloor, prev.floor); } catch {}
+        }
+        const newSt = { floor: newFloor };
+        subStates.set(stateKeyFloor, newSt);
+        if (redis) redisSet(`sub:floor:${stateKeyFloor}`, JSON.stringify(newSt), { EX: 86400*7 }).catch(()=>{});
+      }
+    }
+  } catch(e) { console.error('[FLOOR] error:', e?.message); }
+  finally { isFloorChecking = false; }
 }
 
 // ===================== AutoBuy =====================
@@ -4253,16 +4283,27 @@ app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
   console.log('Bot ready. MODE=' + MODE + ' AUTO_BUY_GLOBAL=' + AUTO_BUY_GLOBAL + ' AUTO_BUY_DRY_RUN=' + AUTO_BUY_DRY_RUN);
   console.log('Users loaded:', users.size, '| Subs total:', Array.from(users.values()).reduce((a,u)=>a+(u.subscriptions?.length||0),0));
 
-  // Запускаем интервалы ТОЛЬКО ПОСЛЕ загрузки Redis и state
-  // Это критично — иначе первые циклы работают с пустым users Map
-  // Один цикл на всё — подписки + AutoBuy вместе (нет дублирования запросов)
+  // Быстрый цикл — только feed + AutoBuy (без /gifts/saling запросов!)
+  // Интервал 8 секунд — быстро ловим новые листинги
   setInterval(() => {
     checkSubscriptionsForAllUsers().catch((e) => console.error('subs interval error:', e));
-  }, SUBS_CHECK_INTERVAL_MS);
+  }, 8000);
 
-  // Первый запуск через 5 секунд после старта
+  // Медленный цикл — только floor уведомления (через /gifts/saling)
+  // Интервал 60 секунд — не спамим MRKT saling запросами
+  setInterval(() => {
+    checkFloorForAllUsers().catch((e) => console.error('floor interval error:', e));
+  }, 60000);
+
+  // Первый запуск feed через 5 секунд
   setTimeout(() => {
     console.log('[BOOT] Первый запуск checkSubscriptions (+ AutoBuy)...');
     checkSubscriptionsForAllUsers({ manual: true }).catch((e) => console.error('subs boot error:', e));
   }, 5000);
+
+  // Первый запуск floor через 30 секунд
+  setTimeout(() => {
+    console.log('[BOOT] Первый запуск checkFloor...');
+    checkFloorForAllUsers().catch((e) => console.error('floor boot error:', e));
+  }, 30000);
 })();
