@@ -65,8 +65,8 @@ const DETAILS_CACHE_TTL_MS = Number(process.env.DETAILS_CACHE_TTL_MS || 8000);
 const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 25_000);
 const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
-// subs
-const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 8000);
+// subs — принудительно максимум 8 секунд независимо от Railway переменных
+const SUBS_CHECK_INTERVAL_MS = Math.min(Number(process.env.SUBS_CHECK_INTERVAL_MS || 5000), 8000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 20);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
 // change_price невалидный тип для MRKT /feed API — убираем из дефолта
@@ -1610,10 +1610,8 @@ async function mrktPostJsonBackground(path, bodyObj) {
     console.log(`[BG] Пауза слишком долгая (${Math.round(pauseMs/1000)}s), пропускаем запрос`);
     return { ok: false, status: 429, data: null, text: 'RPS_WAIT', waitMs: pauseMs };
   }
-  if (waitMs0 > 0) await sleep(waitMs0);
-
-  // Минимальный gap между фоновыми запросами — 500ms
-  bgState.nextAllowedAt = nowMs() + 350;
+  // Ждём только паузу от 429 — gap убираем для параллельных запросов
+  if (pauseMs > 0) await sleep(pauseMs);
 
   const reqVal = makeReq();
   const body = { ...(bodyObj || {}), req: reqVal };
@@ -1764,29 +1762,32 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         }
       }
 
-      // Делаем feed запросы для каждой уникальной комбинации
+      // Делаем feed запросы ПАРАЛЛЕЛЬНО для всех уникальных gift-групп
       console.log(`[SUBS] userId=${userId}: ${active.length} подписок, ${uniqueKeys.size} уникальных gift-групп`);
 
       // Пауза если был 429
       if (bgState.pauseUntil > nowMs()) {
-        const waitFor = Math.min(bgState.pauseUntil - nowMs() + 100, 12000);
+        const waitFor = Math.min(bgState.pauseUntil - nowMs() + 100, 8000);
         console.log(`[SUBS] 429 пауза ${Math.round(waitFor/1000)}s`);
         await sleep(waitFor);
       }
 
+      // Параллельные запросы — все gift группы одновременно
+      const feedPromises = [];
       for (const [key, params] of uniqueKeys.entries()) {
-        const r = await mrktFeedFetchBackground({
-          collectionNames: params.collectionNames,
-          modelNames: params.modelNames,
-          backdropNames: params.backdropNames,
-          cursor: '',
-          count: 50,
-          types: [],
-        });
-        giftFeedCache.set(key, r);
-        // Небольшая пауза только если много подписок
-        if (uniqueKeys.size > 3) await sleep(150);
+        feedPromises.push(
+          mrktFeedFetchBackground({
+            collectionNames: params.collectionNames,
+            modelNames: params.modelNames,
+            backdropNames: params.backdropNames,
+            cursor: '',
+            count: 50,
+            types: [],
+          }).then(r => { giftFeedCache.set(key, r); }).catch(() => {})
+        );
       }
+      await Promise.allSettled(feedPromises);
+      console.log(`[SUBS] feed запросы выполнены параллельно для ${uniqueKeys.size} групп`);
 
       // === ШАГ 2: Обрабатываем каждую подписку используя кэшированный feed ===
       // AutoBuy тоже здесь — использует тот же кэш, без лишних запросов
@@ -1960,14 +1961,33 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
 
 // ===================== Floor checker (медленный цикл, раз в 60 сек) =====================
 let isFloorChecking = false;
+let giftSatelliteFloors = {}; // кэш флоров с gift-satellite
+
+async function fetchGiftSatelliteFloors() {
+  try {
+    const r = await fetchWithTimeout('https://gift-satellite.dev/api/history/offers?market=MRKT', {
+      method: 'GET',
+      headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+    }, 8000).catch(() => null);
+    if (!r || !r.ok) return null;
+    const data = await r.json().catch(() => null);
+    if (data && typeof data === 'object') {
+      giftSatelliteFloors = data;
+      console.log(`[FLOOR] gift-satellite floors обновлены: ${Object.keys(data).length} подарков`);
+      return data;
+    }
+  } catch(e) { console.error('[FLOOR] gift-satellite error:', e?.message); }
+  return null;
+}
 
 async function checkFloorForAllUsers() {
   if (MODE !== 'real') return;
   if (isFloorChecking) return;
-  if (!MRKT_AUTH_RUNTIME) return;
   isFloorChecking = true;
   try {
-    const floorCache = new Map(); // giftKey -> lots
+    // Сначала получаем флоры через gift-satellite — один запрос для всех
+    const floors = await fetchGiftSatelliteFloors();
+
     for (const [userId, user] of users.entries()) {
       if (!user.enabled) continue;
       const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
@@ -1978,31 +1998,9 @@ async function checkFloorForAllUsers() {
         const sf = normalizeFilters(sub.filters || {});
         if (!sf.gifts.length) continue;
 
-        const floorKey = sf.gifts.slice().sort().join('|') + '::' +
-          (sf.gifts.length === 1 ? sf.models.slice().sort().join('|') : '') + '::' +
-          (sf.gifts.length === 1 ? sf.backdrops.slice().sort().join('|') : '');
-
-        if (!floorCache.has(floorKey)) {
-          // Ждём если был 429
-          if (bgState.pauseUntil > nowMs()) {
-            await sleep(Math.min(bgState.pauseUntil - nowMs() + 200, 20000));
-          }
-          const rLots = await mrktSearchLotsBackground(
-            sf.gifts,
-            sf.gifts.length === 1 ? sf.models : [],
-            sf.gifts.length === 1 ? sf.backdrops : [],
-            5
-          );
-          floorCache.set(floorKey, rLots);
-          await sleep(1000); // пауза между floor запросами чтобы не получить 429
-        }
-
-        const rLots = floorCache.get(floorKey);
-        if (!rLots?.ok) continue;
-
-        const lotsSorted = (rLots.gifts || []).map(g => salingGiftToLot(g)).filter(Boolean).sort((a,b) => a.priceTon - b.priceTon);
-        const lot = lotsSorted[0] || null;
-        const newFloor = lot ? lot.priceTon : null;
+        // Берём флор из gift-satellite кэша — без запроса к MRKT
+        const giftTitle = sf.giftLabels?.[sf.gifts[0]] || sf.gifts[0];
+        const newFloor = floors?.[giftTitle] ?? giftSatelliteFloors?.[giftTitle] ?? null;
         if (newFloor == null) continue;
 
         const stateKeyFloor = `${userId}:${sub.id}:floor`;
@@ -2016,7 +2014,9 @@ async function checkFloorForAllUsers() {
         const maxNotify = sub.maxNotifyTon != null ? Number(sub.maxNotifyTon) : null;
         const canNotify = maxNotify == null || newFloor <= maxNotify;
         if (canNotify && (prev.floor == null || Math.abs(Number(prev.floor) - newFloor) > 0.0001)) {
-          try { await notifyFloorToUser(userId, sub, lot, newFloor, prev.floor); } catch {}
+          // Для уведомления нужен lot объект — делаем минимальный
+          const fakeLot = { priceTon: newFloor, urlTelegram: 'https://t.me/mrkt', urlMarket: 'https://t.me/mrkt', model: null, backdrop: null };
+          try { await notifyFloorToUser(userId, sub, fakeLot, newFloor, prev.floor); } catch {}
         }
         const newSt = { floor: newFloor };
         subStates.set(stateKeyFloor, newSt);
@@ -4284,10 +4284,10 @@ app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
   console.log('Users loaded:', users.size, '| Subs total:', Array.from(users.values()).reduce((a,u)=>a+(u.subscriptions?.length||0),0));
 
   // Быстрый цикл — только feed + AutoBuy (без /gifts/saling запросов!)
-  // Интервал 8 секунд — быстро ловим новые листинги
+  console.log(`[BOOT] Интервал подписок: ${SUBS_CHECK_INTERVAL_MS}ms`);
   setInterval(() => {
     checkSubscriptionsForAllUsers().catch((e) => console.error('subs interval error:', e));
-  }, 8000);
+  }, SUBS_CHECK_INTERVAL_MS);
 
   // Медленный цикл — только floor уведомления (через /gifts/saling)
   // Интервал 60 секунд — не спамим MRKT saling запросами
