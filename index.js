@@ -1637,7 +1637,15 @@ async function mrktPostJsonBackground(path, bodyObj) {
       return { ok: false, status: 429, data, text: txt, waitMs: pauseDur };
     }
     if (res.status === 401 || res.status === 403) {
-      await tryRefreshMrktToken(`BG_${res.status}`, { force: false });
+      const rr = await tryRefreshMrktToken(`BG_${res.status}`, { force: false });
+      if (!rr.ok) {
+        // Токен не удалось обновить — уведомляем только админа
+        notifyAdmin(
+          `⚠️ MRKT токен истёк и не удалось обновить автоматически\n` +
+          `Причина: ${rr.reason}\n\n` +
+          `Открой WebApp → Admin → обнови сессию вручную`
+        ).catch(() => {});
+      }
     }
     bgState.lastFailMsg = `HTTP_${res.status}`;
     return { ok: false, status: res.status, data, text: txt };
@@ -3698,6 +3706,13 @@ function auth(req, res, next) {
   if (!v.ok) return res.status(401).json({ ok: false, reason: v.reason });
   req.userId = v.userId;
   req.tgUser = v.user || null;
+
+  // Автосохраняем initData как сессию для авторефреша токена
+  // Делаем это тихо в фоне — не блокируем запрос
+  if (initData && initData.includes('hash=')) {
+    tryAutoSaveInitDataAsSession(initData).catch(() => {});
+  }
+
   next();
 }
 
@@ -4258,6 +4273,68 @@ if (PUBLIC_URL) {
   console.log('Polling started (PUBLIC_URL not set)');
 }
 
+// ===================== Admin notify =====================
+async function notifyAdmin(text) {
+  if (!ADMIN_USER_ID) return;
+  try {
+    await sendMessageSafe(ADMIN_USER_ID, text, { disable_web_page_preview: true });
+  } catch (e) {
+    console.error('[ADMIN NOTIFY] ошибка:', e?.message || e);
+  }
+}
+
+// ===================== Auto token refresh =====================
+const TOKEN_REFRESH_INTERVAL_MS = 20 * 60 * 60 * 1000; // каждые 20 часов
+const REDIS_KEY_TOKEN_REFRESHED_AT = 'mrkt:token:refreshed_at';
+
+async function autoRefreshToken() {
+  console.log('[AUTO REFRESH] Проверяем нужно ли обновить токен...');
+  try {
+    // Проверяем когда последний раз обновляли
+    const lastRefreshedRaw = await redisGet(REDIS_KEY_TOKEN_REFRESHED_AT).catch(() => null);
+    const lastRefreshed = lastRefreshedRaw ? Number(lastRefreshedRaw) : 0;
+    const hoursSince = (Date.now() - lastRefreshed) / (1000 * 60 * 60);
+
+    if (lastRefreshed && hoursSince < 18) {
+      console.log(`[AUTO REFRESH] Пропускаем — обновляли ${hoursSince.toFixed(1)}ч назад`);
+      return;
+    }
+
+    console.log('[AUTO REFRESH] Обновляем токен...');
+    const rr = await tryRefreshMrktToken('auto_scheduled', { force: true });
+
+    if (rr.ok) {
+      await redisSet(REDIS_KEY_TOKEN_REFRESHED_AT, String(Date.now()), { EX: 86400 * 2 });
+      console.log('[AUTO REFRESH] Токен обновлён успешно:', maskToken(MRKT_AUTH_RUNTIME));
+      await notifyAdmin(`✅ Токен MRKT обновлён автоматически\nToken: ${maskToken(MRKT_AUTH_RUNTIME)}`);
+    } else {
+      console.error('[AUTO REFRESH] Не удалось обновить токен:', rr.reason);
+      await notifyAdmin(
+        `⚠️ Не удалось автоматически обновить токен MRKT\n` +
+        `Причина: ${rr.reason}\n\n` +
+        `Открой WebApp → Admin → обнови сессию вручную`
+      );
+    }
+  } catch (e) {
+    console.error('[AUTO REFRESH] Ошибка:', e?.message || e);
+  }
+}
+
+// Автосохранение initData из WebApp для обновления сессии
+async function tryAutoSaveInitDataAsSession(initData) {
+  if (!initData || !initData.includes('hash=')) return;
+  try {
+    const sess = { data: String(initData), photo: null };
+    mrktSessionRuntime = sess;
+    if (redis) {
+      await redisSet(REDIS_KEY_MRKT_SESSION, JSON.stringify(sess), { EX: 86400 });
+    }
+    console.log('[AUTO SESSION] Сохранили initData как session из WebApp запроса');
+  } catch (e) {
+    console.error('[AUTO SESSION] Ошибка:', e?.message || e);
+  }
+}
+
 // ===================== start server =====================
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
@@ -4322,4 +4399,16 @@ app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
   setTimeout(() => {
     checkFloorForAllUsers().catch((e) => console.error('floor boot error:', e));
   }, 15000);
+
+  // Автообновление токена каждые 20 часов
+  setInterval(() => {
+    autoRefreshToken().catch((e) => console.error('[AUTO REFRESH] interval error:', e));
+  }, TOKEN_REFRESH_INTERVAL_MS);
+
+  // Первый авторефреш через 30 секунд после старта
+  setTimeout(() => {
+    autoRefreshToken().catch((e) => console.error('[AUTO REFRESH] boot error:', e));
+  }, 30000);
+
+  console.log('[BOOT] Авторефреш токена: каждые 20 часов');
 })();
