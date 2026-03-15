@@ -1380,7 +1380,10 @@ async function notifyTextOrPhoto(chatId, imgUrl, text, reply_markup) {
 // ===================== Subscription notifications =====================
 async function notifyFloorToUser(userId, sub, lot, newFloor, prevFloor) {
   const chatId = userChatId(userId);
-  console.log(`[NOTIFY FLOOR] userId=${userId} chatId=${chatId} sub=#${sub.num} floor=${newFloor}`);
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString('ru-RU', { timeZone: 'Europe/Moscow', hour12: false }) +
+    '.' + String(now.getMilliseconds()).padStart(3, '0');
+  console.log(`[NOTIFY FLOOR] userId=${userId} chatId=${chatId} sub=#${sub.num} floor=${newFloor} time=${timeStr}`);
 
   const isFirst = prevFloor == null;
   const went = !isFirst ? (newFloor < prevFloor ? '📉' : newFloor > prevFloor ? '📈' : '➡️') : '🆕';
@@ -1392,6 +1395,7 @@ async function notifyFloorToUser(userId, sub, lot, newFloor, prevFloor) {
   if (lot?.model) lines.push(`Model: ${lot.model}`);
   if (lot?.backdrop) lines.push(`Backdrop: ${lot.backdrop}`);
   if (lot?.number != null) lines.push(`#${lot.number}`);
+  lines.push(`⏱ ${timeStr} MSK`);
   lines.push('');
   lines.push(lot?.urlTelegram || 'https://t.me/mrkt');
 
@@ -1401,7 +1405,7 @@ async function notifyFloorToUser(userId, sub, lot, newFloor, prevFloor) {
       ...(lot?.urlMarket ? [{ text: '🛍 MRKT', url: lot.urlMarket }] : []),
     ]]
   };
-  await notifyTextOrPhoto(chatId, lotImgUrl(lot), lines.join('\n'), reply_markup);
+  await notifyTextOrPhoto(chatId, null, lines.join('\n'), reply_markup);
 }
 
 function feedItemToEvent(it) {
@@ -1459,17 +1463,22 @@ function feedItemToEvent(it) {
 
 async function notifyFeedEvent(userId, sub, ev) {
   const chatId = userChatId(userId);
-  console.log(`[NOTIFY FEED] userId=${userId} chatId=${chatId} sub=#${sub.num} type=${ev.type} price=${ev.priceTon}`);
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString('ru-RU', { timeZone: 'Europe/Moscow', hour12: false }) +
+    '.' + String(now.getMilliseconds()).padStart(3, '0');
+  console.log(`[NOTIFY FEED] userId=${userId} chatId=${chatId} sub=#${sub.num} type=${ev.type} price=${ev.priceTon} time=${timeStr}`);
 
-  const typeIcon = ev.type === 'sale' ? '💰' : ev.type === 'listing' ? '🏷' : ev.type === 'change_price' ? '✏️' : '📌';
+  const typeIcon = ev.type === 'sale' ? '💰' : ev.type === 'listing' ? '🏷' : '📌';
+  const typeLabel = ev.type === 'sale' ? 'Продажа' : ev.type === 'listing' ? 'Листинг' : 'Событие';
 
   const lines = [];
-  lines.push(`🔔 Подписка #${sub.num} — ${typeIcon} ${ev.typeLabel}`);
+  lines.push(`🔔 Подписка #${sub.num} — ${typeIcon} ${typeLabel}`);
   lines.push(`Gift: ${subGiftTitle(sub)}`);
   if (ev.priceTon != null) lines.push(`Цена: ${ev.priceTon.toFixed(3)} TON`);
   if (ev.model) lines.push(`Model: ${ev.model}`);
   if (ev.backdrop) lines.push(`Backdrop: ${ev.backdrop}`);
-  if (ev.title) lines.push(`${ev.title}`);
+  if (ev.title) lines.push(ev.title);
+  lines.push(`⏱ ${timeStr} MSK`);
   lines.push('');
   lines.push(ev.urlTelegram || 'https://t.me/mrkt');
 
@@ -1479,7 +1488,7 @@ async function notifyFeedEvent(userId, sub, ev) {
       ...(ev.urlMarket ? [{ text: '🛍 MRKT', url: ev.urlMarket }] : []),
     ]]
   };
-  await notifyTextOrPhoto(chatId, ev.imgUrl, lines.join('\n'), reply_markup);
+  await notifyTextOrPhoto(chatId, null, lines.join('\n'), reply_markup);
 }
 
 // ===================== Subs worker =====================
@@ -1884,9 +1893,11 @@ async function mrktBuy({ id, priceNano }) {
 
   if (!okItem) {
     console.warn('[BUY] Не нашли подтверждение в ответе, data=', JSON.stringify(data).slice(0, 300));
-    if (data && !data.error && !data.message) {
-      return { ok: true, okItem: data, data };
+    // Пустой массив или объект без подтверждения = покупка НЕ прошла
+    if (Array.isArray(data) && data.length === 0) {
+      return { ok: false, reason: 'BUY_NOT_CONFIRMED_EMPTY', data };
     }
+    // Объект без ошибки но и без подтверждения = тоже не прошла
     return { ok: false, reason: 'BUY_NOT_CONFIRMED', data };
   }
   return { ok: true, okItem, data };
