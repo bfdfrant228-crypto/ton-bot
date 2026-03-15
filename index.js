@@ -69,7 +69,8 @@ const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 12000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 20);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
-const SUBS_FEED_TYPES_RAW = String(process.env.SUBS_FEED_TYPES || 'sale,listing,change_price');
+// change_price невалидный тип для MRKT /feed API — убираем из дефолта
+const SUBS_FEED_TYPES_RAW = String(process.env.SUBS_FEED_TYPES || 'sale,listing');
 const SUBS_FEED_TYPES = new Set(
   SUBS_FEED_TYPES_RAW.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
 );
@@ -1138,7 +1139,12 @@ function maxOfferTonFromOrders(orders) {
   return maxNano != null ? maxNano / 1e9 : null;
 }
 
+// MRKT API принимает только типы: sale, listing (change_price — невалидный тип!)
+const MRKT_VALID_FEED_TYPES = new Set(['sale', 'listing']);
+
 async function mrktFeedFetch({ collectionNames = [], modelNames = [], backdropNames = [], cursor = '', count = MRKT_FEED_COUNT, ordering = 'Latest', types = [] }) {
+  // type: [] = все события (sale + listing). Передаём только валидные типы.
+  const validTypes = (Array.isArray(types) ? types : []).filter(t => MRKT_VALID_FEED_TYPES.has(String(t).toLowerCase()));
   const body = {
     count: Number(count || MRKT_FEED_COUNT),
     cursor: cursor || '',
@@ -1151,8 +1157,7 @@ async function mrktFeedFetch({ collectionNames = [], modelNames = [], backdropNa
     number: null,
     ordering: ordering || 'Latest',
     query: null,
-    type: Array.isArray(types) ? types : [],
-    types: Array.isArray(types) ? types : [],
+    type: validTypes,
   };
 
   const r = await mrktPostJson('/feed', body);
@@ -1504,7 +1509,7 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
     backdropNames: backdrops,
     cursor: '',
     count: 50,
-    types: ['listing', 'change_price', 'sale'],
+    types: [], // [] = все события (sale + listing). MRKT не принимает change_price
   });
 
   console.log(`[FEED] Sub #${sub.num} userId=${userId}: feedFetch ok=${r.ok} items=${r.items?.length} reason=${r.reason||''}`);
@@ -1598,8 +1603,8 @@ async function mrktPostJsonBackground(path, bodyObj) {
   }
   if (waitMs0 > 0) await sleep(waitMs0);
 
-  // Минимальный gap между фоновыми запросами — 1 секунда
-  bgState.nextAllowedAt = nowMs() + 1000;
+  // Минимальный gap между фоновыми запросами — 1.5 секунды
+  bgState.nextAllowedAt = nowMs() + 1500;
 
   const reqVal = makeReq();
   const body = { ...(bodyObj || {}), req: reqVal };
@@ -1638,23 +1643,26 @@ async function mrktPostJsonBackground(path, bodyObj) {
   return { ok: true, status: res.status, data, text: txt };
 }
 
-async function mrktFeedFetchBackground({ collectionNames = [], modelNames = [], backdropNames = [], cursor = '', count = 30, types = [] }) {
+// (константа перенесена выше)
+
+async function mrktFeedFetchBackground({ collectionNames = [], modelNames = [], backdropNames = [], cursor = '', count = 50, types = [] }) {
+  // type: [] = все события. Передаём только валидные типы (sale, listing).
+  const validTypes = (Array.isArray(types) ? types : []).filter(t => MRKT_VALID_FEED_TYPES.has(String(t).toLowerCase()));
+
+  const reqVal = makeReq();
   const body = {
     count: Number(count),
     cursor: cursor || '',
     collectionNames: Array.isArray(collectionNames) ? collectionNames : [],
     modelNames: Array.isArray(modelNames) ? modelNames : [],
     backdropNames: Array.isArray(backdropNames) ? backdropNames : [],
-    symbolNames: [],
     lowToHigh: false,
     maxPrice: null,
     minPrice: null,
     number: null,
     ordering: 'Latest',
     query: null,
-    promotedFirst: false,
-    type: Array.isArray(types) ? types : [],
-    types: Array.isArray(types) ? types : [],
+    type: validTypes,
   };
 
   const r = await mrktPostJsonBackground('/feed', body);
@@ -1686,7 +1694,6 @@ async function mrktSearchLotsBackground(collectionNames, modelNames, backdropNam
     collectionNames: Array.isArray(collectionNames) ? collectionNames : [],
     modelNames: Array.isArray(modelNames) ? modelNames : [],
     backdropNames: Array.isArray(backdropNames) ? backdropNames : [],
-    symbolNames: [],
     ordering: 'Price',
     lowToHigh: true,
     maxPrice: null,
@@ -1924,7 +1931,7 @@ async function tryAutoBuyFromFeed(userId, sub, feedCache = new Map()) {
       backdropNames: backdrops,
       cursor: '',
       count: 50,
-      types: ['listing', 'change_price'],
+      types: [], // пустой = все события (sale + listing)
     });
     feedCache.set(feedCacheKey, { time: nowMs(), data: r });
   }
@@ -1953,7 +1960,7 @@ async function tryAutoBuyFromFeed(userId, sub, feedCache = new Map()) {
     if (!sub.autoBuyAny && st.autoBuyLastId && it.id === st.autoBuyLastId) break;
 
     const type = String(it?.type || '').toLowerCase();
-    if (type !== 'listing' && type !== 'change_price') continue;
+    if (type !== 'listing' && type !== 'sale') continue;
 
     const g = it?.gift;
     if (!g || !g.id) continue;
