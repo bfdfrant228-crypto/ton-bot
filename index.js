@@ -65,8 +65,8 @@ const DETAILS_CACHE_TTL_MS = Number(process.env.DETAILS_CACHE_TTL_MS || 8000);
 const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 25_000);
 const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
-// subs — принудительно максимум 8 секунд независимо от Railway переменных
-const SUBS_CHECK_INTERVAL_MS = Math.min(Number(process.env.SUBS_CHECK_INTERVAL_MS || 5000), 8000);
+// subs — максимум 3 секунды для максимальной скорости
+const SUBS_CHECK_INTERVAL_MS = Math.min(Number(process.env.SUBS_CHECK_INTERVAL_MS || 2000), 3000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 20);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
 // change_price невалидный тип для MRKT /feed API — убираем из дефолта
@@ -84,9 +84,9 @@ const SUBS_SEND_PHOTO = String(process.env.SUBS_SEND_PHOTO || '0') === '1';
 // AutoBuy
 const AUTO_BUY_GLOBAL = String(process.env.AUTO_BUY_GLOBAL || '0') === '1';
 const AUTO_BUY_DRY_RUN = String(process.env.AUTO_BUY_DRY_RUN || '1') === '1';
-const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 3000);
-const AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE = Number(process.env.AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE || 1);
-const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 60_000);
+const AUTO_BUY_CHECK_INTERVAL_MS = Number(process.env.AUTO_BUY_CHECK_INTERVAL_MS || 2000);
+const AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE = Number(process.env.AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE || 3);
+const AUTO_BUY_ATTEMPT_TTL_MS = Number(process.env.AUTO_BUY_ATTEMPT_TTL_MS || 15_000);
 const AUTO_BUY_DISABLE_AFTER_SUCCESS = String(process.env.AUTO_BUY_DISABLE_AFTER_SUCCESS || '0') === '1';
 
 // sales history
@@ -1603,14 +1603,11 @@ async function mrktPostJsonBackground(path, bodyObj) {
   // Используем ОТДЕЛЬНЫЙ bgState — изолирован от веб-запросов
   const now = nowMs();
   const pauseMs = (bgState.pauseUntil && now < bgState.pauseUntil) ? (bgState.pauseUntil - now) : 0;
-  const gapMs = (bgState.nextAllowedAt && now < bgState.nextAllowedAt) ? (bgState.nextAllowedAt - now) : 0;
-  const waitMs0 = Math.max(pauseMs, gapMs);
 
-  if (pauseMs > 20000) {
-    console.log(`[BG] Пауза слишком долгая (${Math.round(pauseMs/1000)}s), пропускаем запрос`);
+  // Если 429 пауза — пропускаем запрос сразу, не ждём
+  if (pauseMs > 2000) {
     return { ok: false, status: 429, data: null, text: 'RPS_WAIT', waitMs: pauseMs };
   }
-  // Ждём только паузу от 429 — gap убираем для параллельных запросов
   if (pauseMs > 0) await sleep(pauseMs);
 
   const reqVal = makeReq();
@@ -1690,7 +1687,6 @@ async function mrktFeedFetchBackground({ collectionNames = [], modelNames = [], 
 
   const items = Array.isArray(r.data?.items) ? r.data.items : [];
   const nextCursor = r.data?.cursor || r.data?.nextCursor || '';
-  console.log(`[BG FEED OK] items=${items.length} cursor=${!!nextCursor}`);
   return { ok: true, reason: 'OK', items, cursor: nextCursor };
 }
 
@@ -1945,7 +1941,6 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         }
 
         // Floor проверяется в отдельном медленном цикле (checkFloorForAllUsers)
-        // Здесь ничего не делаем — только feed и autobuy
       }
     }
 
@@ -1985,7 +1980,7 @@ async function checkFloorForAllUsers() {
   if (isFloorChecking) return;
   isFloorChecking = true;
   try {
-    // Сначала получаем флоры через gift-satellite — один запрос для всех
+    // Получаем флоры через gift-satellite — один запрос для всех подарков
     const floors = await fetchGiftSatelliteFloors();
 
     for (const [userId, user] of users.entries()) {
@@ -4283,27 +4278,25 @@ app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
   console.log('Bot ready. MODE=' + MODE + ' AUTO_BUY_GLOBAL=' + AUTO_BUY_GLOBAL + ' AUTO_BUY_DRY_RUN=' + AUTO_BUY_DRY_RUN);
   console.log('Users loaded:', users.size, '| Subs total:', Array.from(users.values()).reduce((a,u)=>a+(u.subscriptions?.length||0),0));
 
-  // Быстрый цикл — только feed + AutoBuy (без /gifts/saling запросов!)
+  // Быстрый цикл — feed + AutoBuy параллельно для всех gift-групп
   console.log(`[BOOT] Интервал подписок: ${SUBS_CHECK_INTERVAL_MS}ms`);
   setInterval(() => {
-    checkSubscriptionsForAllUsers().catch((e) => console.error('subs interval error:', e));
+    checkSubscriptionsForAllUsers().catch((e) => console.error('subs error:', e));
   }, SUBS_CHECK_INTERVAL_MS);
 
-  // Медленный цикл — только floor уведомления (через /gifts/saling)
-  // Интервал 60 секунд — не спамим MRKT saling запросами
+  // Медленный цикл — floor уведомления через gift-satellite (раз в 30 сек)
   setInterval(() => {
-    checkFloorForAllUsers().catch((e) => console.error('floor interval error:', e));
-  }, 60000);
-
-  // Первый запуск feed через 5 секунд
-  setTimeout(() => {
-    console.log('[BOOT] Первый запуск checkSubscriptions (+ AutoBuy)...');
-    checkSubscriptionsForAllUsers({ manual: true }).catch((e) => console.error('subs boot error:', e));
-  }, 5000);
-
-  // Первый запуск floor через 30 секунд
-  setTimeout(() => {
-    console.log('[BOOT] Первый запуск checkFloor...');
-    checkFloorForAllUsers().catch((e) => console.error('floor boot error:', e));
+    checkFloorForAllUsers().catch((e) => console.error('floor error:', e));
   }, 30000);
+
+  // Первый запуск feed через 3 секунды после старта
+  setTimeout(() => {
+    console.log('[BOOT] Первый запуск checkSubscriptions...');
+    checkSubscriptionsForAllUsers({ manual: true }).catch((e) => console.error('subs boot error:', e));
+  }, 3000);
+
+  // Первый запуск floor через 15 секунд
+  setTimeout(() => {
+    checkFloorForAllUsers().catch((e) => console.error('floor boot error:', e));
+  }, 15000);
 })();
