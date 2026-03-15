@@ -66,7 +66,7 @@ const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 25_000);
 const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
 // subs — максимум 3 секунды для максимальной скорости
-const SUBS_CHECK_INTERVAL_MS = Math.min(Number(process.env.SUBS_CHECK_INTERVAL_MS || 2000), 3000);
+const SUBS_CHECK_INTERVAL_MS = Math.min(Number(process.env.SUBS_CHECK_INTERVAL_MS || 1500), 2000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 20);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
 // change_price невалидный тип для MRKT /feed API — убираем из дефолта
@@ -1744,22 +1744,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
           (f.gifts.length === 1 ? f.backdrops.slice().sort().join('|') : '');
       };
 
-      // Собираем уникальные комбинации
-      const uniqueKeys = new Map();
-      for (const sub of active) {
-        const key = getGiftKey(sub);
-        if (!uniqueKeys.has(key)) {
-          const f = normalizeFilters(sub.filters || {});
-          uniqueKeys.set(key, {
-            collectionNames: f.gifts,
-            modelNames: f.gifts.length === 1 ? f.models : [],
-            backdropNames: f.gifts.length === 1 ? f.backdrops : [],
-          });
-        }
-      }
-
-      // Делаем feed запросы ПАРАЛЛЕЛЬНО для всех уникальных gift-групп
-      console.log(`[SUBS] userId=${userId}: ${active.length} подписок, ${uniqueKeys.size} уникальных gift-групп`);
+      console.log(`[SUBS] userId=${userId}: ${active.length} подписок`);
 
       // Пауза если был 429
       if (bgState.pauseUntil > nowMs()) {
@@ -1768,22 +1753,60 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         await sleep(waitFor);
       }
 
-      // Параллельные запросы — все gift группы одновременно
-      const feedPromises = [];
-      for (const [key, params] of uniqueKeys.entries()) {
-        feedPromises.push(
-          mrktFeedFetchBackground({
-            collectionNames: params.collectionNames,
-            modelNames: params.modelNames,
-            backdropNames: params.backdropNames,
-            cursor: '',
-            count: 50,
-            types: [],
-          }).then(r => { giftFeedCache.set(key, r); }).catch(() => {})
-        );
+      // === ОДИН глобальный запрос ко всему feed без фильтров ===
+      // Вместо 6 запросов по одному на каждый gift — один запрос, потом фильтруем сами
+      const globalFeed = await mrktFeedFetchBackground({
+        collectionNames: [], // пустой = все коллекции
+        modelNames: [],
+        backdropNames: [],
+        cursor: '',
+        count: 50,
+        types: [],
+      });
+
+      // Строим кэш по collectionName для быстрого поиска
+      const itemsByCollection = new Map();
+      if (globalFeed.ok && globalFeed.items.length > 0) {
+        for (const it of globalFeed.items) {
+          const cName = String(it?.gift?.collectionName || it?.gift?.collectionTitle || '').toLowerCase().trim();
+          if (!cName) continue;
+          if (!itemsByCollection.has(cName)) itemsByCollection.set(cName, []);
+          itemsByCollection.get(cName).push(it);
+        }
       }
-      await Promise.allSettled(feedPromises);
-      console.log(`[SUBS] feed запросы выполнены параллельно для ${uniqueKeys.size} групп`);
+
+      // Для каждой подписки берём нужные события из глобального feed
+      for (const sub of active) {
+        const f = normalizeFilters(sub.filters || {});
+        const giftKey = getGiftKey(sub);
+        let filteredItems = [];
+
+        if (globalFeed.ok && f.gifts.length > 0) {
+          // Фильтруем события по подарку и модели/фону подписки
+          const giftNamesLower = f.gifts.map(g => g.toLowerCase().trim());
+          for (const giftName of giftNamesLower) {
+            const items = itemsByCollection.get(giftName) || [];
+            for (const it of items) {
+              const g = it?.gift;
+              if (!g) continue;
+              // Если есть фильтр по модели
+              if (f.models.length > 0) {
+                const mName = String(g.modelTitle || g.modelName || '').toLowerCase().trim();
+                if (!f.models.some(m => m.toLowerCase().trim() === mName)) continue;
+              }
+              // Если есть фильтр по фону
+              if (f.backdrops.length > 0) {
+                const bName = String(g.backdropName || '').toLowerCase().trim();
+                if (!f.backdrops.some(b => b.toLowerCase().trim() === bName)) continue;
+              }
+              filteredItems.push(it);
+            }
+          }
+        }
+
+        const feedResult = { ok: globalFeed.ok, items: filteredItems, reason: globalFeed.reason };
+        giftFeedCache.set(giftKey, feedResult);
+      }
 
       // === ШАГ 2: Обрабатываем каждую подписку используя кэшированный feed ===
       // AutoBuy тоже здесь — использует тот же кэш, без лишних запросов
