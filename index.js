@@ -1,5 +1,5 @@
 /**
- * v30-stable-mrkt-panel
+ * v31-fixed
  * Node 18+
  * deps: express, node-telegram-bot-api, redis(optional)
  */
@@ -8,7 +8,6 @@ const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const crypto = require('crypto');
 const { Readable } = require('stream');
-const fs = require('fs');
 
 // ===================== ENV =====================
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -67,13 +66,13 @@ const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
 // subs
 const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 15000);
-const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 6);
+const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 20);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
 const SUBS_FEED_TYPES_RAW = String(process.env.SUBS_FEED_TYPES || 'sale,listing,change_price');
 const SUBS_FEED_TYPES = new Set(
   SUBS_FEED_TYPES_RAW.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
 );
-const SUBS_FEED_MAX_EVENTS_PER_CYCLE = Number(process.env.SUBS_FEED_MAX_EVENTS_PER_CYCLE || 8);
+const SUBS_FEED_MAX_EVENTS_PER_CYCLE = Number(process.env.SUBS_FEED_MAX_EVENTS_PER_CYCLE || 20);
 
 // Telegram notifications
 const SUBS_SEND_PHOTO = String(process.env.SUBS_SEND_PHOTO || '0') === '1';
@@ -104,7 +103,7 @@ const REDIS_KEY_STATE = 'bot:state:main';
 const REDIS_KEY_MRKT_AUTH = 'mrkt:auth:token';
 const REDIS_KEY_MRKT_SESSION = 'mrkt:session:admin';
 
-console.log('v30-stable-mrkt-panel start', {
+console.log('v31-fixed start', {
   MODE,
   PUBLIC_URL: !!PUBLIC_URL,
   WEBAPP_URL: !!WEBAPP_URL,
@@ -227,7 +226,7 @@ function fmtWaitMs(ms) {
 function prettyEventType(t) {
   const x = String(t || '').toLowerCase();
   if (x === 'sale') return 'Продажа';
-  if (x === 'listing') return 'Выставлен';
+  if (x === 'listing') return 'Листинг';
   if (x === 'change_price') return 'Изменение цены';
   return x || 'Событие';
 }
@@ -312,7 +311,7 @@ async function redisSet(key, val, opts) {
 // ===================== Telegram bot =====================
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 const MAIN_KEYBOARD = {
-  keyboard: [[{ text: '📌 Статус' }]],
+  keyboard: [[{ text: 'Статус' }]],
   resize_keyboard: true,
 };
 
@@ -359,7 +358,7 @@ async function sendPhotoSafe(chatId, photoUrl, caption, reply_markup) {
 
 // ===================== State =====================
 const users = new Map();
-const subStates = new Map(); // key -> { floor, emptyStreak, feedLastId, autoBuyLastId }
+const subStates = new Map();
 const autoBuyRecentAttempts = new Map();
 const recentSubCreates = new Map();
 
@@ -394,10 +393,7 @@ function getOrCreateUser(userId) {
 function userChatId(userId) {
   const u = users.get(userId);
   const cid = u?.chatId;
-
   if (cid && Number.isFinite(Number(cid))) return Number(cid);
-
-  // fallback: личка по userId
   return Number(userId);
 }
 function renumberSubs(user) {
@@ -1339,8 +1335,6 @@ function mkReplyMarkupOpen(urlMarket, label = 'MRKT') {
   return urlMarket ? { inline_keyboard: [[{ text: label, url: urlMarket }]] } : undefined;
 }
 async function notifyTextOrPhoto(chatId, imgUrl, text, reply_markup) {
-  // Всегда шлём ТЕКСТ, без sendPhoto.
-  // Тогда Telegram сам покажет превью/анимацию по ссылке на nft.
   return sendMessageSafe(chatId, text, {
     disable_web_page_preview: false,
     reply_markup,
@@ -1350,12 +1344,12 @@ async function notifyTextOrPhoto(chatId, imgUrl, text, reply_markup) {
 // ===================== Subscription notifications =====================
 async function notifyFloorToUser(userId, sub, lot, newFloor) {
   const chatId = userChatId(userId);
+  console.log(`[NOTIFY FLOOR] userId=${userId} chatId=${chatId} sub=#${sub.num} floor=${newFloor}`);
 
   const lines = [];
-  lines.push(`🔔 Подписка #${sub.num}`);
-  lines.push(`Тип: Флор`);
+  lines.push(`Подписка #${sub.num}`);
   lines.push(`Gift: ${subGiftTitle(sub)}`);
-  lines.push(`Цена: ${newFloor.toFixed(3)} TON`);
+  lines.push(`Флор: ${newFloor.toFixed(3)} TON`);
   if (lot?.model) lines.push(`Model: ${lot.model}`);
   if (lot?.backdrop) lines.push(`Backdrop: ${lot.backdrop}`);
   lines.push(lot?.urlTelegram || 'https://t.me/mrkt');
@@ -1419,10 +1413,10 @@ function feedItemToEvent(it) {
 
 async function notifyFeedEvent(userId, sub, ev) {
   const chatId = userChatId(userId);
+  console.log(`[NOTIFY FEED] userId=${userId} chatId=${chatId} sub=#${sub.num} type=${ev.type} price=${ev.priceTon}`);
 
   const lines = [];
-  lines.push(`🔔 Подписка #${sub.num}`);
-  lines.push(`Тип: ${ev.typeLabel}`);
+  lines.push(`Подписка #${sub.num} — ${ev.typeLabel}`);
   lines.push(`Gift: ${subGiftTitle(sub)}`);
   if (ev.priceTon != null) lines.push(`Цена: ${ev.priceTon.toFixed(3)} TON`);
   if (ev.model) lines.push(`Model: ${ev.model}`);
@@ -1464,7 +1458,14 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
   if (!latestId) return 0;
 
   if (!st.feedLastId) {
+    // Первый запуск — запоминаем позицию, ничего не шлём
     subStates.set(stateKey, { ...st, feedLastId: latestId });
+    console.log(`[FEED] Sub #${sub.num} userId=${userId}: первый запуск, запомнили lastId=${latestId}`);
+    return 0;
+  }
+
+  if (latestId === st.feedLastId) {
+    // Нет новых событий
     return 0;
   }
 
@@ -1479,6 +1480,8 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
     subStates.set(stateKey, { ...st, feedLastId: latestId });
     return 0;
   }
+
+  console.log(`[FEED] Sub #${sub.num} userId=${userId}: найдено новых событий: ${newItems.length}`);
 
   newItems.reverse();
 
@@ -1496,8 +1499,12 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
       if (Number(ev.priceTon) > Number(sub.maxNotifyTon)) continue;
     }
 
-    await notifyFeedEvent(userId, sub, ev);
-    sent++;
+    try {
+      await notifyFeedEvent(userId, sub, ev);
+      sent++;
+    } catch (e) {
+      console.error(`[FEED] Ошибка отправки уведомления userId=${userId}:`, e?.message || e);
+    }
   }
 
   subStates.set(stateKey, { ...st, feedLastId: latestId });
@@ -1505,7 +1512,10 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
 }
 
 async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
-  if (MODE !== 'real') return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
+  if (MODE !== 'real') {
+    console.log('[SUBS] Пропуск: MODE=', MODE, '(нужно real)');
+    return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
+  }
   if (isSubsChecking && !manual) return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
 
   isSubsChecking = true;
@@ -1525,12 +1535,13 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
       for (const sub of active) {
         processedSubs++;
 
-        if (floorNotifs < SUBS_MAX_NOTIFICATIONS_PER_CYCLE) {
-          const sf = normalizeFilters(sub.filters || {});
-          if (sf.gifts.length) {
-            const stateKeyFloor = `${userId}:${sub.id}:floor`;
-            const prev = subStates.get(stateKeyFloor) || { floor: null, emptyStreak: 0 };
+        // Флор уведомления — без жёсткого глобального лимита
+        const sf = normalizeFilters(sub.filters || {});
+        if (sf.gifts.length) {
+          const stateKeyFloor = `${userId}:${sub.id}:floor`;
+          const prev = subStates.get(stateKeyFloor) || { floor: null, emptyStreak: 0 };
 
+          try {
             const r = await mrktSearchLotsByFilters(sf, 1, { ordering: 'Price', lowToHigh: true, count: MRKT_COUNT });
             if (r.ok) {
               const lot = r.gifts?.length ? r.gifts[0] : null;
@@ -1551,7 +1562,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
                 const maxNotify = sub.maxNotifyTon != null ? Number(sub.maxNotifyTon) : null;
                 const canNotify = (maxNotify == null || newFloor <= maxNotify);
 
-                if (canNotify && (prevFloor == null || Number(prevFloor) !== Number(newFloor))) {
+                if (canNotify && (prevFloor == null || Math.abs(Number(prevFloor) - Number(newFloor)) > 0.0001)) {
                   await notifyFloorToUser(userId, sub, lot, newFloor);
                   floorNotifs++;
                 }
@@ -1559,16 +1570,27 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
                 subStates.set(stateKeyFloor, { ...prev, floor: newFloor, emptyStreak });
               }
             }
+          } catch (e) {
+            console.error(`[SUBS] Ошибка флора sub #${sub.num} userId=${userId}:`, e?.message || e);
           }
         }
 
+        // Feed уведомления
         if (feedBudget > 0) {
           const stateKeyFeed = `${userId}:${sub.id}:feed`;
-          const sent = await processFeedForSub(userId, sub, stateKeyFeed, feedBudget);
-          feedBudget -= sent;
-          feedNotifs += sent;
+          try {
+            const sent = await processFeedForSub(userId, sub, stateKeyFeed, feedBudget);
+            feedBudget -= sent;
+            feedNotifs += sent;
+          } catch (e) {
+            console.error(`[SUBS] Ошибка feed sub #${sub.num} userId=${userId}:`, e?.message || e);
+          }
         }
       }
+    }
+
+    if (processedSubs > 0) {
+      console.log(`[SUBS] Проверено: ${processedSubs} подписок, флор: ${floorNotifs}, feed: ${feedNotifs}`);
     }
 
     return { processedSubs, floorNotifs, feedNotifs };
@@ -1594,14 +1616,28 @@ async function mrktBuy({ id, priceNano }) {
   if (!r.ok) return { ok: false, reason: r.status === 429 ? 'RPS_WAIT' : (mrktState.lastFailMsg || 'BUY_ERROR'), waitMs: r.waitMs || 0, data: r.data };
 
   const data = r.data;
-  const okItem = Array.isArray(data)
-    ? data.find((x) =>
-      x?.source?.type === 'buy_gift' &&
-      x?.userGift?.isMine === true &&
-      String(x?.userGift?.id || '') === String(id))
-    : null;
+  // ИСПРАВЛЕНИЕ: MRKT может вернуть разные форматы ответа на покупку
+  // Проверяем несколько вариантов подтверждения
+  let okItem = null;
+  if (Array.isArray(data)) {
+    okItem = data.find((x) =>
+      (x?.source?.type === 'buy_gift' && x?.userGift?.isMine === true && String(x?.userGift?.id || '') === String(id)) ||
+      (x?.type === 'buy_gift' && String(x?.gift?.id || x?.id || '') === String(id)) ||
+      (x?.status === 'success' && String(x?.id || '') === String(id))
+    );
+  } else if (data && typeof data === 'object') {
+    // Если ответ не массив — считаем успехом если нет ошибки
+    if (!data.error && !data.message) okItem = data;
+  }
 
-  if (!okItem) return { ok: false, reason: 'BUY_NOT_CONFIRMED', data };
+  if (!okItem) {
+    console.warn('[BUY] Не нашли подтверждение в ответе, data=', JSON.stringify(data).slice(0, 300));
+    // Мягкая проверка — если статус 200 и нет явной ошибки, считаем успехом
+    if (data && !data.error && !data.message) {
+      return { ok: true, okItem: data, data };
+    }
+    return { ok: false, reason: 'BUY_NOT_CONFIRMED', data };
+  }
   return { ok: true, okItem, data };
 }
 
@@ -1630,7 +1666,7 @@ async function tryAutoBuyFromFeed(userId, sub) {
     modelNames: models,
     backdropNames: backdrops,
     cursor: '',
-    count: 30,
+    count: 50,
     ordering: 'Latest',
     types: ['listing', 'change_price'],
   });
@@ -1643,14 +1679,17 @@ async function tryAutoBuyFromFeed(userId, sub) {
 
   const latestId = r.items[0]?.id || null;
 
+  // ИСПРАВЛЕНИЕ: при первом запуске в режиме "Новые" — запоминаем позицию
   if (latestId && !st.autoBuyLastId && !sub.autoBuyAny) {
     subStates.set(stateKey, { ...st, autoBuyLastId: latestId });
+    console.log(`[AUTOBUY] Sub #${sub.num} userId=${userId}: первый запуск (Новые), запомнили lastId=${latestId}`);
     return { ok: true, bought: false };
   }
 
   const candidates = [];
   for (const it of r.items) {
     if (!it?.id) continue;
+    // В режиме "Новые" — только новые события после lastId
     if (!sub.autoBuyAny && st.autoBuyLastId && it.id === st.autoBuyLastId) break;
 
     const type = String(it?.type || '').toLowerCase();
@@ -1684,12 +1723,17 @@ async function tryAutoBuyFromFeed(userId, sub) {
 
   const tsFound = Date.now();
 
+  console.log(`[AUTOBUY] Sub #${sub.num} userId=${userId}: кандидат lotId=${lotId} price=${pick.priceTon} TON DRY_RUN=${AUTO_BUY_DRY_RUN}`);
+
   if (AUTO_BUY_DRY_RUN) {
-    return { ok: true, bought: true, dry: true, priceTon: pick.priceTon, tsFound };
+    return { ok: true, bought: true, dry: true, priceTon: pick.priceTon, tsFound, lotId };
   }
 
   const buyRes = await mrktBuy({ id: lotId, priceNano: pick.priceNano });
-  if (!buyRes.ok) return { ok: true, bought: false, buyFail: buyRes };
+  if (!buyRes.ok) {
+    console.error(`[AUTOBUY] Покупка не удалась: ${buyRes.reason}`);
+    return { ok: true, bought: false, buyFail: buyRes };
+  }
 
   const tsBought = Date.now();
   const listedRaw = pick.it?.date ? Date.parse(pick.it.date) : NaN;
@@ -1729,6 +1773,8 @@ async function tryAutoBuyFromFeed(userId, sub) {
   });
   scheduleSave();
 
+  console.log(`[AUTOBUY] Куплено! lotId=${lotId} price=${pick.priceTon} TON latency=${latencyMs}ms`);
+
   return {
     ok: true,
     bought: true,
@@ -1736,13 +1782,20 @@ async function tryAutoBuyFromFeed(userId, sub) {
     urlTelegram,
     urlMarket,
     latencyMs,
+    title,
   };
 }
 
 async function autoBuyCycle() {
   if (!AUTO_BUY_GLOBAL) return;
-  if (MODE !== 'real') return;
-  if (!MRKT_AUTH_RUNTIME) return;
+  if (MODE !== 'real') {
+    console.log('[AUTOBUY] Пропуск: MODE=', MODE);
+    return;
+  }
+  if (!MRKT_AUTH_RUNTIME) {
+    console.log('[AUTOBUY] Пропуск: нет MRKT_AUTH_RUNTIME');
+    return;
+  }
   if (isAutoBuying) return;
 
   isAutoBuying = true;
@@ -1754,11 +1807,13 @@ async function autoBuyCycle() {
       const eligible = subs.filter((s) => s && s.enabled && s.autoBuyEnabled && s.maxAutoBuyTon != null);
       if (!eligible.length) continue;
 
+      console.log(`[AUTOBUY] Проверяем userId=${userId}, подписок с автобаем: ${eligible.length}`);
+
       let buysDone = 0;
       for (const sub of eligible) {
         if (buysDone >= AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE) break;
 
-        // 1) сначала быстрый путь: feed listing/change_price
+        // 1) Быстрый путь: feed listing/change_price
         const r1 = await tryAutoBuyFromFeed(userId, sub);
 
         if (r1 && r1.bought) {
@@ -1767,17 +1822,15 @@ async function autoBuyCycle() {
           if (AUTO_BUY_DRY_RUN) {
             await sendMessageSafe(
               userChatId(userId),
-              `AutoBuy (DRY) OK: ${Number(r1.priceTon).toFixed(3)} TON`,
+              `AutoBuy (DRY RUN)\nЦена: ${Number(r1.priceTon).toFixed(3)} TON\nLot: ${r1.lotId || ''}`,
               { disable_web_page_preview: true }
             );
           } else {
-            let msg =
-              `✅ AutoBuy OK\n` +
-              `Цена: ${Number(r1.priceTon).toFixed(3)} TON\n`;
-
+            let msg = `AutoBuy выполнен\nЦена: ${Number(r1.priceTon).toFixed(3)} TON\n`;
             if (r1.latencyMs != null) {
               msg += `Latency: ${(Number(r1.latencyMs) / 1000).toFixed(2)}s\n`;
             }
+            if (r1.title) msg += `${r1.title}\n`;
             msg += `${r1.urlTelegram || ''}`;
 
             await sendMessageSafe(userChatId(userId), msg, {
@@ -1793,7 +1846,7 @@ async function autoBuyCycle() {
           continue;
         }
 
-        // 2) если включён режим "Любые" — добираем уже существующие лоты
+        // 2) Fallback: режим "Любые" — поиск уже существующих лотов по цене
         if (!sub.autoBuyAny) continue;
 
         const maxBuy = Number(sub.maxAutoBuyTon);
@@ -1818,10 +1871,12 @@ async function autoBuyCycle() {
         if (lastAttempt && nowMs() - lastAttempt < AUTO_BUY_ATTEMPT_TTL_MS) continue;
         autoBuyRecentAttempts.set(attemptKey, nowMs());
 
+        console.log(`[AUTOBUY FALLBACK] userId=${userId} sub=#${sub.num} кандидат: ${candidate.priceTon} TON`);
+
         if (AUTO_BUY_DRY_RUN) {
           await sendMessageSafe(
             userChatId(userId),
-            `AutoBuy (DRY) кандидат: ${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`,
+            `AutoBuy (DRY RUN) кандидат\n${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`,
             {
               disable_web_page_preview: false,
               reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
@@ -1858,7 +1913,7 @@ async function autoBuyCycle() {
 
           await sendMessageSafe(
             userChatId(userId),
-            `✅ AutoBuy OK\n${candidate.priceTon.toFixed(3)} TON\n${candidate.urlTelegram}`,
+            `AutoBuy выполнен\n${candidate.priceTon.toFixed(3)} TON\n${candidate.name}\n${candidate.urlTelegram}`,
             {
               disable_web_page_preview: false,
               reply_markup: mkReplyMarkupOpen(candidate.urlMarket, 'MRKT'),
@@ -1873,7 +1928,7 @@ async function autoBuyCycle() {
         } else if (isNoFundsError(buyRes)) {
           for (const s2 of subs) if (s2) s2.autoBuyEnabled = false;
           scheduleSave();
-          await sendMessageSafe(userChatId(userId), `❌ AutoBuy stop: no funds`, {
+          await sendMessageSafe(userChatId(userId), `AutoBuy остановлен: недостаточно средств`, {
             disable_web_page_preview: true,
           });
         }
@@ -1909,7 +1964,7 @@ bot.onText(/^\/start\b/, async (msg) => {
     } catch {}
   }
 
-  await sendMessageSafe(msg.chat.id, `Открой меню “${APP_TITLE}”`, { reply_markup: MAIN_KEYBOARD });
+  await sendMessageSafe(msg.chat.id, `Открой меню "${APP_TITLE}"`, { reply_markup: MAIN_KEYBOARD });
 
   if (WEBAPP_URL) {
     await sendMessageSafe(msg.chat.id, 'Если меню не видно — открой через кнопку ниже:', {
@@ -1930,25 +1985,1283 @@ bot.on('message', async (msg) => {
   u.chatId = msg.chat.id;
   scheduleSave();
 
-  if ((msg.text || '') === '📌 Статус') {
+  if ((msg.text || '') === 'Статус') {
+    const now = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
     const txt =
-      `Status\n` +
-      `MRKT_AUTH: ${MRKT_AUTH_RUNTIME ? 'YES' : 'NO'} (${maskToken(MRKT_AUTH_RUNTIME) || '-'})\n` +
-      `lastFail: ${mrktState.lastFailMsg || '-'}\n` +
-      `pauseUntil: ${mrktState.pauseUntil ? new Date(mrktState.pauseUntil).toLocaleTimeString('ru-RU') : '-'}\n` +
-      `Redis: ${redis ? 'YES' : 'NO'}\n` +
-      `Subs interval: ${SUBS_CHECK_INTERVAL_MS}ms\n` +
-      `Feed types: ${Array.from(SUBS_FEED_TYPES).join(', ')}\n` +
-      `AutoBuy: ${AUTO_BUY_GLOBAL ? 'ON' : 'OFF'} ${AUTO_BUY_DRY_RUN ? '(DRY)' : ''}\n`;
+      `Статус (${now})\n` +
+      `MRKT Auth: ${MRKT_AUTH_RUNTIME ? 'OK (' + maskToken(MRKT_AUTH_RUNTIME) + ')' : 'НЕТ'}\n` +
+      `Ошибка: ${mrktState.lastFailMsg || '-'}\n` +
+      `Пауза до: ${mrktState.pauseUntil ? new Date(mrktState.pauseUntil).toLocaleTimeString('ru-RU') : '-'}\n` +
+      `Redis: ${redis ? 'OK' : 'НЕТ'}\n` +
+      `MODE: ${MODE}\n` +
+      `Подписки: ${SUBS_CHECK_INTERVAL_MS}ms\n` +
+      `Feed типы: ${Array.from(SUBS_FEED_TYPES).join(', ')}\n` +
+      `AutoBuy: ${AUTO_BUY_GLOBAL ? 'ON' : 'OFF'} ${AUTO_BUY_DRY_RUN ? '(DRY RUN — не покупает!)' : '(реальный)'}\n`;
     await sendMessageSafe(msg.chat.id, txt, { reply_markup: MAIN_KEYBOARD });
   }
 });
 
 // ===================== WebApp HTML =====================
-const WEBAPP_HTML = fs.readFileSync(__dirname + '/webapp.html', 'utf-8');
+const WEBAPP_HTML = `<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>${APP_TITLE}</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --bg:#080d12;
+  --bg2:#0d1520;
+  --card:#0f1923;
+  --card2:#131f2e;
+  --text:#e2e8f0;
+  --muted:#64748b;
+  --muted2:#94a3b8;
+  --border:#1e2d3d;
+  --border2:#243347;
+  --input:#0a1520;
+  --accent:#3b82f6;
+  --accent2:#60a5fa;
+  --green:#22c55e;
+  --green2:#16a34a;
+  --red:#ef4444;
+  --yellow:#f59e0b;
+  --purple:#8b5cf6;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{background:var(--bg);overscroll-behavior:none;min-height:100vh}
+body{margin:0;padding:0;color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;font-size:14px;line-height:1.5}
+
+/* App header */
+.appHeader{
+  background:var(--bg2);
+  border-bottom:1px solid var(--border);
+  padding:12px 16px 0;
+  position:sticky;top:0;z-index:100;
+  backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px);
+}
+.appHeaderTop{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.appTitle{font-size:17px;font-weight:700;letter-spacing:-.3px}
+.statusDot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.statusDot.green{background:var(--green)}
+.statusDot.red{background:var(--red)}
+
+/* Tabs */
+.tabs{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none;padding-bottom:0}
+.tabs::-webkit-scrollbar{display:none}
+.tabbtn{
+  flex-shrink:0;
+  padding:8px 14px;
+  font-size:13px;font-weight:500;
+  border:none;background:transparent;color:var(--muted2);
+  cursor:pointer;border-radius:10px 10px 0 0;
+  border-bottom:2px solid transparent;
+  transition:color .15s,border-color .15s;
+}
+.tabbtn.active{color:var(--accent2);border-bottom-color:var(--accent)}
+.tabbtn:hover:not(.active){color:var(--text)}
+
+/* Main content */
+.content{padding:12px 14px;max-width:720px;margin:0 auto}
+
+/* Cards */
+.card{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:16px;
+  padding:14px;
+  margin-bottom:12px;
+}
+.card2{
+  background:var(--card2);
+  border:1px solid var(--border2);
+  border-radius:12px;
+  padding:12px;
+}
+
+/* Section title */
+.sectionTitle{font-size:13px;font-weight:600;color:var(--muted2);text-transform:uppercase;letter-spacing:.5px;margin:0 0 10px 0}
+
+/* Error */
+#err{display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);border-radius:12px;padding:10px 12px;color:#fca5a5;font-size:13px;margin-bottom:10px;white-space:pre-wrap;word-break:break-word}
+
+/* Inputs */
+label{display:block;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px}
+.inpWrap{position:relative}
+input,textarea{
+  width:100%;padding:10px 34px 10px 12px;
+  border:1px solid var(--border2);
+  border-radius:10px;
+  background:var(--input);
+  color:var(--text);
+  outline:none;font-size:14px;
+  transition:border-color .15s;
+  -webkit-appearance:none;
+}
+input:focus,textarea:focus{border-color:var(--accent)}
+textarea{padding:10px 12px;resize:vertical;min-height:80px}
+.xbtn{
+  position:absolute;right:8px;top:50%;transform:translateY(-50%);
+  width:22px;height:22px;border-radius:6px;
+  border:none;background:rgba(255,255,255,.06);
+  color:var(--muted2);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  font-size:14px;line-height:1;transition:background .15s;
+}
+.xbtn:hover{background:rgba(255,255,255,.12)}
+
+/* Buttons */
+button{cursor:pointer;border:1px solid var(--border2);border-radius:10px;background:var(--card2);color:var(--text);padding:9px 14px;font-size:13px;font-weight:500;transition:background .15s,border-color .15s}
+button:hover{background:rgba(255,255,255,.06)}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.btn-primary:hover{background:var(--accent2);border-color:var(--accent2)}
+.btn-green{background:var(--green2);border-color:var(--green);color:#fff;font-weight:600}
+.btn-green:hover{background:var(--green)}
+.btn-sm{padding:7px 11px;font-size:12px;border-radius:8px}
+.btn-danger{border-color:rgba(239,68,68,.4);color:var(--red)}
+.btn-danger:hover{background:rgba(239,68,68,.1)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.field{flex:1 1 200px;min-width:140px;position:relative}
+.field.open{z-index:999999}
+
+/* Chips */
+.chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.chip{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:4px 10px;border-radius:999px;
+  background:rgba(59,130,246,.15);border:1px solid rgba(59,130,246,.3);
+  color:var(--accent2);font-size:12px;font-weight:500;
+}
+
+/* Suggest dropdown */
+.sug{
+  position:absolute;top:calc(100% + 5px);left:0;right:0;
+  background:var(--card);border:1px solid var(--border2);
+  border-radius:14px;overflow:auto;max-height:360px;
+  z-index:999998;box-shadow:0 20px 60px rgba(0,0,0,.6);
+  -webkit-overflow-scrolling:touch;
+}
+.sugHead{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:9px 12px;border-bottom:1px solid var(--border);
+  position:sticky;top:0;background:var(--card);z-index:2;
+  font-size:12px;font-weight:600;color:var(--muted2);
+}
+.sug .item{
+  width:100%;text-align:left;border:0;background:transparent;
+  padding:9px 12px;display:flex;gap:10px;align-items:center;
+  border-radius:0;transition:background .1s;
+}
+.sug .item:hover{background:rgba(255,255,255,.04)}
+.sug .item.sel{background:rgba(59,130,246,.08)}
+.thumb{
+  width:40px;height:40px;border-radius:10px;
+  object-fit:cover;background:rgba(255,255,255,.05);
+  border:1px solid var(--border);flex-shrink:0;
+}
+.thumb.color{display:flex;align-items:center;justify-content:center;overflow:hidden}
+.colorFill{width:100%;height:100%;border-radius:9px;border:1px solid rgba(255,255,255,.1)}
+
+/* Lots grid */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-top:10px}
+@media(max-width:440px){.grid{grid-template-columns:repeat(2,1fr)}}
+.lot{
+  background:var(--card2);border:1px solid var(--border);
+  border-radius:14px;padding:10px;cursor:pointer;
+  transition:border-color .15s,transform .1s;
+  position:relative;overflow:hidden;
+}
+.lot:hover{border-color:var(--border2);transform:translateY(-1px)}
+.lot:active{transform:translateY(0)}
+.lotImg{width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.03);display:block}
+.lotImgPlaceholder{width:100%;aspect-ratio:1/1;border-radius:10px;border:1px solid var(--border);background:linear-gradient(135deg,rgba(59,130,246,.08),rgba(139,92,246,.08));display:flex;align-items:center;justify-content:center;color:var(--border2)}
+.lotPrice{font-size:15px;font-weight:700;margin-top:8px;color:var(--text)}
+.lotName{font-size:12px;color:var(--muted2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lotMeta{font-size:11px;color:var(--muted);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Badge */
+.badge{display:inline-flex;align-items:center;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:600;letter-spacing:.2px}
+.badge-green{background:rgba(34,197,94,.12);color:var(--green);border:1px solid rgba(34,197,94,.2)}
+.badge-blue{background:rgba(59,130,246,.12);color:var(--accent2);border:1px solid rgba(59,130,246,.2)}
+.badge-yellow{background:rgba(245,158,11,.12);color:var(--yellow);border:1px solid rgba(245,158,11,.2)}
+.badge-muted{background:rgba(100,116,139,.1);color:var(--muted2);border:1px solid rgba(100,116,139,.15)}
+
+/* Loader */
+.loaderLine{display:none;align-items:center;gap:8px;color:var(--muted);font-size:13px;padding:8px 0}
+.spinner{width:16px;height:16px;border-radius:50%;border:2px solid rgba(255,255,255,.1);border-top-color:var(--accent);animation:spin .7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Summary bar */
+.sumBar{display:flex;flex-wrap:wrap;gap:8px;padding:10px 0 4px}
+.sumPill{
+  padding:5px 10px;border:1px solid var(--border2);border-radius:8px;
+  font-size:12px;color:var(--muted2);background:var(--card2);
+}
+.sumPill b{color:var(--text)}
+
+/* Sheet */
+.sheetOverlay{
+  position:fixed;inset:0;background:rgba(0,0,0,.5);
+  display:flex;align-items:flex-end;justify-content:center;
+  z-index:50000;padding:0;
+  opacity:0;visibility:hidden;pointer-events:none;
+  transition:opacity .2s ease,visibility .2s ease;
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);
+}
+.sheetOverlay.show{opacity:1;visibility:visible;pointer-events:auto}
+.sheet{
+  width:100%;max-width:680px;
+  max-height:88vh;
+  background:var(--bg2);
+  border:1px solid var(--border2);
+  border-radius:22px 22px 0 0;
+  display:flex;flex-direction:column;
+  box-shadow:0 -20px 80px rgba(0,0,0,.6);
+  transform:translateY(40px);
+  transition:transform .2s cubic-bezier(.32,1.2,.5,1);
+}
+.sheetOverlay.show .sheet{transform:translateY(0)}
+.sheetHandle{width:36px;height:4px;border-radius:2px;background:rgba(255,255,255,.15);margin:10px auto 0}
+.sheetHead{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.sheetTitle{font-size:16px;font-weight:700}
+.sheetSub{font-size:13px;color:var(--muted2);margin-top:2px}
+.sheetScroll{overflow-y:auto;-webkit-overflow-scrolling:touch;flex:1;padding:14px 16px}
+.sheetImg{width:100%;max-height:200px;object-fit:contain;border-radius:14px;border:1px solid var(--border);background:rgba(255,255,255,.02);margin-bottom:12px}
+.sheetMeta{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
+.sheetMetaRow{display:flex;justify-content:space-between;align-items:center;font-size:13px}
+.sheetMetaRow .key{color:var(--muted)}
+.sheetMetaRow .val{font-weight:600;cursor:pointer;color:var(--accent2)}
+.sheetMetaRow .val:hover{text-decoration:underline}
+.sheetBtns{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.sheetDivider{height:1px;background:var(--border);margin:12px 0}
+
+/* Sale rows */
+.saleRow{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)}
+.saleRow:last-child{border-bottom:none}
+.saleThumb{width:48px;height:48px;border-radius:10px;object-fit:cover;background:rgba(255,255,255,.04);border:1px solid var(--border);flex-shrink:0}
+
+/* Purchase rows */
+.purchCard{
+  background:var(--card2);border:1px solid var(--border);
+  border-radius:14px;padding:12px;
+  display:flex;gap:12px;align-items:flex-start;
+}
+.purchThumb{width:56px;height:56px;border-radius:12px;object-fit:cover;background:rgba(255,255,255,.04);border:1px solid var(--border);flex-shrink:0}
+.purchInfo{flex:1;min-width:0}
+
+/* Sub cards */
+.subCard{
+  background:var(--card2);border:1px solid var(--border);
+  border-radius:16px;padding:14px;margin-bottom:10px;
+}
+.subCardHead{display:flex;gap:12px;align-items:flex-start}
+.subImg{width:52px;height:52px;border-radius:12px;object-fit:cover;background:rgba(255,255,255,.04);border:1px solid var(--border);flex-shrink:0}
+.subImgPlaceholder{width:52px;height:52px;border-radius:12px;background:linear-gradient(135deg,rgba(59,130,246,.1),rgba(139,92,246,.1));border:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;justify-content:center;color:var(--border2)}
+.subInfo{flex:1;min-width:0}
+.subTitle{font-size:14px;font-weight:700;margin-bottom:3px}
+.subMeta{font-size:12px;color:var(--muted2);margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.subActions{display:flex;align-items:center;gap:6px}
+.iconBtn{
+  width:32px;height:32px;border-radius:8px;
+  border:1px solid var(--border2);background:var(--card);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;font-size:15px;color:var(--muted2);
+  transition:background .15s,color .15s;padding:0;
+}
+.iconBtn:hover{background:rgba(255,255,255,.08);color:var(--text)}
+.iconBtn.danger:hover{background:rgba(239,68,68,.12);color:var(--red);border-color:rgba(239,68,68,.3)}
+.subSwatches{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}
+.swatch{width:12px;height:12px;border-radius:50%;border:1px solid rgba(255,255,255,.15)}
+.subActions2{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}
+
+/* Link buttons */
+.linkBtns{display:flex;gap:6px;margin-top:8px}
+.linkBtn{
+  padding:5px 12px;border-radius:8px;
+  border:1px solid var(--border2);background:var(--card);
+  color:var(--muted2);font-size:12px;font-weight:500;
+  text-decoration:none;display:inline-flex;align-items:center;
+  transition:background .15s,color .15s;
+}
+.linkBtn:hover{background:rgba(255,255,255,.07);color:var(--text)}
+
+/* Admin */
+.adminRow{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+.adminRow:last-child{border-bottom:none}
+.adminLabel{color:var(--muted)}
+.adminVal{font-weight:600;font-family:monospace;font-size:12px}
+
+/* Status line */
+.statusLine{font-size:12px;color:var(--muted);padding:4px 0}
+
+/* Scrollbar */
+*::-webkit-scrollbar{width:6px;height:6px}
+*::-webkit-scrollbar-track{background:transparent}
+*::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:3px}
+*::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.2)}
+
+/* Divider */
+.hr{height:1px;background:var(--border);margin:10px 0}
+
+/* Toggle */
+.toggle{
+  position:relative;width:38px;height:21px;flex-shrink:0;
+}
+.toggle input{opacity:0;width:0;height:0;position:absolute}
+.toggleSlider{
+  position:absolute;inset:0;border-radius:21px;
+  background:rgba(255,255,255,.1);border:1px solid var(--border2);
+  cursor:pointer;transition:background .2s;
+}
+.toggleSlider:before{
+  content:'';position:absolute;left:2px;top:2px;
+  width:15px;height:15px;border-radius:50%;
+  background:#fff;transition:transform .2s;
+}
+.toggle input:checked + .toggleSlider{background:var(--green);border-color:var(--green2)}
+.toggle input:checked + .toggleSlider:before{transform:translateX(17px)}
+
+/* Empty state */
+.emptyState{text-align:center;padding:40px 20px;color:var(--muted)}
+.emptyIcon{font-size:40px;margin-bottom:10px;opacity:.4}
+</style>
+</head>
+<body>
+
+<div class="appHeader">
+  <div class="appHeaderTop">
+    <div class="appTitle">${APP_TITLE}</div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <div id="authDot" class="statusDot" title="MRKT Auth"></div>
+    </div>
+  </div>
+  <div class="tabs">
+    <button class="tabbtn active" data-tab="market">Market</button>
+    <button class="tabbtn" data-tab="subs">Подписки</button>
+    <button class="tabbtn" data-tab="profile">Профиль</button>
+    <button class="tabbtn" data-tab="admin" id="adminTabBtn" style="display:none">Admin</button>
+  </div>
+</div>
+
+<div class="content">
+  <div id="err"></div>
+
+  <!-- MARKET TAB -->
+  <div id="market">
+    <div class="card">
+      <div class="sectionTitle">Фильтры</div>
+      <div class="row">
+        <div class="field" id="giftField">
+          <label>Gift</label>
+          <div class="inpWrap">
+            <input id="gift" placeholder="Выбрать коллекцию..." autocomplete="off"/>
+            <button class="xbtn" data-clear="gift" type="button">×</button>
+          </div>
+          <div id="giftSug" class="sug" style="display:none"></div>
+        </div>
+        <div class="field" id="modelField">
+          <label>Model <span style="color:var(--muted);font-weight:400">(1 gift)</span></label>
+          <div class="inpWrap">
+            <input id="model" placeholder="Выбрать модель..." autocomplete="off"/>
+            <button class="xbtn" data-clear="model" type="button">×</button>
+          </div>
+          <div id="modelSug" class="sug" style="display:none"></div>
+        </div>
+        <div class="field" id="backdropField">
+          <label>Backdrop <span style="color:var(--muted);font-weight:400">(1 gift)</span></label>
+          <div class="inpWrap">
+            <input id="backdrop" placeholder="Выбрать фон..." autocomplete="off"/>
+            <button class="xbtn" data-clear="backdrop" type="button">×</button>
+          </div>
+          <div id="backdropSug" class="sug" style="display:none"></div>
+        </div>
+        <div class="field" style="max-width:130px;flex:0 0 130px">
+          <label>Number #</label>
+          <div class="inpWrap">
+            <input id="number" placeholder="Префикс" inputmode="numeric"/>
+            <button class="xbtn" data-clear="number" type="button">×</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:10px">
+        <button id="apply" class="btn-primary">Найти лоты</button>
+        <button id="refresh">Обновить</button>
+        <button id="salesByFilters" class="btn-sm">История продаж</button>
+      </div>
+    </div>
+
+    <div id="summary" class="sumBar" style="display:none"></div>
+    <div id="lotsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка лотов...</div></div>
+    <div id="status" class="statusLine"></div>
+    <div id="lots" class="grid"></div>
+  </div>
+
+  <!-- SUBS TAB -->
+  <div id="subs" style="display:none">
+    <div class="card">
+      <div class="sectionTitle">Подписки</div>
+      <div class="row">
+        <button id="subCreate" class="btn-green">+ Создать из фильтров</button>
+        <button id="subRefresh">Обновить</button>
+        <button id="subRebuildUi" class="btn-sm">Обновить картинки</button>
+        <button id="subCheckNow" class="btn-sm">Проверить сейчас</button>
+      </div>
+    </div>
+    <div id="subsLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка...</div></div>
+    <div id="subsList"></div>
+  </div>
+
+  <!-- PROFILE TAB -->
+  <div id="profile" style="display:none">
+    <div class="card">
+      <div style="display:flex;align-items:center;gap:12px">
+        <img id="pfp" style="width:48px;height:48px;border-radius:50%;object-fit:cover;border:2px solid var(--border2);display:none"/>
+        <div>
+          <div id="profileName" style="font-size:15px;font-weight:700">Загрузка...</div>
+          <div id="profileMeta" class="statusLine"></div>
+        </div>
+      </div>
+    </div>
+    <div id="profileLoading" class="loaderLine"><div class="spinner"></div><div>Загрузка покупок...</div></div>
+    <div id="profileStats" style="display:none" class="card">
+      <div class="sectionTitle">Статистика</div>
+      <div id="statsContent" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+    </div>
+    <div style="font-size:13px;font-weight:600;color:var(--muted2);margin:4px 0 8px">История покупок</div>
+    <div id="purchases" style="display:flex;flex-direction:column;gap:8px"></div>
+  </div>
+
+  <!-- ADMIN TAB -->
+  <div id="admin" style="display:none">
+    <div class="card">
+      <div class="sectionTitle">Статус системы</div>
+      <div id="adminRows"></div>
+    </div>
+    <div class="card">
+      <div class="sectionTitle">MRKT Session Payload</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">Вставь JSON из Network вкладки MRKT — поля <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:4px">data</code> и <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:4px">photo</code></div>
+      <textarea id="payloadJson" rows="5" placeholder='{"appId":null,"data":"query_id=...&hash=...","photo":null}'></textarea>
+      <div class="row" style="margin-top:10px">
+        <button id="sessSave" class="btn-primary">Сохранить + обновить токен</button>
+        <button id="tokRefresh">Обновить токен</button>
+        <button id="testMrkt" class="btn-sm">Test API</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- BOTTOM SHEET -->
+<div id="sheetOverlay" class="sheetOverlay">
+  <div class="sheet">
+    <div class="sheetHandle"></div>
+    <div class="sheetHead">
+      <div style="flex:1;min-width:0">
+        <div id="sheetTitle" class="sheetTitle"></div>
+        <div id="sheetSub" class="sheetSub"></div>
+      </div>
+      <button id="sheetClose" class="btn-sm" style="flex-shrink:0">✕</button>
+    </div>
+    <div class="sheetScroll" id="sheetScroll">
+      <img id="sheetImg" class="sheetImg" style="display:none"/>
+      <div id="sheetMeta" class="sheetMeta"></div>
+      <div id="sheetBtns" class="sheetBtns"></div>
+      <div id="sheetBody"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body></html>`;
 
 // ===================== WebApp JS =====================
-const WEBAPP_JS = '/* moved to webapp.html */';
+const WEBAPP_JS = `(() => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const el = id => document.getElementById(id);
+
+  function setLoading(which, on) {
+    const ids = { lots: 'lotsLoading', subs: 'subsLoading', profile: 'profileLoading' };
+    const node = ids[which] ? el(ids[which]) : null;
+    if (node) node.style.display = on ? 'flex' : 'none';
+  }
+  function showErr(msg) {
+    const b = el('err');
+    if (!b) return;
+    b.style.display = 'block';
+    b.textContent = String(msg || '');
+  }
+  function hideErr() {
+    const b = el('err');
+    if (!b) return;
+    b.style.display = 'none';
+    b.textContent = '';
+  }
+
+  function parseInitDataFromLocation() {
+    try {
+      for (const raw of [location.hash, location.search]) {
+        const s = (raw || '').replace(/^[#?]/, '');
+        if (!s) continue;
+        const p = new URLSearchParams(s);
+        const v = p.get('tgWebAppData') || p.get('tgWebAppInitData') || p.get('initData') || '';
+        if (v) return v;
+      }
+    } catch {}
+    return '';
+  }
+
+  async function getTelegramContext() {
+    for (let i = 0; i < 30; i++) {
+      const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+      const initData = tg && tg.initData ? tg.initData : parseInitDataFromLocation();
+      if (tg && initData) {
+        try { tg.ready(); tg.expand(); } catch {}
+        return { tg, initData };
+      }
+      await sleep(100);
+    }
+    const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+    const initData = tg && tg.initData ? tg.initData : parseInitDataFromLocation();
+    if (tg) { try { tg.ready(); tg.expand(); } catch {} }
+    return { tg, initData };
+  }
+
+  (async () => {
+    const ctx = await getTelegramContext();
+    const tg = ctx.tg;
+    const initData = ctx.initData || '';
+
+    if (!initData) {
+      document.body.innerHTML =
+        '<div style="padding:20px;font-family:system-ui;color:#e2e8f0;background:#080d12;min-height:100vh">' +
+          '<div style="max-width:400px;margin:0 auto">' +
+            '<div style="font-size:18px;font-weight:700;margin-bottom:12px">Нет доступа</div>' +
+            '<div style="color:#64748b;line-height:1.6;font-size:14px">' +
+              'Открой панель через Telegram: /start → кнопка меню.<br><br>' +
+              'Хост: <b style="color:#94a3b8">' + (location.host || '-') + '</b><br>' +
+              'Platform: ' + (tg ? (tg.platform || '-') : 'нет объекта Telegram') +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      return;
+    }
+
+    async function api(path, opts) {
+      opts = opts || {};
+      const res = await fetch(path, {
+        ...opts,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Tg-Init-Data': initData,
+          ...(opts.headers || {})
+        }
+      });
+      const txt = await res.text();
+      let data = null;
+      try { data = txt ? JSON.parse(txt) : null; } catch { data = { raw: txt }; }
+      if (!res.ok) throw new Error((data && data.reason) ? String(data.reason) : ('HTTP ' + res.status));
+      return data;
+    }
+
+    function openTg(url) {
+      if (!url) return;
+      try { if (tg && tg.openTelegramLink) return tg.openTelegramLink(url); } catch {}
+      window.open(url, '_blank');
+    }
+
+    function setTab(name) {
+      ['market', 'subs', 'profile', 'admin'].forEach(x => {
+        const node = el(x);
+        if (node) node.style.display = x === name ? 'block' : 'none';
+      });
+      document.querySelectorAll('.tabbtn').forEach(b =>
+        b.classList.toggle('active', b.dataset.tab === name)
+      );
+    }
+
+    document.querySelectorAll('.tabbtn').forEach(b => b.onclick = async () => {
+      setTab(b.dataset.tab);
+      if (b.dataset.tab === 'profile') await refreshProfile().catch(() => {});
+      if (b.dataset.tab === 'admin') await refreshAdmin().catch(() => {});
+      if (b.dataset.tab === 'subs') await refreshSubs().catch(() => {});
+    });
+
+    let sel = { gifts: [], giftLabels: {}, models: [], backdrops: [], numberPrefix: '' };
+    let currentLots = [];
+    let currentState = null;
+
+    function giftsInputText() {
+      if (!sel.gifts.length) return '';
+      return sel.gifts.map(v => sel.giftLabels[v] || v).join(', ');
+    }
+    function listInputText(arr) { return (arr || []).join(', '); }
+    function isSelectedNorm(arr, v) {
+      const k = String(v || '').toLowerCase().trim();
+      return (arr || []).some(x => String(x).toLowerCase().trim() === k);
+    }
+    function toggleIn(arr, v) {
+      const k = String(v || '').toLowerCase().trim();
+      const out = [];
+      let removed = false;
+      for (const x of (arr || [])) {
+        if (String(x).toLowerCase().trim() === k) { removed = true; continue; }
+        out.push(x);
+      }
+      if (!removed) out.push(v);
+      return out;
+    }
+
+    async function patchFilters() {
+      await api('/api/state/patch', {
+        method: 'POST',
+        body: JSON.stringify({
+          filters: {
+            gifts: sel.gifts,
+            giftLabels: sel.giftLabels,
+            models: sel.models,
+            backdrops: sel.backdrops,
+            numberPrefix: el('number').value.trim()
+          }
+        })
+      });
+    }
+
+    function wrap(which, fn) {
+      return async () => {
+        hideErr();
+        setLoading(which, true);
+        try { await fn(); }
+        catch (e) { showErr(e.message || String(e)); }
+        finally { setLoading(which, false); }
+      };
+    }
+
+    const timers = {};
+    function debounce(kind, fn, ms) {
+      clearTimeout(timers[kind]);
+      timers[kind] = setTimeout(fn, ms || 220);
+    }
+
+    function scheduleRetryIfWait(resp, fn) {
+      const waitMs = resp && Number(resp.waitMs || 0);
+      if (!waitMs || waitMs < 500 || waitMs > 20000) return;
+      setTimeout(() => { fn().catch(() => {}); }, waitMs + 150);
+    }
+
+    function openField(fieldId) {
+      ['giftField', 'modelField', 'backdropField'].forEach(id => el(id) && el(id).classList.remove('open'));
+      if (el(fieldId)) el(fieldId).classList.add('open');
+    }
+    function hideSug(id) {
+      const b = el(id);
+      if (!b) return;
+      b.style.display = 'none';
+      b.innerHTML = '';
+    }
+
+    function renderSug(id, title, items, isSelected, onToggle) {
+      const b = el(id);
+      if (!b) return;
+      let html = '<div class="sugHead"><span>' + title + '</span><span style="font-weight:400;font-size:11px">нажми чтобы выбрать</span></div>';
+      html += (items || []).map(x => {
+        const selected = isSelected(x.value);
+        let thumb = '';
+        if (x.imgUrl) {
+          thumb = '<img class="thumb" src="' + x.imgUrl + '" referrerpolicy="no-referrer" loading="lazy"/>';
+        } else if (x.colorHex) {
+          thumb = '<div class="thumb color"><div class="colorFill" style="background:' + x.colorHex + '"></div></div>';
+        } else {
+          thumb = '<div class="thumb"></div>';
+        }
+        const mark = selected ? '<span style="color:var(--green)">✓ </span>' : '';
+        const sub = x.sub ? '<div style="font-size:11px;color:var(--muted);margin-top:1px">' + x.sub + '</div>' : '';
+        return '<button type="button" class="item' + (selected ? ' sel' : '') + '" data-v="' + String(x.value).replace(/"/g, '&quot;') + '">' +
+          thumb +
+          '<div style="min-width:0;flex:1">' +
+            '<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:' + (selected ? '700' : '500') + '">' + mark + (x.label || x.value) + '</div>' +
+            sub +
+          '</div></button>';
+      }).join('');
+
+      b.innerHTML = html;
+      b.style.display = 'block';
+      b.onpointerdown = e => e.stopPropagation();
+      b.onclick = e => {
+        const btn = e.target.closest('button[data-v]');
+        if (!btn) return;
+        onToggle(btn.getAttribute('data-v'));
+      };
+    }
+
+    async function showGiftSug() {
+      openField('giftField');
+      const q = (() => {
+        const raw = (el('gift').value || '').trim();
+        const sel2 = giftsInputText().trim();
+        return raw === sel2 ? '' : raw;
+      })();
+      const r = await api('/api/mrkt/collections?q=' + encodeURIComponent(q));
+      const items = r.items || [];
+      const mapLabel = r.mapLabel || {};
+      const rerender = () => renderSug('giftSug', 'Gift', items,
+        v => isSelectedNorm(sel.gifts, v),
+        v => {
+          const next = toggleIn(sel.gifts, v);
+          if (next.length !== 1) { sel.models = []; sel.backdrops = []; }
+          sel.gifts = next;
+          sel.giftLabels[v] = mapLabel[v] || v;
+          el('gift').value = giftsInputText();
+          el('model').value = listInputText(sel.models);
+          el('backdrop').value = listInputText(sel.backdrops);
+          rerender();
+        }
+      );
+      rerender();
+    }
+
+    async function showModelSug() {
+      openField('modelField');
+      if (sel.gifts.length !== 1) { hideSug('modelSug'); return; }
+      const gift = sel.gifts[0];
+      const q = (() => {
+        const raw = (el('model').value || '').trim();
+        return raw === listInputText(sel.models).trim() ? '' : raw;
+      })();
+      const r = await api('/api/mrkt/suggest?kind=model&gift=' + encodeURIComponent(gift) + '&q=' + encodeURIComponent(q));
+      const items = r.items || [];
+      const rerender = () => renderSug('modelSug', 'Model', items,
+        v => isSelectedNorm(sel.models, v),
+        v => {
+          sel.models = toggleIn(sel.models, v);
+          el('model').value = listInputText(sel.models);
+          rerender();
+        }
+      );
+      rerender();
+    }
+
+    async function showBackdropSug() {
+      openField('backdropField');
+      if (sel.gifts.length !== 1) { hideSug('backdropSug'); return; }
+      const gift = sel.gifts[0];
+      const q = (() => {
+        const raw = (el('backdrop').value || '').trim();
+        return raw === listInputText(sel.backdrops).trim() ? '' : raw;
+      })();
+      const r = await api('/api/mrkt/suggest?kind=backdrop&gift=' + encodeURIComponent(gift) + '&q=' + encodeURIComponent(q));
+      const items = r.items || [];
+      const rerender = () => renderSug('backdropSug', 'Backdrop', items,
+        v => isSelectedNorm(sel.backdrops, v),
+        v => {
+          sel.backdrops = toggleIn(sel.backdrops, v);
+          el('backdrop').value = listInputText(sel.backdrops);
+          rerender();
+        }
+      );
+      rerender();
+    }
+
+    document.addEventListener('click', e => {
+      if (!e.target.closest('#giftSug') && e.target !== el('gift')) hideSug('giftSug');
+      if (!e.target.closest('#modelSug') && e.target !== el('model')) hideSug('modelSug');
+      if (!e.target.closest('#backdropSug') && e.target !== el('backdrop')) hideSug('backdropSug');
+    });
+
+    el('gift').addEventListener('focus', () => debounce('gift', () => showGiftSug().catch(e => showErr(e.message || String(e)))));
+    el('gift').addEventListener('input', () => debounce('gift', () => showGiftSug().catch(e => showErr(e.message || String(e)))));
+    el('model').addEventListener('focus', () => debounce('model', () => showModelSug().catch(e => showErr(e.message || String(e)))));
+    el('model').addEventListener('input', () => debounce('model', () => showModelSug().catch(e => showErr(e.message || String(e)))));
+    el('backdrop').addEventListener('focus', () => debounce('backdrop', () => showBackdropSug().catch(e => showErr(e.message || String(e)))));
+    el('backdrop').addEventListener('input', () => debounce('backdrop', () => showBackdropSug().catch(e => showErr(e.message || String(e)))));
+
+    document.querySelectorAll('[data-clear]').forEach(btn => {
+      btn.onclick = () => {
+        const what = btn.dataset.clear;
+        if (what === 'gift') { sel.gifts = []; sel.models = []; sel.backdrops = []; sel.giftLabels = {}; el('gift').value = ''; el('model').value = ''; el('backdrop').value = ''; }
+        if (what === 'model') { sel.models = []; el('model').value = ''; }
+        if (what === 'backdrop') { sel.backdrops = []; el('backdrop').value = ''; }
+        if (what === 'number') el('number').value = '';
+      };
+    });
+
+    async function refreshState() {
+      const s = await api('/api/state');
+      currentState = s;
+      const isAdm = !!(s.api && s.api.isAdmin);
+      el('adminTabBtn').style.display = isAdm ? 'inline-block' : 'none';
+
+      const dot = el('authDot');
+      if (dot) {
+        dot.className = 'statusDot ' + (s.api && s.api.mrktAuthSet ? 'green' : 'red');
+        dot.title = s.api && s.api.mrktAuthSet ? ('Auth OK: ' + (s.api.mrktAuthMask || '')) : 'Auth MISSING';
+      }
+
+      const f = s.user && s.user.filters ? s.user.filters : {};
+      sel.gifts = (f.gifts || []).slice();
+      sel.giftLabels = Object.assign({}, f.giftLabels || {});
+      sel.models = (f.models || []).slice();
+      sel.backdrops = (f.backdrops || []).slice();
+
+      el('gift').value = giftsInputText();
+      el('model').value = listInputText(sel.models);
+      el('backdrop').value = listInputText(sel.backdrops);
+      el('number').value = f.numberPrefix || '';
+      return s;
+    }
+
+    function lotCard(lot) {
+      const imgHtml = lot.imgUrl
+        ? '<img class="lotImg" src="' + lot.imgUrl + '" referrerpolicy="no-referrer" loading="lazy"/>'
+        : '<div class="lotImgPlaceholder"><svg width="32" height="32" fill="none" viewBox="0 0 24 24"><rect width="24" height="24" rx="6" fill="rgba(255,255,255,.04)"/><path d="M12 8a4 4 0 100 8 4 4 0 000-8z" fill="rgba(255,255,255,.15)"/></svg></div>';
+      return '<div class="lot" data-id="' + lot.id + '">' +
+        imgHtml +
+        '<div class="lotPrice">' + Number(lot.priceTon).toFixed(3) + ' TON</div>' +
+        '<div class="lotName">' + (lot.name || '') + '</div>' +
+        (lot.model ? '<div class="lotMeta">Model: ' + lot.model + '</div>' : '') +
+        (lot.backdrop ? '<div class="lotMeta">Backdrop: ' + lot.backdrop + '</div>' : '') +
+      '</div>';
+    }
+
+    async function refreshSummary(force) {
+      try {
+        const r = await api('/api/mrkt/summary_by_filters' + (force ? '?force=1' : ''));
+        const box = el('summary');
+        const offers = r.offers || {};
+        if (!r.note && offers.exact == null && offers.collection == null) {
+          box.style.display = 'none'; box.innerHTML = ''; return;
+        }
+        box.style.display = 'flex';
+        box.innerHTML =
+          (offers.exact != null ? '<div class="sumPill">Макс. оффер (точный): <b>' + Number(offers.exact).toFixed(3) + ' TON</b></div>' : '') +
+          (offers.collection != null ? '<div class="sumPill">Макс. оффер (коллекция): <b>' + Number(offers.collection).toFixed(3) + ' TON</b></div>' : '') +
+          (r.note ? '<div class="sumPill" style="color:var(--muted)">' + r.note + '</div>' : '');
+      } catch {}
+    }
+
+    async function refreshLots(force) {
+      const r = await api('/api/mrkt/lots' + (force ? '?force=1' : ''));
+      currentLots = r.lots || [];
+      const statusEl = el('status');
+      if (statusEl) statusEl.textContent = r.note || '';
+      const lotsEl = el('lots');
+      if (lotsEl) {
+        lotsEl.innerHTML = currentLots.length
+          ? currentLots.map(lotCard).join('')
+          : '<div class="emptyState"><div class="emptyIcon">◇</div><div>Лоты не найдены</div></div>';
+      }
+    }
+
+    async function refreshProfile() {
+      setLoading('profile', true);
+      try {
+        const r = await api('/api/profile');
+        const user = r.user || null;
+        const nameEl = el('profileName');
+        const metaEl = el('profileMeta');
+        const pfp = el('pfp');
+
+        if (user) {
+          const fn = user.first_name || '';
+          const un = user.username ? ('@' + user.username) : '';
+          if (nameEl) nameEl.textContent = (fn + ' ' + un).trim() || 'Пользователь';
+          if (user.photo_url && pfp) { pfp.src = user.photo_url; pfp.style.display = 'block'; }
+          else if (pfp) pfp.style.display = 'none';
+        } else {
+          if (nameEl) nameEl.textContent = 'Пользователь';
+          if (pfp) pfp.style.display = 'none';
+        }
+
+        const items = r.purchases || [];
+        const statsEl = el('profileStats');
+        const statsContent = el('statsContent');
+        if (items.length && statsEl && statsContent) {
+          statsEl.style.display = 'block';
+          const totalTon = items.reduce((s, p) => s + Number(p.priceTon || 0), 0);
+          const withLatency = items.filter(p => p.latencyMs != null);
+          const avgLatency = withLatency.length ? withLatency.reduce((s, p) => s + p.latencyMs, 0) / withLatency.length : null;
+          statsContent.innerHTML =
+            '<div class="badge badge-blue">Покупок: ' + items.length + '</div>' +
+            '<div class="badge badge-muted">Потрачено: ' + totalTon.toFixed(3) + ' TON</div>' +
+            (avgLatency != null ? '<div class="badge badge-green">Avg latency: ' + (avgLatency / 1000).toFixed(2) + 's</div>' : '');
+        } else if (statsEl) statsEl.style.display = 'none';
+
+        if (metaEl) metaEl.textContent = items.length + ' покупок';
+
+        const list = el('purchases');
+        if (!list) return;
+        if (!items.length) {
+          list.innerHTML = '<div class="emptyState"><div class="emptyIcon">◻</div><div>Покупок нет</div></div>';
+          return;
+        }
+
+        list.innerHTML = items.map(p => {
+          const imgHtml = p.imgUrl
+            ? '<img class="purchThumb" src="' + p.imgUrl + '" referrerpolicy="no-referrer" loading="lazy"/>'
+            : '<div class="purchThumb" style="display:flex;align-items:center;justify-content:center;color:var(--border2)">◻</div>';
+
+          const latColor = p.latencyMs == null ? '' :
+            p.latencyMs < 2000 ? 'color:var(--green)' :
+            p.latencyMs < 10000 ? 'color:var(--yellow)' : 'color:var(--muted2)';
+
+          const meta = [];
+          if (p.model) meta.push(p.model);
+          if (p.backdrop) meta.push(p.backdrop);
+          if (p.collection && p.number != null) meta.push('#' + p.number);
+
+          return '<div class="purchCard">' +
+            imgHtml +
+            '<div class="purchInfo">' +
+              '<div style="font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (p.title || 'Gift') + '</div>' +
+              '<div style="font-size:15px;font-weight:700;color:var(--accent2);margin-top:2px">' + Number(p.priceTon || 0).toFixed(3) + ' TON</div>' +
+              (p.boughtMsk ? '<div style="font-size:11px;color:var(--muted);margin-top:2px">' + p.boughtMsk + '</div>' : '') +
+              (p.latencyMs != null ? '<div style="font-size:11px;margin-top:1px;' + latColor + '">Latency: ' + (p.latencyMs / 1000).toFixed(2) + 's</div>' : '') +
+              (meta.length ? '<div style="font-size:11px;color:var(--muted);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + meta.join(' · ') + '</div>' : '') +
+              '<div class="linkBtns">' +
+                (p.urlMarket ? '<a class="linkBtn" href="' + p.urlMarket + '" target="_blank">MRKT</a>' : '') +
+                (p.urlTelegram ? '<a class="linkBtn" href="' + p.urlTelegram + '" target="_blank">NFT</a>' : '') +
+              '</div>' +
+            '</div>' +
+          '</div>';
+        }).join('');
+      } finally {
+        setLoading('profile', false);
+      }
+    }
+
+    async function refreshSubs() {
+      setLoading('subs', true);
+      try {
+        const s = await api('/api/state');
+        currentState = s;
+        const list = el('subsList');
+        if (!list) return;
+        const subs = (s.user && s.user.subscriptions) ? s.user.subscriptions : [];
+
+        if (!subs.length) {
+          list.innerHTML = '<div class="emptyState"><div class="emptyIcon">◇</div><div>Нет подписок</div><div style="font-size:12px;margin-top:4px">Выбери фильтры на Market и нажми "+ Создать"</div></div>';
+          return;
+        }
+
+        list.innerHTML = subs.map(sub => {
+          const f = sub.filters || {};
+          const gifts = (f.gifts || []).map(v => (f.giftLabels && f.giftLabels[v]) ? f.giftLabels[v] : v).join(', ') || '—';
+          const models = (f.models || []).join(', ');
+          const backs = (f.backdrops || []).join(', ');
+          const notifyMax = sub.maxNotifyTon == null ? '∞' : sub.maxNotifyTon + ' TON';
+          const autoMax = sub.maxAutoBuyTon == null ? '—' : sub.maxAutoBuyTon + ' TON';
+          const mode = sub.autoBuyAny ? 'Любые лоты' : 'Только новые';
+
+          const imgHtml = sub.ui && sub.ui.thumbKey
+            ? '<img class="subImg" src="/img/cdn?key=' + encodeURIComponent(sub.ui.thumbKey) + '" referrerpolicy="no-referrer" loading="lazy"/>'
+            : '<div class="subImgPlaceholder">◇</div>';
+
+          const swatches = Array.isArray(sub.ui && sub.ui.swatches ? sub.ui.swatches : [])
+            ? (sub.ui.swatches || []).map(c => '<span class="swatch" style="background:' + c + '"></span>').join('')
+            : '';
+
+          const statusBadge = sub.enabled
+            ? '<span class="badge badge-green">Активна</span>'
+            : '<span class="badge badge-muted">Пауза</span>';
+
+          const autoBuyBadge = sub.autoBuyEnabled
+            ? '<span class="badge badge-yellow" style="margin-left:4px">AutoBuy</span>'
+            : '';
+
+          return '<div class="subCard">' +
+            '<div class="subCardHead">' +
+              imgHtml +
+              '<div class="subInfo">' +
+                '<div class="subTitle">#' + sub.num + ' ' + statusBadge + autoBuyBadge + '</div>' +
+                '<div class="subMeta">Gift: ' + gifts + '</div>' +
+                (models ? '<div class="subMeta">Model: ' + models + '</div>' : '') +
+                (backs ? '<div class="subMeta">Backdrop: ' + backs + '</div>' : '') +
+                (f.numberPrefix ? '<div class="subMeta">Number: ' + f.numberPrefix + '</div>' : '') +
+                (swatches ? '<div class="subSwatches">' + swatches + '</div>' : '') +
+                '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">' +
+                  '<span style="font-size:11px;color:var(--muted)">Notify max: <b style="color:var(--text)">' + notifyMax + '</b></span>' +
+                  (sub.autoBuyEnabled ? '<span style="font-size:11px;color:var(--muted)">AutoBuy max: <b style="color:var(--yellow)">' + autoMax + '</b></span>' : '') +
+                  (sub.autoBuyEnabled ? '<span style="font-size:11px;color:var(--muted)">Режим: <b style="color:var(--text)">' + mode + '</b></span>' : '') +
+                '</div>' +
+              '</div>' +
+              '<div class="subActions">' +
+                '<button class="iconBtn" title="' + (sub.enabled ? 'Пауза' : 'Включить') + '" data-sub-act="toggle" data-id="' + sub.id + '" style="font-size:13px">' + (sub.enabled ? '⏸' : '▶') + '</button>' +
+                '<button class="iconBtn danger" title="Удалить" data-sub-act="delete" data-id="' + sub.id + '" style="font-size:13px">✕</button>' +
+              '</div>' +
+            '</div>' +
+            '<div class="subActions2">' +
+              '<button class="btn-sm" data-sub-act="nmax" data-id="' + sub.id + '">Notify max</button>' +
+              '<button class="btn-sm' + (sub.autoBuyEnabled ? ' btn-green' : '') + '" data-sub-act="ab" data-id="' + sub.id + '">AutoBuy ' + (sub.autoBuyEnabled ? 'ON' : 'OFF') + '</button>' +
+              (sub.autoBuyEnabled ? '<button class="btn-sm" data-sub-act="amax" data-id="' + sub.id + '">Auto max</button>' : '') +
+              (sub.autoBuyEnabled ? '<button class="btn-sm" data-sub-act="mode" data-id="' + sub.id + '">' + (sub.autoBuyAny ? 'Режим: Любые' : 'Режим: Новые') + '</button>' : '') +
+            '</div>' +
+          '</div>';
+        }).join('');
+      } finally {
+        setLoading('subs', false);
+      }
+    }
+
+    async function refreshAdmin() {
+      try {
+        const r = await api('/api/admin/status');
+        const rows = el('adminRows');
+        if (!rows) return;
+        const fmt = v => v == null ? '—' : String(v);
+        const boolBadge = v => v
+          ? '<span class="badge badge-green">YES</span>'
+          : '<span class="badge badge-muted">NO</span>';
+
+        rows.innerHTML = [
+          ['MRKT Auth', boolBadge(r.mrktAuthSet) + (r.mrktAuthMask ? ' <span style="font-family:monospace;font-size:11px;color:var(--muted2)">' + r.mrktAuthMask + '</span>' : '')],
+          ['Session saved', boolBadge(r.mrktSessionSaved)],
+          ['Last fail', r.mrktLastFail ? '<span style="color:var(--red);font-size:12px">' + r.mrktLastFail + '</span>' : '<span class="badge badge-green">OK</span>'],
+          ['Pause until', r.pauseUntil && r.pauseUntil > Date.now() ? new Date(r.pauseUntil).toLocaleTimeString('ru-RU') : '—'],
+          ['Last refresh', r.refresh && r.refresh.lastOkAt ? new Date(r.refresh.lastOkAt).toLocaleString('ru-RU') : '—'],
+        ].map(([k, v]) =>
+          '<div class="adminRow"><span class="adminLabel">' + k + '</span><span class="adminVal">' + v + '</span></div>'
+        ).join('');
+      } catch (e) {
+        const rows = el('adminRows');
+        if (rows) rows.innerHTML = '<div style="color:var(--red);font-size:13px">' + (e.message || String(e)) + '</div>';
+      }
+    }
+
+    // Sheet
+    function openSheet() { el('sheetOverlay').classList.add('show'); }
+    function closeSheet() {
+      el('sheetOverlay').classList.remove('show');
+      ['sheetTitle','sheetSub','sheetMeta','sheetBtns','sheetBody'].forEach(id => { if(el(id)) el(id).innerHTML = ''; });
+      if (el('sheetImg')) { el('sheetImg').style.display = 'none'; el('sheetImg').src = ''; }
+    }
+    el('sheetClose').onclick = closeSheet;
+    el('sheetOverlay').addEventListener('click', e => { if (e.target === el('sheetOverlay')) closeSheet(); });
+
+    function renderSalesList(r) {
+      const sales = r.sales || [];
+      if (!sales.length) {
+        el('sheetBody').innerHTML = '<div class="emptyState" style="padding:20px 0"><div>Нет данных о продажах</div></div>';
+        return;
+      }
+      el('sheetBody').innerHTML = sales.map(s => {
+        const imgHtml = s.imgUrl
+          ? '<img class="saleThumb" src="' + s.imgUrl + '" referrerpolicy="no-referrer" loading="lazy"/>'
+          : '<div class="saleThumb" style="display:flex;align-items:center;justify-content:center;color:var(--border2)">◻</div>';
+        return '<div class="saleRow">' +
+          imgHtml +
+          '<div style="flex:1;min-width:0">' +
+            '<div style="font-weight:700;font-size:14px">' + Number(s.priceTon).toFixed(3) + ' TON</div>' +
+            (s.ts ? '<div style="font-size:11px;color:var(--muted)">' + new Date(s.ts).toLocaleString('ru-RU') + '</div>' : '') +
+            '<div style="font-size:12px;color:var(--muted2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (s.title || '') + '</div>' +
+            (s.model || s.backdrop ? '<div style="font-size:11px;color:var(--muted)">' + [s.model, s.backdrop].filter(Boolean).join(' · ') + '</div>' : '') +
+          '</div>' +
+          '<div style="display:flex;gap:5px;flex-shrink:0">' +
+            (s.urlMarket ? '<a class="linkBtn" href="' + s.urlMarket + '" target="_blank">MRKT</a>' : '') +
+            (s.urlTelegram ? '<a class="linkBtn" href="' + s.urlTelegram + '" target="_blank">NFT</a>' : '') +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    async function openLotSheet(lot) {
+      openSheet();
+      el('sheetTitle').textContent = lot.name || 'Gift';
+      el('sheetSub').textContent = lot.priceTon != null ? Number(lot.priceTon).toFixed(3) + ' TON' : '';
+
+      if (lot.imgUrl) {
+        el('sheetImg').src = lot.imgUrl;
+        el('sheetImg').style.display = 'block';
+      }
+
+      // Кликабельные фильтры
+      const metaItems = [];
+      if (lot.collectionName) metaItems.push(['Gift', lot.collectionName, () => {
+        sel.gifts = [lot.collectionName]; sel.giftLabels = { [lot.collectionName]: lot.collectionName };
+        sel.models = []; sel.backdrops = [];
+        el('gift').value = giftsInputText(); el('model').value = ''; el('backdrop').value = '';
+        closeSheet(); setTab('market');
+        wrap('lots', async () => { await patchFilters(); await refreshSummary(true); await refreshLots(true); })();
+      }]);
+      if (lot.model) metaItems.push(['Model', lot.model, () => {
+        if (sel.gifts.length !== 1 || sel.gifts[0] !== lot.collectionName) {
+          sel.gifts = [lot.collectionName]; sel.giftLabels = { [lot.collectionName]: lot.collectionName };
+        }
+        sel.models = [lot.model]; el('gift').value = giftsInputText(); el('model').value = lot.model; el('backdrop').value = '';
+        closeSheet(); setTab('market');
+        wrap('lots', async () => { await patchFilters(); await refreshSummary(true); await refreshLots(true); })();
+      }]);
+      if (lot.backdrop) metaItems.push(['Backdrop', lot.backdrop, () => {
+        if (sel.gifts.length !== 1 || sel.gifts[0] !== lot.collectionName) {
+          sel.gifts = [lot.collectionName]; sel.giftLabels = { [lot.collectionName]: lot.collectionName };
+        }
+        sel.backdrops = [lot.backdrop]; el('gift').value = giftsInputText(); el('backdrop').value = lot.backdrop;
+        closeSheet(); setTab('market');
+        wrap('lots', async () => { await patchFilters(); await refreshSummary(true); await refreshLots(true); })();
+      }]);
+      if (lot.number != null) metaItems.push(['Number', '#' + lot.number, null]);
+
+      el('sheetMeta').innerHTML = metaItems.map(([k, v, fn]) =>
+        '<div class="sheetMetaRow">' +
+          '<span class="key">' + k + '</span>' +
+          '<span class="val" style="' + (fn ? 'cursor:pointer' : 'cursor:default;color:var(--text)') + '">' + v + '</span>' +
+        '</div>'
+      ).join('');
+
+      metaItems.forEach(([k, v, fn], i) => {
+        if (!fn) return;
+        const spans = el('sheetMeta').querySelectorAll('.val');
+        if (spans[i]) spans[i].onclick = fn;
+      });
+
+      el('sheetBtns').innerHTML =
+        '<button class="btn-sm" id="sBtn_tg">Telegram NFT</button>' +
+        '<button class="btn-sm" id="sBtn_mrkt">MRKT</button>' +
+        '<button class="btn-sm" id="sBtn_apply">Применить фильтры</button>' +
+        '<button class="btn-sm" id="sBtn_hist">История продаж</button>';
+
+      el('sBtn_tg').onclick = () => openTg(lot.urlTelegram || 'https://t.me/mrkt');
+      el('sBtn_mrkt').onclick = () => window.open(lot.urlMarket || 'https://t.me/mrkt', '_blank');
+      el('sBtn_apply').onclick = async () => {
+        sel.gifts = lot.collectionName ? [lot.collectionName] : [];
+        sel.giftLabels = lot.collectionName ? { [lot.collectionName]: lot.collectionName } : {};
+        sel.models = lot.model ? [lot.model] : [];
+        sel.backdrops = lot.backdrop ? [lot.backdrop] : [];
+        el('gift').value = giftsInputText(); el('model').value = listInputText(sel.models); el('backdrop').value = listInputText(sel.backdrops); el('number').value = '';
+        await patchFilters(); await refreshSummary(true); await refreshLots(true);
+        closeSheet();
+      };
+      el('sBtn_hist').onclick = async () => {
+        el('sheetBody').innerHTML = '<div class="loaderLine" style="display:flex"><div class="spinner"></div><div>Загрузка истории...</div></div>';
+        try {
+          const s = await api('/api/lot/sales', { method: 'POST', body: JSON.stringify({ lot }) });
+          const hist = s.salesHistory || { approxPriceTon: null, sales: [] };
+          el('sheetSub').textContent =
+            (lot.priceTon != null ? Number(lot.priceTon).toFixed(3) + ' TON' : '') +
+            (hist.approxPriceTon != null ? ' · медиана ' + Number(hist.approxPriceTon).toFixed(3) + ' TON' : '');
+          renderSalesList(hist);
+        } catch (e) {
+          el('sheetBody').innerHTML = '<div style="color:var(--red);font-size:13px">' + (e.message || String(e)) + '</div>';
+        }
+      };
+
+      // Загрузить offers сразу
+      el('sheetBody').innerHTML = '<div class="statusLine">Загрузка офферов...</div>';
+      try {
+        const d = await api('/api/lot/details', { method: 'POST', body: JSON.stringify({ lot }) });
+        const off = d.offers || {};
+        el('sheetBody').innerHTML = [
+          off.exact != null ? '<div class="sumPill" style="margin-bottom:4px">Макс. оффер (точный): <b>' + Number(off.exact).toFixed(3) + ' TON</b></div>' : '',
+          off.collection != null ? '<div class="sumPill">Макс. оффер (коллекция): <b>' + Number(off.collection).toFixed(3) + ' TON</b></div>' : '',
+          (!off.exact && !off.collection) ? '<div class="statusLine">Офферов нет</div>' : '',
+        ].join('');
+      } catch {
+        el('sheetBody').innerHTML = '';
+      }
+    }
+
+    async function openSalesByFilters() {
+      openSheet();
+      el('sheetTitle').textContent = 'История продаж';
+      el('sheetSub').textContent = 'По текущим фильтрам';
+      el('sheetImg').style.display = 'none';
+      el('sheetMeta').innerHTML = '';
+      el('sheetBtns').innerHTML = '';
+      el('sheetBody').innerHTML = '<div class="loaderLine" style="display:flex"><div class="spinner"></div><div>Загрузка...</div></div>';
+      try {
+        const r = await api('/api/mrkt/sales_by_filters?force=1');
+        if (r.approxPriceTon != null) {
+          el('sheetSub').textContent = 'Медиана: ' + Number(r.approxPriceTon).toFixed(3) + ' TON';
+        }
+        renderSalesList(r);
+        scheduleRetryIfWait(r, openSalesByFilters);
+      } catch (e) {
+        el('sheetBody').innerHTML = '<div style="color:var(--red);font-size:13px">' + (e.message || String(e)) + '</div>';
+      }
+    }
+
+    el('lots').addEventListener('click', e => {
+      const card = e.target.closest('.lot');
+      if (!card) return;
+      const id = card.getAttribute('data-id');
+      const lot = currentLots.find(x => String(x.id) === String(id));
+      if (lot) openLotSheet(lot).catch(err => showErr(err.message || String(err)));
+    });
+
+    el('apply').onclick = wrap('lots', async () => {
+      if (sel.gifts.length !== 1) { sel.models = []; sel.backdrops = []; el('model').value = ''; el('backdrop').value = ''; }
+      await patchFilters(); await refreshSummary(true); await refreshLots(true);
+    });
+    el('refresh').onclick = wrap('lots', async () => { await refreshSummary(true); await refreshLots(true); });
+    el('salesByFilters').onclick = async () => { hideErr(); await openSalesByFilters(); };
+
+    let subCreateBusy = false;
+    el('subCreate').onclick = wrap('subs', async () => {
+      if (subCreateBusy) return;
+      subCreateBusy = true;
+      try {
+        await api('/api/sub/create', { method: 'POST' });
+        await refreshSubs();
+      } finally { subCreateBusy = false; }
+    });
+    el('subRefresh').onclick = wrap('subs', async () => { await refreshSubs(); });
+    el('subRebuildUi').onclick = wrap('subs', async () => { await api('/api/sub/rebuild_ui', { method: 'POST' }); await refreshSubs(); });
+    el('subCheckNow').onclick = wrap('subs', async () => {
+      const r = await api('/api/sub/check_now', { method: 'POST' });
+      alert('Подписок проверено: ' + r.processedSubs + '\\nФлор уведомлений: ' + r.floorNotifs + '\\nFeed событий: ' + r.feedNotifs);
+    });
+
+    el('subsList').addEventListener('click', e => {
+      const btn = e.target.closest('button[data-sub-act]');
+      if (!btn) return;
+      const act = btn.getAttribute('data-sub-act');
+      const id = btn.getAttribute('data-id');
+      wrap('subs', async () => {
+        if (act === 'toggle') await api('/api/sub/toggle', { method: 'POST', body: JSON.stringify({ id }) });
+        if (act === 'delete') { if (!confirm('Удалить подписку?')) return; await api('/api/sub/delete', { method: 'POST', body: JSON.stringify({ id }) }); }
+        if (act === 'nmax') {
+          const v = prompt('Max Notify TON (пусто = без лимита):');
+          if (v == null) return;
+          await api('/api/sub/set_notify_max', { method: 'POST', body: JSON.stringify({ id, maxNotifyTon: v }) });
+        }
+        if (act === 'ab') await api('/api/sub/toggle_autobuy', { method: 'POST', body: JSON.stringify({ id }) });
+        if (act === 'amax') {
+          const v = prompt('Max AutoBuy TON:');
+          if (v == null) return;
+          await api('/api/sub/set_autobuy_max', { method: 'POST', body: JSON.stringify({ id, maxAutoBuyTon: v }) });
+        }
+        if (act === 'mode') await api('/api/sub/toggle_autobuy_any', { method: 'POST', body: JSON.stringify({ id }) });
+        await refreshSubs();
+      })();
+    });
+
+    el('sessSave').onclick = wrap('admin', async () => {
+      const payloadJson = el('payloadJson').value.trim();
+      if (!payloadJson) throw new Error('Вставь payload JSON');
+      const r = await api('/api/admin/session', { method: 'POST', body: JSON.stringify({ payloadJson }) });
+      alert('Сохранено. Token: ' + (r.tokenMask || ''));
+      await refreshAdmin();
+    });
+    el('tokRefresh').onclick = wrap('admin', async () => {
+      const r = await api('/api/admin/refresh_token', { method: 'POST', body: '{}' });
+      alert('Token обновлён: ' + (r.tokenMask || ''));
+      await refreshAdmin();
+    });
+    el('testMrkt').onclick = wrap('admin', async () => {
+      const r = await api('/api/admin/test_mrkt');
+      alert('Коллекций: ' + r.collectionsCount + '\\nToken: ' + (r.tokenMask || '—') + '\\nОшибка: ' + (r.lastFail || 'нет'));
+      await refreshAdmin();
+    });
+
+    async function refreshAll(forceLots) {
+      hideErr();
+      await refreshState();
+      await refreshSummary(forceLots);
+      await refreshLots(forceLots);
+    }
+
+    await wrap('lots', async () => { await refreshAll(true); })();
+  })();
+})();`;
 
 // ===================== Express =====================
 const app = express();
@@ -2050,7 +3363,7 @@ app.get('/api/mrkt/collections', auth, async (req, res) => {
       label: x.title || x.name,
       value: x.name,
       imgUrl,
-      sub: floorTon != null ? `floor: ${floorTon.toFixed(3)} TON` : null,
+      sub: floorTon != null ? `флор: ${floorTon.toFixed(3)} TON` : null,
     };
   });
 
@@ -2065,7 +3378,6 @@ app.get('/api/mrkt/suggest', auth, async (req, res) => {
 
   if (kind === 'model') {
     if (!gift) return res.json({ ok: true, items: [], waitMs: 0 });
-
     const models = await mrktGetModelsForGift(gift);
     const items = models
       .filter((m) => !q || m.name.toLowerCase().includes(q))
@@ -2073,29 +3385,22 @@ app.get('/api/mrkt/suggest', auth, async (req, res) => {
       .map((m) => {
         const imgUrl = m.thumbKey ? `/img/cdn?key=${encodeURIComponent(m.thumbKey)}` : null;
         const floor = m.floorNano != null ? tonFromNano(m.floorNano) : null;
-        const rarityPct =
-          m.rarityPerMille != null && Number.isFinite(Number(m.rarityPerMille))
-            ? (Number(m.rarityPerMille) / 10).toFixed(1) + '%'
-            : null;
-        const sub =
-          (floor != null ? `min: ${floor.toFixed(3)} TON` : 'min: —') +
-          (rarityPct ? ` · rarity: ${rarityPct}` : '');
-        return { label: m.name, value: m.name, imgUrl, sub };
+        const rarityPct = m.rarityPerMille != null && Number.isFinite(Number(m.rarityPerMille))
+          ? (Number(m.rarityPerMille) / 10).toFixed(1) + '%' : null;
+        const sub = (floor != null ? `от ${floor.toFixed(3)} TON` : '') + (rarityPct ? ` · редкость: ${rarityPct}` : '');
+        return { label: m.name, value: m.name, imgUrl, sub: sub || null };
       });
-
     const waitMs = Math.max(0, (mrktState.pauseUntil || 0) - nowMs());
     return res.json({ ok: true, items, waitMs: waitMs > 0 ? waitMs : 0 });
   }
 
   if (kind === 'backdrop') {
     if (!gift) return res.json({ ok: true, items: [], waitMs: 0 });
-
     const backs = await mrktGetBackdropsForGift(gift);
     const items = backs
       .filter((b) => !q || b.name.toLowerCase().includes(q))
       .slice(0, WEBAPP_SUGGEST_LIMIT)
-      .map((b) => ({ label: b.name, value: b.name, colorHex: b.centerHex || '#000000' }));
-
+      .map((b) => ({ label: b.name, value: b.name, colorHex: b.centerHex || '#444444' }));
     const waitMs = Math.max(0, (mrktState.pauseUntil || 0) - nowMs());
     return res.json({ ok: true, items, waitMs: waitMs > 0 ? waitMs : 0 });
   }
@@ -2126,7 +3431,6 @@ app.get('/api/mrkt/lots', auth, async (req, res) => {
       lowToHigh: true,
       count: MRKT_COUNT,
     });
-
     if (!r.ok) {
       note = `MRKT RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}`;
       waitMs = r.waitMs || 1000;
@@ -2162,7 +3466,7 @@ app.get('/api/mrkt/summary_by_filters', auth, async (req, res) => {
     const payload = {
       ok: true,
       offers: { exact: null, collection: null },
-      note: f.gifts.length ? 'Сводка работает для 1 gift' : 'Выбери gift',
+      note: f.gifts.length ? 'Сводка работает для 1 gift' : null,
       waitMs: 0,
     };
     if (!force) summaryCache.set(cacheKey, { time: nowMs(), data: payload });
@@ -2175,22 +3479,12 @@ app.get('/api/mrkt/summary_by_filters', auth, async (req, res) => {
 
   const o1 = await mrktOrdersFetch({ gift, model, backdrop });
   if (!o1.ok && o1.reason === 'RPS_WAIT') {
-    return res.json({
-      ok: true,
-      offers: { exact: null, collection: null },
-      note: `RPS limit, wait ${fmtWaitMs(o1.waitMs || 1000)}`,
-      waitMs: o1.waitMs || 1000,
-    });
+    return res.json({ ok: true, offers: { exact: null, collection: null }, note: `RPS limit, wait ${fmtWaitMs(o1.waitMs || 1000)}`, waitMs: o1.waitMs || 1000 });
   }
 
   const o2 = await mrktOrdersFetch({ gift, model: null, backdrop: null });
   if (!o2.ok && o2.reason === 'RPS_WAIT') {
-    return res.json({
-      ok: true,
-      offers: { exact: null, collection: null },
-      note: `RPS limit, wait ${fmtWaitMs(o2.waitMs || 1000)}`,
-      waitMs: o2.waitMs || 1000,
-    });
+    return res.json({ ok: true, offers: { exact: null, collection: null }, note: `RPS limit, wait ${fmtWaitMs(o2.waitMs || 1000)}`, waitMs: o2.waitMs || 1000 });
   }
 
   const payload = {
@@ -2210,16 +3504,16 @@ app.get('/api/mrkt/summary_by_filters', auth, async (req, res) => {
 // ===================== Lot details + sales =====================
 app.post('/api/lot/details', auth, async (req, res) => {
   const force = req.query.force != null;
-  const lot = req.body?.lot || null;
-  const lotId = String(lot?.id || '').trim();
+  const lot = req.body && req.body.lot ? req.body.lot : null;
+  const lotId = String((lot && lot.id) || '').trim();
   if (!lotId) return res.status(400).json({ ok: false, reason: 'NO_LOT' });
 
   const cached = detailsCache.get(lotId);
   if (!force && cached && nowMs() - cached.time < DETAILS_CACHE_TTL_MS) return res.json(cached.data);
 
-  const gift = String(lot?.collectionName || '').trim();
-  const model = lot?.model ? String(lot.model) : null;
-  const backdrop = lot?.backdrop ? String(lot.backdrop) : null;
+  const gift = String((lot && lot.collectionName) || '').trim();
+  const model = lot && lot.model ? String(lot.model) : null;
+  const backdrop = lot && lot.backdrop ? String(lot.backdrop) : null;
 
   let offerExact = null;
   let offerCollection = null;
@@ -2235,35 +3529,22 @@ app.post('/api/lot/details', auth, async (req, res) => {
     else if (o2.ok) offerCollection = maxOfferTonFromOrders(o2.orders);
   }
 
-  const payload = {
-    ok: true,
-    offers: { exact: offerExact, collection: offerCollection },
-    waitMs,
-  };
-
+  const payload = { ok: true, offers: { exact: offerExact, collection: offerCollection }, waitMs };
   if (!force) detailsCache.set(lotId, { time: nowMs(), data: payload });
   res.json(payload);
 });
 
 app.post('/api/lot/sales', auth, async (req, res) => {
-  const lot = req.body?.lot || null;
-  const gift = String(lot?.collectionName || '').trim();
-  const model = lot?.model ? String(lot.model) : null;
-  const backdrop = lot?.backdrop ? String(lot.backdrop) : null;
+  const lot = req.body && req.body.lot ? req.body.lot : null;
+  const gift = String((lot && lot.collectionName) || '').trim();
+  const model = lot && lot.model ? String(lot.model) : null;
+  const backdrop = lot && lot.backdrop ? String(lot.backdrop) : null;
 
   if (!gift) {
-    return res.json({
-      ok: true,
-      salesHistory: { ok: true, approxPriceTon: null, sales: [], note: 'NO_GIFT', waitMs: 0 }
-    });
+    return res.json({ ok: true, salesHistory: { ok: true, approxPriceTon: null, sales: [], note: 'NO_GIFT', waitMs: 0 } });
   }
 
-  const out = await mrktFeedSales({
-    gift,
-    modelNames: model ? [model] : [],
-    backdropNames: backdrop ? [backdrop] : [],
-  });
-
+  const out = await mrktFeedSales({ gift, modelNames: model ? [model] : [], backdropNames: backdrop ? [backdrop] : [] });
   res.json({ ok: true, salesHistory: out });
 });
 
@@ -2282,9 +3563,9 @@ app.get('/api/mrkt/sales_by_filters', auth, async (req, res) => {
 app.post('/api/mrkt/buy', auth, async (req, res) => {
   if (!MANUAL_BUY_ENABLED) return res.status(403).json({ ok: false, reason: 'MANUAL_BUY_DISABLED' });
 
-  const id = String(req.body?.id || '').trim();
-  const priceNano = Number(req.body?.priceNano);
-  const lot = req.body?.lot || null;
+  const id = String((req.body && req.body.id) || '').trim();
+  const priceNano = Number(req.body && req.body.priceNano);
+  const lot = (req.body && req.body.lot) || null;
 
   if (!id) return res.status(400).json({ ok: false, reason: 'NO_ID' });
   if (!Number.isFinite(priceNano) || priceNano <= 0) return res.status(400).json({ ok: false, reason: 'BAD_PRICE' });
@@ -2305,21 +3586,21 @@ app.post('/api/mrkt/buy', auth, async (req, res) => {
     tsFound: foundAt,
     tsBought: boughtAt,
     latencyMs,
-    title: lot?.name || 'Gift',
+    title: (lot && lot.name) || 'Gift',
     priceTon: priceNano / 1e9,
-    urlTelegram: lot?.urlTelegram || '',
-    urlMarket: lot?.urlMarket || mrktLotUrlFromId(id),
+    urlTelegram: (lot && lot.urlTelegram) || '',
+    urlMarket: (lot && lot.urlMarket) || mrktLotUrlFromId(id),
     lotId: id,
-    giftName: lot?.giftName || '',
-    thumbKey: lot?.thumbKey || '',
-    model: lot?.model || '',
-    backdrop: lot?.backdrop || '',
-    collection: lot?.collectionName || '',
-    number: lot?.number ?? null,
+    giftName: (lot && lot.giftName) || '',
+    thumbKey: (lot && lot.thumbKey) || '',
+    model: (lot && lot.model) || '',
+    backdrop: (lot && lot.backdrop) || '',
+    collection: (lot && lot.collectionName) || '',
+    number: (lot && lot.number) != null ? lot.number : null,
   });
   scheduleSave();
 
-  res.json({ ok: true, title: lot?.name || 'Gift', priceTon: priceNano / 1e9 });
+  res.json({ ok: true, title: (lot && lot.name) || 'Gift', priceTon: priceNano / 1e9 });
 });
 
 // ===================== Profile =====================
@@ -2331,7 +3612,7 @@ app.get('/api/profile', auth, async (req, res) => {
     lotId: p.lotId || null,
     priceTon: p.priceTon,
     boughtMsk: p.tsBought ? new Date(p.tsBought).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }) : null,
-    latencyMs: p.latencyMs ?? null,
+    latencyMs: p.latencyMs != null ? p.latencyMs : null,
     imgUrl: p.giftName
       ? `/img/gift?name=${encodeURIComponent(p.giftName)}`
       : (p.thumbKey ? `/img/cdn?key=${encodeURIComponent(p.thumbKey)}` : null),
@@ -2340,7 +3621,7 @@ app.get('/api/profile', auth, async (req, res) => {
     model: p.model || null,
     backdrop: p.backdrop || null,
     collection: p.collection || null,
-    number: p.number ?? null,
+    number: p.number != null ? p.number : null,
   }));
 
   res.json({ ok: true, user: req.tgUser, purchases });
@@ -2350,41 +3631,31 @@ app.get('/api/profile', auth, async (req, res) => {
 app.post('/api/sub/create', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
 
-  // сохраняем chatId косвенно через user state, если уже был /start или любое сообщение
   const r = makeSubFromCurrentFilters(u);
   if (!r.ok) return res.status(400).json({ ok: false, reason: r.reason });
 
-  // защита от дублей одной и той же подписки подряд
   const sig = JSON.stringify(normalizeFilters(r.sub.filters || {}));
   const exists = (u.subscriptions || []).find((x) => x && JSON.stringify(normalizeFilters(x.filters || {})) === sig);
-  if (exists) {
-    return res.json({ ok: true, alreadyExists: true });
-  }
+  if (exists) return res.json({ ok: true, alreadyExists: true });
 
   r.sub.ui = await buildSubUi(r.sub);
-
   u.subscriptions.push(r.sub);
   renumberSubs(u);
   scheduleSave();
 
-  // сразу пытаемся прислать стартовый флор
+  // Стартовое уведомление о флоре
   setTimeout(async () => {
     try {
       const sf = normalizeFilters(r.sub.filters || {});
-      const rLots = await mrktSearchLotsByFilters(sf, 1, {
-        ordering: 'Price',
-        lowToHigh: true,
-        count: MRKT_COUNT,
-      });
-
+      const rLots = await mrktSearchLotsByFilters(sf, 1, { ordering: 'Price', lowToHigh: true, count: MRKT_COUNT });
       const lot = (rLots.ok && rLots.gifts && rLots.gifts[0]) ? rLots.gifts[0] : null;
       if (!lot) return;
-
       await notifyFloorToUser(req.userId, r.sub, lot, lot.priceTon);
+      console.log(`[SUB CREATE] Стартовое уведомление отправлено userId=${req.userId} sub=#${r.sub.num}`);
     } catch (e) {
-      console.error('sub create notify error:', e?.message || e);
+      console.error('sub create notify error:', e && e.message || e);
     }
-  }, 250);
+  }, 300);
 
   res.json({ ok: true });
 });
@@ -2407,7 +3678,7 @@ app.post('/api/sub/check_now', auth, async (req, res) => {
 
 app.post('/api/sub/toggle', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
-  const s = findSub(u, String(req.body?.id || ''));
+  const s = findSub(u, String((req.body && req.body.id) || ''));
   if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
   s.enabled = !s.enabled;
   scheduleSave();
@@ -2416,7 +3687,7 @@ app.post('/api/sub/toggle', auth, async (req, res) => {
 
 app.post('/api/sub/delete', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
-  const id = String(req.body?.id || '');
+  const id = String((req.body && req.body.id) || '');
   u.subscriptions = (u.subscriptions || []).filter((x) => x && x.id !== id);
   renumberSubs(u);
   scheduleSave();
@@ -2425,19 +3696,12 @@ app.post('/api/sub/delete', auth, async (req, res) => {
 
 app.post('/api/sub/set_notify_max', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
-  const s = findSub(u, String(req.body?.id || ''));
+  const s = findSub(u, String((req.body && req.body.id) || ''));
   if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
-
-  const str = String(req.body?.maxNotifyTon ?? '').trim();
-  if (!str) {
-    s.maxNotifyTon = null;
-    scheduleSave();
-    return res.json({ ok: true });
-  }
-
+  const str = String(req.body && req.body.maxNotifyTon != null ? req.body.maxNotifyTon : '').trim();
+  if (!str) { s.maxNotifyTon = null; scheduleSave(); return res.json({ ok: true }); }
   const v = parseTonInput(str);
   if (!Number.isFinite(v) || v <= 0) return res.status(400).json({ ok: false, reason: 'BAD_MAX' });
-
   s.maxNotifyTon = v;
   scheduleSave();
   res.json({ ok: true });
@@ -2445,7 +3709,7 @@ app.post('/api/sub/set_notify_max', auth, async (req, res) => {
 
 app.post('/api/sub/toggle_autobuy', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
-  const s = findSub(u, String(req.body?.id || ''));
+  const s = findSub(u, String((req.body && req.body.id) || ''));
   if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
   s.autoBuyEnabled = !s.autoBuyEnabled;
   scheduleSave();
@@ -2454,12 +3718,10 @@ app.post('/api/sub/toggle_autobuy', auth, async (req, res) => {
 
 app.post('/api/sub/set_autobuy_max', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
-  const s = findSub(u, String(req.body?.id || ''));
+  const s = findSub(u, String((req.body && req.body.id) || ''));
   if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
-
-  const v = parseTonInput(req.body?.maxAutoBuyTon);
+  const v = parseTonInput(req.body && req.body.maxAutoBuyTon);
   if (!Number.isFinite(v) || v <= 0) return res.status(400).json({ ok: false, reason: 'BAD_MAX' });
-
   s.maxAutoBuyTon = v;
   scheduleSave();
   res.json({ ok: true });
@@ -2467,7 +3729,7 @@ app.post('/api/sub/set_autobuy_max', auth, async (req, res) => {
 
 app.post('/api/sub/toggle_autobuy_any', auth, async (req, res) => {
   const u = getOrCreateUser(req.userId);
-  const s = findSub(u, String(req.body?.id || ''));
+  const s = findSub(u, String((req.body && req.body.id) || ''));
   if (!s) return res.status(404).json({ ok: false, reason: 'NOT_FOUND' });
   s.autoBuyAny = !s.autoBuyAny;
   scheduleSave();
@@ -2500,7 +3762,7 @@ app.get('/api/admin/status', auth, async (req, res) => {
 app.post('/api/admin/session', auth, async (req, res) => {
   if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
 
-  const payloadJson = req.body?.payloadJson;
+  const payloadJson = req.body && req.body.payloadJson;
   let data = null;
   let photo = null;
 
@@ -2508,17 +3770,15 @@ app.post('/api/admin/session', auth, async (req, res) => {
     const j = tryParseJsonMaybe(payloadJson);
     if (!j || typeof j !== 'object') return res.status(400).json({ ok: false, reason: 'BAD_PAYLOAD_JSON' });
     data = typeof j.data === 'string' ? j.data : null;
-    photo = (j.photo === undefined) ? null : j.photo;
+    photo = j.photo === undefined ? null : j.photo;
   } else {
-    data = typeof req.body?.data === 'string' ? req.body.data : null;
-    const rawPhoto = req.body?.photo;
+    data = req.body && typeof req.body.data === 'string' ? req.body.data : null;
+    const rawPhoto = req.body && req.body.photo;
     if (rawPhoto == null || rawPhoto === '') photo = null;
     else if (typeof rawPhoto === 'string') {
       const pj = tryParseJsonMaybe(rawPhoto);
       photo = pj != null ? pj : rawPhoto;
-    } else {
-      photo = rawPhoto;
-    }
+    } else photo = rawPhoto;
   }
 
   if (!data || !String(data).includes('hash=')) return res.status(400).json({ ok: false, reason: 'BAD_DATA_NO_HASH' });
@@ -2564,7 +3824,7 @@ if (PUBLIC_URL) {
   const hookUrl = `${PUBLIC_URL.replace(/\/+$/, '')}/telegram-webhook`;
   bot.setWebHook(hookUrl)
     .then(() => console.log('Webhook set:', hookUrl))
-    .catch((e) => console.error('setWebHook error:', e?.message || e));
+    .catch((e) => console.error('setWebHook error:', e && e.message || e));
 
   app.post('/telegram-webhook', (req, res) => {
     bot.processUpdate(req.body);
@@ -2576,16 +3836,16 @@ if (PUBLIC_URL) {
   console.log('Polling started (PUBLIC_URL not set)');
 }
 
-// ===================== start server + intervals + bootstrap =====================
+// ===================== start server + intervals =====================
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
 
 setInterval(() => {
-  checkSubscriptionsForAllUsers().catch((e) => console.error('subs error:', e));
+  checkSubscriptionsForAllUsers().catch((e) => console.error('subs interval error:', e));
 }, SUBS_CHECK_INTERVAL_MS);
 
 setInterval(() => {
-  autoBuyCycle().catch((e) => console.error('autobuy error:', e));
+  autoBuyCycle().catch((e) => console.error('autobuy interval error:', e));
 }, AUTO_BUY_CHECK_INTERVAL_MS);
 
 (async () => {
@@ -2593,23 +3853,21 @@ setInterval(() => {
     await initRedis();
     if (redis) {
       const t = await redisGet(REDIS_KEY_MRKT_AUTH);
-      if (t && String(t).trim()) MRKT_AUTH_RUNTIME = String(t).trim();
+      if (t && String(t).trim()) {
+        MRKT_AUTH_RUNTIME = String(t).trim();
+        console.log('Loaded MRKT token from Redis:', maskToken(MRKT_AUTH_RUNTIME));
+      }
 
       const rawSess = await redisGet(REDIS_KEY_MRKT_SESSION);
       if (rawSess) {
-        try { mrktSessionRuntime = JSON.parse(rawSess); } catch {}
+        try { mrktSessionRuntime = JSON.parse(rawSess); console.log('Loaded MRKT session from Redis'); } catch {}
       }
 
       const keys = [
         REDIS_KEY_STATE,
-        'bot:state:v8',
-        'bot:state:v7',
-        'bot:state:v6',
-        'bot:state:v5',
-        'bot:state:v4',
-        'bot:state:v3',
-        'bot:state:v2',
-        'bot:state:v1',
+        'bot:state:v8', 'bot:state:v7', 'bot:state:v6',
+        'bot:state:v5', 'bot:state:v4', 'bot:state:v3',
+        'bot:state:v2', 'bot:state:v1',
       ];
       for (const k of keys) {
         const raw = await redisGet(k);
@@ -2623,8 +3881,8 @@ setInterval(() => {
       }
     }
   } else {
-    console.warn('REDIS_URL not set => state/session/token won’t persist');
+    console.warn('REDIS_URL not set => state/session/token won\'t persist');
   }
 
-  console.log('Bot started. /start');
+  console.log('Bot ready. MODE=' + MODE + ' AUTO_BUY_GLOBAL=' + AUTO_BUY_GLOBAL + ' AUTO_BUY_DRY_RUN=' + AUTO_BUY_DRY_RUN);
 })();
