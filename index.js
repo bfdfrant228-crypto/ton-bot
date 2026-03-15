@@ -842,26 +842,46 @@ async function mrktGetModelsForGift(giftName) {
   const cached = modelsCache.get(giftName);
   if (cached && nowMs() - cached.time < CACHE_TTL_MS) return cached.items;
 
-  const r = await mrktPostJson('/gifts/models', { collections: [giftName] });
-  if (!r.ok) return cached?.items || [];
+  // Пробуем оба варианта запроса — с collectionNames и collections
+  let r = await mrktPostJson('/gifts/models', { collectionNames: [giftName], collections: [giftName] });
+  if (!r.ok) {
+    // Fallback — только collections
+    r = await mrktPostJson('/gifts/models', { collections: [giftName] });
+  }
+  if (!r.ok) {
+    console.warn('[MODELS] Не удалось загрузить модели для', giftName, 'status=', r.status);
+    return cached?.items || [];
+  }
 
-  const arr = Array.isArray(r.data) ? r.data : [];
+  // MRKT может вернуть массив напрямую или объект с полем models/items
+  let arr = [];
+  if (Array.isArray(r.data)) {
+    arr = r.data;
+  } else if (r.data && Array.isArray(r.data.models)) {
+    arr = r.data.models;
+  } else if (r.data && Array.isArray(r.data.items)) {
+    arr = r.data.items;
+  }
+
   const map = new Map();
   for (const it of arr) {
-    const name = it.modelTitle || it.modelName;
+    const name = it.modelTitle || it.modelName || it.title || it.name;
     if (!name) continue;
     const key = normTraitName(name);
     if (!map.has(key)) {
       map.set(key, {
         name: String(name),
-        thumbKey: it.modelStickerThumbnailKey || null,
-        floorNano: it.floorPriceNanoTons ?? null,
+        thumbKey: it.modelStickerThumbnailKey || it.stickerThumbnailKey || null,
+        floorNano: it.floorPriceNanoTons ?? it.floorPrice ?? null,
         rarityPerMille: it.rarityPerMille ?? null,
       });
     }
   }
   const items = Array.from(map.values());
-  modelsCache.set(giftName, { time: nowMs(), items });
+  if (items.length > 0) {
+    modelsCache.set(giftName, { time: nowMs(), items });
+  }
+  console.log('[MODELS]', giftName, '→', items.length, 'моделей');
   return items;
 }
 
@@ -1439,7 +1459,14 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
   const models = f.gifts.length === 1 ? (f.models || []) : [];
   const backdrops = f.gifts.length === 1 ? (f.backdrops || []) : [];
 
-  const st = subStates.get(stateKey) || { feedLastId: null };
+  // Загружаем из Redis если в памяти нет (переживает рестарт)
+  let st = subStates.get(stateKey);
+  if (!st) {
+    const saved = await redisGet(`sub:feed:${stateKey}`).catch(() => null);
+    if (saved) { try { st = JSON.parse(saved); } catch { st = { feedLastId: null }; } }
+    else { st = { feedLastId: null }; }
+    subStates.set(stateKey, st);
+  }
 
   const r = await mrktFeedFetch({
     collectionNames: f.gifts,
@@ -1458,8 +1485,9 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
   if (!latestId) return 0;
 
   if (!st.feedLastId) {
-    // Первый запуск — запоминаем позицию, ничего не шлём
-    subStates.set(stateKey, { ...st, feedLastId: latestId });
+    const newSt = { ...st, feedLastId: latestId };
+    subStates.set(stateKey, newSt);
+    if (redis) redisSet(`sub:feed:${stateKey}`, JSON.stringify(newSt), { EX: 86400 * 7 }).catch(() => {});
     console.log(`[FEED] Sub #${sub.num} userId=${userId}: первый запуск, запомнили lastId=${latestId}`);
     return 0;
   }
@@ -1477,7 +1505,9 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
   }
 
   if (!newItems.length) {
-    subStates.set(stateKey, { ...st, feedLastId: latestId });
+    const newSt = { ...st, feedLastId: latestId };
+    subStates.set(stateKey, newSt);
+    if (redis) redisSet(`sub:feed:${stateKey}`, JSON.stringify(newSt), { EX: 86400 * 7 }).catch(() => {});
     return 0;
   }
 
@@ -1507,7 +1537,9 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
     }
   }
 
-  subStates.set(stateKey, { ...st, feedLastId: latestId });
+  const newSt2 = { ...st, feedLastId: latestId };
+  subStates.set(stateKey, newSt2);
+  if (redis) redisSet(`sub:feed:${stateKey}`, JSON.stringify(newSt2), { EX: 86400 * 7 }).catch(() => {});
   return sent;
 }
 
@@ -1539,7 +1571,13 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         const sf = normalizeFilters(sub.filters || {});
         if (sf.gifts.length) {
           const stateKeyFloor = `${userId}:${sub.id}:floor`;
-          const prev = subStates.get(stateKeyFloor) || { floor: null, emptyStreak: 0 };
+          let prev = subStates.get(stateKeyFloor);
+          if (!prev) {
+            const saved = await redisGet(`sub:floor:${stateKeyFloor}`).catch(() => null);
+            if (saved) { try { prev = JSON.parse(saved); } catch { prev = { floor: null, emptyStreak: 0 }; } }
+            else { prev = { floor: null, emptyStreak: 0 }; }
+            subStates.set(stateKeyFloor, prev);
+          }
 
           try {
             const r = await mrktSearchLotsByFilters(sf, 1, { ordering: 'Price', lowToHigh: true, count: MRKT_COUNT });
@@ -1567,7 +1605,9 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
                   floorNotifs++;
                 }
 
-                subStates.set(stateKeyFloor, { ...prev, floor: newFloor, emptyStreak });
+                const newFloorSt = { ...prev, floor: newFloor, emptyStreak };
+                subStates.set(stateKeyFloor, newFloorSt);
+                if (redis) redisSet(`sub:floor:${stateKeyFloor}`, JSON.stringify(newFloorSt), { EX: 86400 * 7 }).catch(() => {});
               }
             }
           } catch (e) {
@@ -2827,8 +2867,9 @@ const WEBAPP_JS = `(() => {
       if (!e.target.closest('#modelSug') && !e.target.closest('#modelField')) hideSug('modelSug');
       if (!e.target.closest('#backdropSug') && !e.target.closest('#backdropField')) hideSug('backdropSug');
     });
-    // Закрывать dropdown при скролле
+    // Закрывать dropdown при скролле и при открытии sheet
     window.addEventListener('scroll', () => { hideSug('giftSug'); hideSug('modelSug'); hideSug('backdropSug'); }, { passive: true });
+    function hideAllSug() { hideSug('giftSug'); hideSug('modelSug'); hideSug('backdropSug'); }
 
     el('gift').addEventListener('focus', () => debounce('gift', () => showGiftSug().catch(e => showErr(e.message || String(e)))));
     el('gift').addEventListener('input', () => debounce('gift', () => showGiftSug().catch(e => showErr(e.message || String(e)))));
@@ -3093,6 +3134,7 @@ const WEBAPP_JS = `(() => {
     let sheetIsOpen = false;
     function openSheet() {
       sheetIsOpen = true;
+      hideAllSug(); // закрываем все dropdown когда открываем sheet
       el('sheetOverlay').classList.add('show');
     }
     function closeSheet() {
@@ -3535,7 +3577,8 @@ app.get('/api/mrkt/lots', auth, async (req, res) => {
   }));
 
   const payload = { ok: true, lots: mapped, note, waitMs };
-  if (!force) lotsCache.set(cacheKey, { time: nowMs(), data: payload });
+  // Сохраняем кэш всегда (даже при force) чтобы повторные запросы были быстрыми
+  lotsCache.set(cacheKey, { time: nowMs(), data: payload });
   res.json(payload);
 });
 
