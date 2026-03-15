@@ -1613,7 +1613,7 @@ async function mrktPostJsonBackground(path, bodyObj) {
   if (waitMs0 > 0) await sleep(waitMs0);
 
   // Минимальный gap между фоновыми запросами — 500ms
-  bgState.nextAllowedAt = nowMs() + 500;
+  bgState.nextAllowedAt = nowMs() + 350;
 
   const reqVal = makeReq();
   const body = { ...(bodyObj || {}), req: reqVal };
@@ -1785,10 +1785,13 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         });
         giftFeedCache.set(key, r);
         // Минимальная пауза между уникальными gift запросами
-        if (uniqueKeys.size > 1) await sleep(600);
+        if (uniqueKeys.size > 1) await sleep(200);
       }
 
       // === ШАГ 2: Обрабатываем каждую подписку используя кэшированный feed ===
+      // AutoBuy тоже здесь — использует тот же кэш, без лишних запросов
+      let autoBuysDone = 0;
+
       for (const sub of active) {
         processedSubs++;
         const key = getGiftKey(sub);
@@ -1842,6 +1845,102 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
           } catch (e) {
             console.error(`[SUBS] Feed ошибка sub #${sub.num}:`, e?.message);
           }
+        }
+
+        // === AutoBuy — используем тот же feedResult, без нового запроса ===
+        if (AUTO_BUY_GLOBAL && sub.autoBuyEnabled && sub.maxAutoBuyTon != null &&
+            autoBuysDone < AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE && feedResult.ok && feedResult.items.length > 0) {
+          try {
+            const maxBuy = Number(sub.maxAutoBuyTon);
+            if (Number.isFinite(maxBuy) && maxBuy > 0) {
+              const stateKey = `${userId}:${sub.id}:autobuy`;
+              let st = subStates.get(stateKey);
+              if (!st) {
+                const saved = await redisGet(`sub:autobuy:${stateKey}`).catch(() => null);
+                st = saved ? (JSON.parse(saved) || { autoBuyLastId: null }) : { autoBuyLastId: null };
+                subStates.set(stateKey, st);
+              }
+
+              const latestId = feedResult.items[0]?.id || null;
+
+              if (latestId && !st.autoBuyLastId) {
+                // Первый запуск — запоминаем позицию
+                const newSt = { autoBuyLastId: latestId };
+                subStates.set(stateKey, newSt);
+                if (redis) redisSet(`sub:autobuy:${stateKey}`, JSON.stringify(newSt), { EX: 86400*7 }).catch(()=>{});
+              } else {
+                // Ищем кандидатов
+                const candidates = [];
+                for (const it of feedResult.items) {
+                  if (!it?.id) continue;
+                  if (st.autoBuyLastId && it.id === st.autoBuyLastId) break;
+                  const type = String(it?.type || '').toLowerCase();
+                  if (type !== 'listing') continue;
+                  const g = it?.gift;
+                  if (!g || !g.id) continue;
+                  const priceNano = extractListingPriceNanoFromGift(g);
+                  if (!priceNano) continue;
+                  const priceTon = priceNano / 1e9;
+                  if (priceTon > maxBuy) continue;
+                  candidates.push({ it, g, priceNano, priceTon });
+                }
+
+                if (latestId) {
+                  const newSt = { autoBuyLastId: latestId };
+                  subStates.set(stateKey, newSt);
+                  if (redis) redisSet(`sub:autobuy:${stateKey}`, JSON.stringify(newSt), { EX: 86400*7 }).catch(()=>{});
+                }
+
+                if (candidates.length > 0) {
+                  candidates.sort((a, b) => a.priceTon - b.priceTon);
+                  const pick = candidates[0];
+                  const lotId = String(pick.g.id);
+                  const attemptKey = `${userId}:${lotId}`;
+                  const lastAttempt = autoBuyRecentAttempts.get(attemptKey);
+
+                  if (!lastAttempt || nowMs() - lastAttempt > AUTO_BUY_ATTEMPT_TTL_MS) {
+                    autoBuyRecentAttempts.set(attemptKey, nowMs());
+                    const tsFound = Date.now();
+                    console.log(`[AUTOBUY] Sub #${sub.num}: кандидат ${pick.priceTon} TON lotId=${lotId}`);
+
+                    if (!AUTO_BUY_DRY_RUN) {
+                      const buyRes = await mrktBuy({ id: lotId, priceNano: pick.priceNano });
+                      if (buyRes.ok) {
+                        autoBuysDone++;
+                        const tsBought = Date.now();
+                        const listedRaw = pick.it?.date ? Date.parse(pick.it.date) : NaN;
+                        const tsListed = Number.isFinite(listedRaw) ? listedRaw : null;
+                        const latencyMs = tsListed != null ? Math.max(0, tsBought - tsListed) : null;
+                        const base = (pick.g.collectionTitle || pick.g.collectionName || '').trim();
+                        const number = pick.g.number ?? null;
+                        const title = number != null ? `${base} #${number}` : base;
+                        const giftName = pick.g.name || null;
+                        const urlTelegram = giftName ? `https://t.me/nft/${giftName}` : 'https://t.me/mrkt';
+                        const urlMarket = pick.g.id ? mrktLotUrlFromId(pick.g.id) : 'https://t.me/mrkt';
+                        const thumbKey = pick.g.modelStickerThumbnailKey || pick.g.modelStickerKey || null;
+                        const uBuy = getOrCreateUser(userId);
+                        pushPurchase(uBuy, { tsListed, tsFound, tsBought, latencyMs, title, priceTon: pick.priceTon, urlTelegram, urlMarket, lotId, giftName: giftName||'', thumbKey: thumbKey||'', model: pick.g.modelTitle||pick.g.modelName||'', backdrop: pick.g.backdropName||'', collection: pick.g.collectionName||base, number: number??null });
+                        scheduleSave();
+                        const nowMsk = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow', hour:'2-digit', minute:'2-digit', second:'2-digit', fractionalSecondDigits:3 });
+                        let msg = `✅ AutoBuy OK ⏱${nowMsk} MSK\nЦена: ${pick.priceTon.toFixed(3)} TON\n`;
+                        if (latencyMs != null) msg += `Latency: ${(latencyMs/1000).toFixed(2)}s\n`;
+                        msg += `${title}\n${urlTelegram}`;
+                        await sendMessageSafe(userChatId(userId), msg, { disable_web_page_preview: false, reply_markup: mkReplyMarkupOpen(urlMarket, 'MRKT') });
+                        if (AUTO_BUY_DISABLE_AFTER_SUCCESS) { sub.autoBuyEnabled = false; scheduleSave(); }
+                      } else if (buyRes.noFunds) {
+                        for (const s2 of active) if (s2) s2.autoBuyEnabled = false;
+                        scheduleSave();
+                        await sendMessageSafe(userChatId(userId), `⚠️ AutoBuy стоп: нет средств\nПопытка: ${pick.priceTon.toFixed(3)} TON`, { disable_web_page_preview: true });
+                      }
+                    } else {
+                      autoBuysDone++;
+                      await sendMessageSafe(userChatId(userId), `🔍 DRY: ${pick.priceTon.toFixed(3)} TON`, { disable_web_page_preview: true });
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e) { console.error(`[AUTOBUY] ошибка sub #${sub.num}:`, e?.message); }
         }
 
         // === ШАГ 3: Флор — тоже кэшируем по gift ===
@@ -2118,71 +2217,11 @@ async function tryAutoBuyFromFeed(userId, sub, feedCache = new Map()) {
   };
 }
 
-// Глобальный кэш feed для AutoBuy — TTL 2 секунды
-const autoBuyFeedCache = new Map(); // giftKey -> { time, items }
-const AUTO_BUY_FEED_CACHE_TTL = 2000;
-
+// AutoBuy теперь встроен в checkSubscriptionsForAllUsers — отдельного цикла нет!
+// Это исключает дублирование feed запросов
 async function autoBuyCycle() {
-  if (!AUTO_BUY_GLOBAL) return;
-  if (MODE !== 'real') return;
-  if (!MRKT_AUTH_RUNTIME) return;
-  if (isAutoBuying) return;
-
-  isAutoBuying = true;
-  try {
-    for (const [userId, user] of users.entries()) {
-      if (!user.enabled) continue;
-
-      const subs = Array.isArray(user.subscriptions) ? user.subscriptions : [];
-      const eligible = subs.filter((s) => s && s.enabled && s.autoBuyEnabled && s.maxAutoBuyTon != null);
-      if (!eligible.length) continue;
-
-      // Используем глобальный кэш чтобы не дублировать запросы между циклами
-      const feedCache = autoBuyFeedCache;
-
-      let buysDone = 0;
-      for (const sub of eligible) {
-        if (buysDone >= AUTO_BUY_MAX_BUYS_PER_USER_PER_CYCLE) break;
-
-        const r1 = await tryAutoBuyFromFeed(userId, sub, feedCache);
-
-        if (r1 && r1.noFunds) {
-          console.warn(`[AUTOBUY] Нет средств userId=${userId} sub=#${sub.num} price=${r1.priceTon} TON`);
-          for (const s2 of eligible) if (s2) s2.autoBuyEnabled = false;
-          scheduleSave();
-          await sendMessageSafe(userChatId(userId),
-            `⚠️ AutoBuy остановлен\nНедостаточно средств на балансе MRKT\nПопытка покупки: ${Number(r1.priceTon || 0).toFixed(3)} TON\nПополни баланс и включи AutoBuy снова`,
-            { disable_web_page_preview: true }
-          );
-          break;
-        }
-
-        if (r1 && r1.bought) {
-          buysDone++;
-          if (AUTO_BUY_DRY_RUN) {
-            await sendMessageSafe(userChatId(userId),
-              `🔍 AutoBuy DRY RUN\nНашёл: ${Number(r1.priceTon).toFixed(3)} TON\n${r1.lotId || ''}`,
-              { disable_web_page_preview: true }
-            );
-          } else {
-            let msg = `✅ AutoBuy OK\nЦена: ${Number(r1.priceTon).toFixed(3)} TON\n`;
-            if (r1.latencyMs != null) msg += `Latency: ${(r1.latencyMs/1000).toFixed(2)}s\n`;
-            if (r1.title) msg += `${r1.title}\n`;
-            msg += r1.urlTelegram || '';
-            await sendMessageSafe(userChatId(userId), msg, {
-              disable_web_page_preview: false,
-              reply_markup: mkReplyMarkupOpen(r1.urlMarket, 'MRKT'),
-            });
-          }
-          if (AUTO_BUY_DISABLE_AFTER_SUCCESS) { sub.autoBuyEnabled = false; scheduleSave(); }
-        }
-      }
-    }
-  } catch (e) {
-    console.error('[AUTOBUY] Ошибка цикла:', e?.message || e);
-  } finally {
-    isAutoBuying = false;
-  }
+  // AutoBuy теперь выполняется внутри checkSubscriptionsForAllUsers
+  // Этот цикл больше не делает отдельных запросов к MRKT
 }
 
 
@@ -4216,23 +4255,14 @@ app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
 
   // Запускаем интервалы ТОЛЬКО ПОСЛЕ загрузки Redis и state
   // Это критично — иначе первые циклы работают с пустым users Map
+  // Один цикл на всё — подписки + AutoBuy вместе (нет дублирования запросов)
   setInterval(() => {
     checkSubscriptionsForAllUsers().catch((e) => console.error('subs interval error:', e));
   }, SUBS_CHECK_INTERVAL_MS);
 
-  setInterval(() => {
-    autoBuyCycle().catch((e) => console.error('autobuy interval error:', e));
-  }, AUTO_BUY_CHECK_INTERVAL_MS);
-
-  // Первый запуск подписок через 5 секунд после старта
+  // Первый запуск через 5 секунд после старта
   setTimeout(() => {
-    console.log('[BOOT] Первый запуск checkSubscriptions...');
+    console.log('[BOOT] Первый запуск checkSubscriptions (+ AutoBuy)...');
     checkSubscriptionsForAllUsers({ manual: true }).catch((e) => console.error('subs boot error:', e));
   }, 5000);
-
-  // Первый запуск autoBuy через 8 секунд
-  setTimeout(() => {
-    console.log('[BOOT] Первый запуск autoBuyCycle...');
-    autoBuyCycle().catch((e) => console.error('autobuy boot error:', e));
-  }, 8000);
 })();
