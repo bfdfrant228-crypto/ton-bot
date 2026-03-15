@@ -37,9 +37,9 @@ let MRKT_AUTH_RUNTIME = (process.env.MRKT_AUTH || '').trim() || null;
 
 // throttling / RPS
 const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 12000);
-const MRKT_MIN_GAP_MS = Number(process.env.MRKT_MIN_GAP_MS || 2000);
+const MRKT_MIN_GAP_MS = Number(process.env.MRKT_MIN_GAP_MS || 600);
 const MRKT_429_DEFAULT_PAUSE_MS = Number(process.env.MRKT_429_DEFAULT_PAUSE_MS || 4500);
-const MRKT_HTTP_MAX_WAIT_MS = Number(process.env.MRKT_HTTP_MAX_WAIT_MS || 800);
+const MRKT_HTTP_MAX_WAIT_MS = Number(process.env.MRKT_HTTP_MAX_WAIT_MS || 2500);
 
 // sizes
 const MRKT_COUNT = Number(process.env.MRKT_COUNT || 12);
@@ -59,8 +59,8 @@ const GLOBAL_SCAN_CACHE_TTL_MS = Number(process.env.GLOBAL_SCAN_CACHE_TTL_MS || 
 // caches
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60_000);
 const OFFERS_CACHE_TTL_MS = Number(process.env.OFFERS_CACHE_TTL_MS || 25_000);
-const LOTS_CACHE_TTL_MS = Number(process.env.LOTS_CACHE_TTL_MS || 2000);
-const DETAILS_CACHE_TTL_MS = Number(process.env.DETAILS_CACHE_TTL_MS || 3500);
+const LOTS_CACHE_TTL_MS = Number(process.env.LOTS_CACHE_TTL_MS || 8000);
+const DETAILS_CACHE_TTL_MS = Number(process.env.DETAILS_CACHE_TTL_MS || 8000);
 const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 25_000);
 const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
@@ -2048,22 +2048,28 @@ body{margin:0;padding:0;color:var(--text);font-family:-apple-system,BlinkMacSyst
 .statusDot.red{background:var(--red)}
 
 /* Tabs */
-.tabs{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none;padding-bottom:0}
-.tabs::-webkit-scrollbar{display:none}
-.tabbtn{
-  flex-shrink:0;
-  padding:8px 14px;
-  font-size:13px;font-weight:500;
-  border:none;background:transparent;color:var(--muted2);
-  cursor:pointer;border-radius:10px 10px 0 0;
-  border-bottom:2px solid transparent;
-  transition:color .15s,border-color .15s;
+.bottomNav{
+  position:fixed;bottom:0;left:0;right:0;z-index:500;
+  background:rgba(13,17,23,0.95);
+  border-top:1px solid var(--border);
+  display:flex;align-items:stretch;
+  padding-bottom:env(safe-area-inset-bottom,0px);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
 }
-.tabbtn.active{color:var(--accent2);border-bottom-color:var(--accent)}
+.tabbtn{
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:2px;padding:8px 4px 10px;
+  border:none;background:transparent;color:var(--muted);
+  cursor:pointer;font-size:10px;font-weight:500;letter-spacing:.2px;
+  transition:color .15s;min-width:0;
+}
+.tabbtn .tabIcon{font-size:22px;line-height:1;transition:transform .15s,filter .15s;}
+.tabbtn.active{color:var(--accent2);}
+.tabbtn.active .tabIcon{transform:scale(1.1);filter:drop-shadow(0 0 6px var(--accent));}
 .tabbtn:hover:not(.active){color:var(--text)}
 
 /* Main content */
-.content{padding:12px 14px;max-width:720px;margin:0 auto}
+.content{padding:12px 14px 90px;max-width:720px;margin:0 auto}
 
 /* Cards */
 .card{
@@ -2136,11 +2142,13 @@ button:hover{background:rgba(255,255,255,.06)}
 
 /* Suggest dropdown */
 .sug{
-  position:absolute;top:calc(100% + 5px);left:0;right:0;
+  position:fixed;
   background:var(--card);border:1px solid var(--border2);
-  border-radius:14px;overflow:auto;max-height:360px;
-  z-index:999998;box-shadow:0 20px 60px rgba(0,0,0,.6);
+  border-radius:14px;overflow:auto;max-height:50vh;
+  z-index:99999;box-shadow:0 20px 60px rgba(0,0,0,.75);
   -webkit-overflow-scrolling:touch;
+  left:14px;right:14px;
+  width:auto;
 }
 .sugHead{
   display:flex;justify-content:space-between;align-items:center;
@@ -2323,8 +2331,13 @@ button:hover{background:rgba(255,255,255,.06)}
 .toggle input:checked + .toggleSlider:before{transform:translateX(17px)}
 
 /* Empty state */
-.emptyState{text-align:center;padding:40px 20px;color:var(--muted)}
-.emptyIcon{font-size:40px;margin-bottom:10px;opacity:.4}
+.emptyState{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:40px 20px;color:var(--muted);gap:8px}
+.emptyIcon{font-size:36px;opacity:.35;line-height:1}
+.emptyState div{font-size:13px;line-height:1.4}
+
+/* Sub preview image size fix */
+.subImg{width:52px;height:52px;border-radius:12px;object-fit:cover;background:rgba(255,255,255,.04);border:1px solid var(--border);flex-shrink:0}
+.subImgPlaceholder{width:52px;height:52px;border-radius:12px;background:linear-gradient(135deg,rgba(59,130,246,.1),rgba(139,92,246,.1));border:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;justify-content:center;color:var(--border2);font-size:22px}
 </style>
 </head>
 <body>
@@ -2335,12 +2348,6 @@ button:hover{background:rgba(255,255,255,.06)}
     <div style="display:flex;align-items:center;gap:8px">
       <div id="authDot" class="statusDot" title="MRKT Auth"></div>
     </div>
-  </div>
-  <div class="tabs">
-    <button class="tabbtn active" data-tab="market">Market</button>
-    <button class="tabbtn" data-tab="subs">Подписки</button>
-    <button class="tabbtn" data-tab="profile">Профиль</button>
-    <button class="tabbtn" data-tab="admin" id="adminTabBtn" style="display:none">Admin</button>
   </div>
 </div>
 
@@ -2451,6 +2458,13 @@ button:hover{background:rgba(255,255,255,.06)}
     </div>
   </div>
 </div>
+
+<nav class="bottomNav">
+  <button class="tabbtn active" data-tab="market"><span class="tabIcon">🛍</span>Market</button>
+  <button class="tabbtn" data-tab="subs"><span class="tabIcon">🔔</span>Подписки</button>
+  <button class="tabbtn" data-tab="profile"><span class="tabIcon">👤</span>Профиль</button>
+  <button class="tabbtn" data-tab="admin" id="adminTabBtn" style="display:none"><span class="tabIcon">⚙️</span>Admin</button>
+</nav>
 
 <!-- BOTTOM SHEET -->
 <div id="sheetOverlay" class="sheetOverlay">
@@ -2653,6 +2667,30 @@ const WEBAPP_JS = `(() => {
       ['giftField', 'modelField', 'backdropField'].forEach(id => el(id) && el(id).classList.remove('open'));
       if (el(fieldId)) el(fieldId).classList.add('open');
     }
+    function positionSug(sugId, fieldId) {
+      const sug = el(sugId);
+      const field = el(fieldId);
+      if (!sug || !field) return;
+      const rect = field.getBoundingClientRect();
+      const navH = 64;
+      const spaceBelow = window.innerHeight - rect.bottom - navH - 8;
+      const spaceAbove = rect.top - 56;
+      // Ширина по полю, но не выходить за экран
+      const left = Math.max(8, rect.left);
+      const right = Math.max(8, window.innerWidth - rect.right);
+      sug.style.left = left + 'px';
+      sug.style.right = right + 'px';
+      sug.style.width = 'auto';
+      if (spaceBelow >= 160 || spaceBelow >= spaceAbove) {
+        sug.style.top = (rect.bottom + 4) + 'px';
+        sug.style.bottom = 'auto';
+        sug.style.maxHeight = Math.max(140, Math.min(spaceBelow, window.innerHeight * 0.45)) + 'px';
+      } else {
+        sug.style.top = 'auto';
+        sug.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+        sug.style.maxHeight = Math.max(140, Math.min(spaceAbove, window.innerHeight * 0.45)) + 'px';
+      }
+    }
     function hideSug(id) {
       const b = el(id);
       if (!b) return;
@@ -2704,19 +2742,22 @@ const WEBAPP_JS = `(() => {
       const r = await api('/api/mrkt/collections?q=' + encodeURIComponent(q));
       const items = r.items || [];
       const mapLabel = r.mapLabel || {};
-      const rerender = () => renderSug('giftSug', 'Gift', items,
-        v => isSelectedNorm(sel.gifts, v),
-        v => {
-          const next = toggleIn(sel.gifts, v);
-          if (next.length !== 1) { sel.models = []; sel.backdrops = []; }
-          sel.gifts = next;
-          sel.giftLabels[v] = mapLabel[v] || v;
-          el('gift').value = giftsInputText();
-          el('model').value = listInputText(sel.models);
-          el('backdrop').value = listInputText(sel.backdrops);
-          rerender();
-        }
-      );
+      const rerender = () => {
+        renderSug('giftSug', 'Gift', items,
+          v => isSelectedNorm(sel.gifts, v),
+          v => {
+            const next = toggleIn(sel.gifts, v);
+            if (next.length !== 1) { sel.models = []; sel.backdrops = []; }
+            sel.gifts = next;
+            sel.giftLabels[v] = mapLabel[v] || v;
+            el('gift').value = giftsInputText();
+            el('model').value = listInputText(sel.models);
+            el('backdrop').value = listInputText(sel.backdrops);
+            rerender();
+          }
+        );
+        positionSug('giftSug', 'giftField');
+      };
       rerender();
     }
 
@@ -2730,14 +2771,17 @@ const WEBAPP_JS = `(() => {
       })();
       const r = await api('/api/mrkt/suggest?kind=model&gift=' + encodeURIComponent(gift) + '&q=' + encodeURIComponent(q));
       const items = r.items || [];
-      const rerender = () => renderSug('modelSug', 'Model', items,
-        v => isSelectedNorm(sel.models, v),
-        v => {
-          sel.models = toggleIn(sel.models, v);
-          el('model').value = listInputText(sel.models);
-          rerender();
-        }
-      );
+      const rerender = () => {
+        renderSug('modelSug', 'Model', items,
+          v => isSelectedNorm(sel.models, v),
+          v => {
+            sel.models = toggleIn(sel.models, v);
+            el('model').value = listInputText(sel.models);
+            rerender();
+          }
+        );
+        positionSug('modelSug', 'modelField');
+      };
       rerender();
     }
 
@@ -2751,14 +2795,17 @@ const WEBAPP_JS = `(() => {
       })();
       const r = await api('/api/mrkt/suggest?kind=backdrop&gift=' + encodeURIComponent(gift) + '&q=' + encodeURIComponent(q));
       const items = r.items || [];
-      const rerender = () => renderSug('backdropSug', 'Backdrop', items,
-        v => isSelectedNorm(sel.backdrops, v),
-        v => {
-          sel.backdrops = toggleIn(sel.backdrops, v);
-          el('backdrop').value = listInputText(sel.backdrops);
-          rerender();
-        }
-      );
+      const rerender = () => {
+        renderSug('backdropSug', 'Backdrop', items,
+          v => isSelectedNorm(sel.backdrops, v),
+          v => {
+            sel.backdrops = toggleIn(sel.backdrops, v);
+            el('backdrop').value = listInputText(sel.backdrops);
+            rerender();
+          }
+        );
+        positionSug('backdropSug', 'backdropField');
+      };
       rerender();
     }
 
@@ -3028,11 +3075,18 @@ const WEBAPP_JS = `(() => {
     }
 
     // Sheet
-    function openSheet() { el('sheetOverlay').classList.add('show'); }
+    let sheetIsOpen = false;
+    function openSheet() {
+      sheetIsOpen = true;
+      el('sheetOverlay').classList.add('show');
+    }
     function closeSheet() {
+      sheetIsOpen = false;
       el('sheetOverlay').classList.remove('show');
-      ['sheetTitle','sheetSub','sheetMeta','sheetBtns','sheetBody'].forEach(id => { if(el(id)) el(id).innerHTML = ''; });
-      if (el('sheetImg')) { el('sheetImg').style.display = 'none'; el('sheetImg').src = ''; }
+      setTimeout(() => {
+        ['sheetTitle','sheetSub','sheetMeta','sheetBtns','sheetBody'].forEach(id => { if(el(id)) el(id).innerHTML = ''; });
+        if (el('sheetImg')) { el('sheetImg').style.display = 'none'; el('sheetImg').src = ''; }
+      }, 220);
     }
     el('sheetClose').onclick = closeSheet;
     el('sheetOverlay').addEventListener('click', e => { if (e.target === el('sheetOverlay')) closeSheet(); });
@@ -3040,14 +3094,14 @@ const WEBAPP_JS = `(() => {
     function renderSalesList(r) {
       const sales = r.sales || [];
       if (!sales.length) {
-        el('sheetBody').innerHTML = '<div class="emptyState" style="padding:20px 0"><div>Нет данных о продажах</div></div>';
+        el('sheetBody').innerHTML = '<div class="emptyState" style="padding:20px 0"><div class="emptyIcon">📭</div><div>Нет данных о продажах</div></div>';
         return;
       }
-      el('sheetBody').innerHTML = sales.map(s => {
+      const rows = sales.map((s, idx) => {
         const imgHtml = s.imgUrl
           ? '<img class="saleThumb" src="' + s.imgUrl + '" referrerpolicy="no-referrer" loading="lazy"/>'
-          : '<div class="saleThumb" style="display:flex;align-items:center;justify-content:center;color:var(--border2)">◻</div>';
-        return '<div class="saleRow">' +
+          : '<div class="saleThumb" style="background:rgba(255,255,255,.04)"></div>';
+        return '<div class="saleRow" data-idx="' + idx + '">' +
           imgHtml +
           '<div style="flex:1;min-width:0">' +
             '<div style="font-weight:700;font-size:14px">' + Number(s.priceTon).toFixed(3) + ' TON</div>' +
@@ -3055,12 +3109,19 @@ const WEBAPP_JS = `(() => {
             '<div style="font-size:12px;color:var(--muted2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (s.title || '') + '</div>' +
             (s.model || s.backdrop ? '<div style="font-size:11px;color:var(--muted)">' + [s.model, s.backdrop].filter(Boolean).join(' · ') + '</div>' : '') +
           '</div>' +
-          '<div style="display:flex;gap:5px;flex-shrink:0">' +
-            (s.urlMarket ? '<a class="linkBtn" href="' + s.urlMarket + '" target="_blank">MRKT</a>' : '') +
-            (s.urlTelegram ? '<a class="linkBtn" href="' + s.urlTelegram + '" target="_blank">NFT</a>' : '') +
+          '<div style="display:flex;flex-direction:column;gap:4px;flex-shrink:0">' +
+            (s.urlMarket ? '<button class="linkBtn sale-mrkt-btn" data-url="' + s.urlMarket + '">MRKT</button>' : '') +
+            (s.urlTelegram ? '<button class="linkBtn sale-tg-btn" data-url="' + s.urlTelegram + '">NFT</button>' : '') +
           '</div>' +
         '</div>';
       }).join('');
+      el('sheetBody').innerHTML = rows;
+      el('sheetBody').querySelectorAll('.sale-tg-btn').forEach(btn => {
+        btn.onclick = () => openTg(btn.getAttribute('data-url'));
+      });
+      el('sheetBody').querySelectorAll('.sale-mrkt-btn').forEach(btn => {
+        btn.onclick = () => openTg(btn.getAttribute('data-url'));
+      });
     }
 
     async function openLotSheet(lot) {
@@ -3120,7 +3181,7 @@ const WEBAPP_JS = `(() => {
         '<button class="btn-sm" id="sBtn_hist">История продаж</button>';
 
       el('sBtn_tg').onclick = () => openTg(lot.urlTelegram || 'https://t.me/mrkt');
-      el('sBtn_mrkt').onclick = () => window.open(lot.urlMarket || 'https://t.me/mrkt', '_blank');
+      el('sBtn_mrkt').onclick = () => openTg(lot.urlMarket || 'https://t.me/mrkt');
       el('sBtn_apply').onclick = async () => {
         sel.gifts = lot.collectionName ? [lot.collectionName] : [];
         sel.giftLabels = lot.collectionName ? { [lot.collectionName]: lot.collectionName } : {};
@@ -3165,17 +3226,20 @@ const WEBAPP_JS = `(() => {
       el('sheetSub').textContent = 'По текущим фильтрам';
       el('sheetImg').style.display = 'none';
       el('sheetMeta').innerHTML = '';
-      el('sheetBtns').innerHTML = '';
-      el('sheetBody').innerHTML = '<div class="loaderLine" style="display:flex"><div class="spinner"></div><div>Загрузка...</div></div>';
+      el('sheetBtns').innerHTML = '<button class="btn-sm" id="salesCloseBtn">Закрыть</button>';
+      el('sheetBody').innerHTML = '<div class="loaderLine" style="display:flex"><div class="spinner"></div><div>Загрузка истории продаж...</div></div>';
+      const closeBtn = el('salesCloseBtn');
+      if (closeBtn) closeBtn.onclick = closeSheet;
       try {
         const r = await api('/api/mrkt/sales_by_filters?force=1');
         if (r.approxPriceTon != null) {
           el('sheetSub').textContent = 'Медиана: ' + Number(r.approxPriceTon).toFixed(3) + ' TON';
+        } else {
+          el('sheetSub').textContent = 'По текущим фильтрам';
         }
         renderSalesList(r);
-        scheduleRetryIfWait(r, openSalesByFilters);
       } catch (e) {
-        el('sheetBody').innerHTML = '<div style="color:var(--red);font-size:13px">' + (e.message || String(e)) + '</div>';
+        el('sheetBody').innerHTML = '<div style="color:var(--red);font-size:13px">Ошибка: ' + (e.message || String(e)) + '</div>';
       }
     }
 
@@ -3192,7 +3256,7 @@ const WEBAPP_JS = `(() => {
       await patchFilters(); await refreshSummary(true); await refreshLots(true);
     });
     el('refresh').onclick = wrap('lots', async () => { await refreshSummary(true); await refreshLots(true); });
-    el('salesByFilters').onclick = async () => { hideErr(); await openSalesByFilters(); };
+    el('salesByFilters').onclick = async (e) => { e.stopPropagation(); hideErr(); await openSalesByFilters(); };
 
     let subCreateBusy = false;
     el('subCreate').onclick = wrap('subs', async () => {
