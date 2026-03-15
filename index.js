@@ -37,7 +37,8 @@ let MRKT_AUTH_RUNTIME = (process.env.MRKT_AUTH || '').trim() || null;
 
 // throttling / RPS
 const MRKT_TIMEOUT_MS = Number(process.env.MRKT_TIMEOUT_MS || 12000);
-const MRKT_MIN_GAP_MS = Number(process.env.MRKT_MIN_GAP_MS || 600);
+// Если в Railway выставлено слишком большое значение — ограничиваем до 800ms
+const MRKT_MIN_GAP_MS = Math.min(Number(process.env.MRKT_MIN_GAP_MS || 400), 800);
 const MRKT_429_DEFAULT_PAUSE_MS = Number(process.env.MRKT_429_DEFAULT_PAUSE_MS || 4500);
 const MRKT_HTTP_MAX_WAIT_MS = Number(process.env.MRKT_HTTP_MAX_WAIT_MS || 2500);
 
@@ -1475,11 +1476,19 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
     cursor: '',
     count: MRKT_FEED_COUNT,
     ordering: 'Latest',
-    types: [],
+    types: ['listing', 'change_price', 'sale'],
   });
 
-  if (!r.ok) return 0;
-  if (!r.items.length) return 0;
+  console.log(`[FEED] Sub #${sub.num} userId=${userId}: feedFetch ok=${r.ok} items=${r.items?.length} reason=${r.reason||''}`);
+
+  if (!r.ok) {
+    console.error(`[FEED] Sub #${sub.num}: ошибка feedFetch reason=${r.reason}`);
+    return 0;
+  }
+  if (!r.items.length) {
+    console.log(`[FEED] Sub #${sub.num}: нет событий в фиде`);
+    return 0;
+  }
 
   const latestId = r.items[0]?.id || null;
   if (!latestId) return 0;
@@ -1564,10 +1573,25 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
       const active = subs.filter((s) => s && s.enabled);
       if (!active.length) continue;
 
+      console.log(`[SUBS] userId=${userId}: активных подписок=${active.length}`);
+
       for (const sub of active) {
         processedSubs++;
+        console.log(`[SUBS] Обрабатываем sub #${sub.num} id=${sub.id} gifts=${JSON.stringify(sub.filters?.gifts)}`);
 
-        // Флор уведомления — без жёсткого глобального лимита
+        // Feed уведомления — идут ПЕРВЫМИ (быстрее чем поиск лотов)
+        if (feedBudget > 0) {
+          const stateKeyFeed = `${userId}:${sub.id}:feed`;
+          try {
+            const sent = await processFeedForSub(userId, sub, stateKeyFeed, feedBudget);
+            feedBudget -= sent;
+            feedNotifs += sent;
+          } catch (e) {
+            console.error(`[SUBS] Ошибка feed sub #${sub.num} userId=${userId}:`, e?.message || e);
+          }
+        }
+
+        // Флор уведомления — только если feed не нашёл ничего нового
         const sf = normalizeFilters(sub.filters || {});
         if (sf.gifts.length) {
           const stateKeyFloor = `${userId}:${sub.id}:floor`;
@@ -1581,6 +1605,7 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
 
           try {
             const r = await mrktSearchLotsByFilters(sf, 1, { ordering: 'Price', lowToHigh: true, count: MRKT_COUNT });
+            console.log(`[SUBS FLOOR] sub #${sub.num}: ok=${r.ok} lots=${r.gifts?.length} prevFloor=${prev.floor}`);
             if (r.ok) {
               const lot = r.gifts?.length ? r.gifts[0] : null;
               const newFloor = lot ? lot.priceTon : null;
@@ -1589,18 +1614,19 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
 
               if (newFloor == null) {
                 emptyStreak++;
-                if (emptyStreak >= SUBS_EMPTY_CONFIRM) {
-                  subStates.set(stateKeyFloor, { ...prev, emptyStreak, floor: null });
-                } else {
-                  subStates.set(stateKeyFloor, { ...prev, emptyStreak });
-                }
+                const newSt = { ...prev, emptyStreak, floor: emptyStreak >= SUBS_EMPTY_CONFIRM ? null : prev.floor };
+                subStates.set(stateKeyFloor, newSt);
+                if (redis) redisSet(`sub:floor:${stateKeyFloor}`, JSON.stringify(newSt), { EX: 86400 * 7 }).catch(() => {});
               } else {
                 emptyStreak = 0;
                 const prevFloor = prev.floor;
                 const maxNotify = sub.maxNotifyTon != null ? Number(sub.maxNotifyTon) : null;
                 const canNotify = (maxNotify == null || newFloor <= maxNotify);
 
+                console.log(`[SUBS FLOOR] sub #${sub.num}: newFloor=${newFloor} prevFloor=${prevFloor} canNotify=${canNotify} maxNotify=${maxNotify}`);
+
                 if (canNotify && (prevFloor == null || Math.abs(Number(prevFloor) - Number(newFloor)) > 0.0001)) {
+                  console.log(`[SUBS FLOOR] Отправляем флор уведомление userId=${userId} sub #${sub.num} floor=${newFloor}`);
                   await notifyFloorToUser(userId, sub, lot, newFloor);
                   floorNotifs++;
                 }
@@ -1614,25 +1640,10 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
             console.error(`[SUBS] Ошибка флора sub #${sub.num} userId=${userId}:`, e?.message || e);
           }
         }
-
-        // Feed уведомления
-        if (feedBudget > 0) {
-          const stateKeyFeed = `${userId}:${sub.id}:feed`;
-          try {
-            const sent = await processFeedForSub(userId, sub, stateKeyFeed, feedBudget);
-            feedBudget -= sent;
-            feedNotifs += sent;
-          } catch (e) {
-            console.error(`[SUBS] Ошибка feed sub #${sub.num} userId=${userId}:`, e?.message || e);
-          }
-        }
       }
     }
 
-    if (processedSubs > 0) {
-      console.log(`[SUBS] Проверено: ${processedSubs} подписок, флор: ${floorNotifs}, feed: ${feedNotifs}`);
-    }
-
+    console.log(`[SUBS] Итого: processedSubs=${processedSubs} floorNotifs=${floorNotifs} feedNotifs=${feedNotifs}`);
     return { processedSubs, floorNotifs, feedNotifs };
   } catch (e) {
     console.error('subs error:', e);
@@ -1699,7 +1710,13 @@ async function tryAutoBuyFromFeed(userId, sub) {
   const backdrops = f.gifts.length === 1 ? (f.backdrops || []) : [];
 
   const stateKey = `${userId}:${sub.id}:autobuy`;
-  const st = subStates.get(stateKey) || { autoBuyLastId: null };
+  let st = subStates.get(stateKey);
+  if (!st) {
+    const saved = await redisGet(`sub:autobuy:${stateKey}`).catch(() => null);
+    if (saved) { try { st = JSON.parse(saved); } catch { st = { autoBuyLastId: null }; } }
+    else { st = { autoBuyLastId: null }; }
+    subStates.set(stateKey, st);
+  }
 
   const r = await mrktFeedFetch({
     collectionNames: f.gifts,
@@ -1721,7 +1738,9 @@ async function tryAutoBuyFromFeed(userId, sub) {
 
   // ИСПРАВЛЕНИЕ: при первом запуске в режиме "Новые" — запоминаем позицию
   if (latestId && !st.autoBuyLastId && !sub.autoBuyAny) {
-    subStates.set(stateKey, { ...st, autoBuyLastId: latestId });
+    const newSt = { ...st, autoBuyLastId: latestId };
+    subStates.set(stateKey, newSt);
+    if (redis) redisSet(`sub:autobuy:${stateKey}`, JSON.stringify(newSt), { EX: 86400 * 7 }).catch(() => {});
     console.log(`[AUTOBUY] Sub #${sub.num} userId=${userId}: первый запуск (Новые), запомнили lastId=${latestId}`);
     return { ok: true, bought: false };
   }
@@ -1747,7 +1766,11 @@ async function tryAutoBuyFromFeed(userId, sub) {
     candidates.push({ it, g, priceNano, priceTon });
   }
 
-  if (latestId) subStates.set(stateKey, { ...st, autoBuyLastId: latestId });
+  if (latestId) {
+    const newSt = { ...st, autoBuyLastId: latestId };
+    subStates.set(stateKey, newSt);
+    if (redis) redisSet(`sub:autobuy:${stateKey}`, JSON.stringify(newSt), { EX: 86400 * 7 }).catch(() => {});
+  }
   if (!candidates.length) return { ok: true, bought: false };
 
   candidates.sort((a, b) => a.priceTon - b.priceTon);
