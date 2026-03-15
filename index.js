@@ -1559,6 +1559,13 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
   }
   if (isSubsChecking && !manual) return { processedSubs: 0, floorNotifs: 0, feedNotifs: 0 };
 
+  // Диагностика — видим что происходит в каждом цикле
+  const totalUsers = users.size;
+  const totalSubs = Array.from(users.values()).reduce((acc, u) => acc + (u.subscriptions?.length || 0), 0);
+  const totalActive = Array.from(users.values()).reduce((acc, u) =>
+    acc + (u.subscriptions || []).filter(s => s && s.enabled).length, 0);
+  console.log(`[SUBS CYCLE] users=${totalUsers} totalSubs=${totalSubs} activeSubs=${totalActive} auth=${!!MRKT_AUTH_RUNTIME}`);
+
   isSubsChecking = true;
   try {
     let processedSubs = 0;
@@ -3988,17 +3995,9 @@ if (PUBLIC_URL) {
   console.log('Polling started (PUBLIC_URL not set)');
 }
 
-// ===================== start server + intervals =====================
+// ===================== start server =====================
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
-
-setInterval(() => {
-  checkSubscriptionsForAllUsers().catch((e) => console.error('subs interval error:', e));
-}, SUBS_CHECK_INTERVAL_MS);
-
-setInterval(() => {
-  autoBuyCycle().catch((e) => console.error('autobuy interval error:', e));
-}, AUTO_BUY_CHECK_INTERVAL_MS);
 
 (async () => {
   if (REDIS_URL) {
@@ -4037,4 +4036,27 @@ setInterval(() => {
   }
 
   console.log('Bot ready. MODE=' + MODE + ' AUTO_BUY_GLOBAL=' + AUTO_BUY_GLOBAL + ' AUTO_BUY_DRY_RUN=' + AUTO_BUY_DRY_RUN);
+  console.log('Users loaded:', users.size, '| Subs total:', Array.from(users.values()).reduce((a,u)=>a+(u.subscriptions?.length||0),0));
+
+  // Запускаем интервалы ТОЛЬКО ПОСЛЕ загрузки Redis и state
+  // Это критично — иначе первые циклы работают с пустым users Map
+  setInterval(() => {
+    checkSubscriptionsForAllUsers().catch((e) => console.error('subs interval error:', e));
+  }, SUBS_CHECK_INTERVAL_MS);
+
+  setInterval(() => {
+    autoBuyCycle().catch((e) => console.error('autobuy interval error:', e));
+  }, AUTO_BUY_CHECK_INTERVAL_MS);
+
+  // Первый запуск подписок через 5 секунд после старта
+  setTimeout(() => {
+    console.log('[BOOT] Первый запуск checkSubscriptions...');
+    checkSubscriptionsForAllUsers({ manual: true }).catch((e) => console.error('subs boot error:', e));
+  }, 5000);
+
+  // Первый запуск autoBuy через 8 секунд
+  setTimeout(() => {
+    console.log('[BOOT] Первый запуск autoBuyCycle...');
+    autoBuyCycle().catch((e) => console.error('autobuy boot error:', e));
+  }, 8000);
 })();
