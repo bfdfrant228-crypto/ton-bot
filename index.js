@@ -66,7 +66,7 @@ const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 25_000);
 const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
 // subs
-const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 15000);
+const SUBS_CHECK_INTERVAL_MS = Number(process.env.SUBS_CHECK_INTERVAL_MS || 30000);
 const SUBS_MAX_NOTIFICATIONS_PER_CYCLE = Number(process.env.SUBS_MAX_NOTIFICATIONS_PER_CYCLE || 20);
 const SUBS_EMPTY_CONFIRM = Number(process.env.SUBS_EMPTY_CONFIRM || 2);
 const SUBS_FEED_TYPES_RAW = String(process.env.SUBS_FEED_TYPES || 'sale,listing,change_price');
@@ -74,6 +74,8 @@ const SUBS_FEED_TYPES = new Set(
   SUBS_FEED_TYPES_RAW.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
 );
 const SUBS_FEED_MAX_EVENTS_PER_CYCLE = Number(process.env.SUBS_FEED_MAX_EVENTS_PER_CYCLE || 20);
+// пауза между подписками чтобы не получать 429
+const SUBS_BETWEEN_PAUSE_MS = Number(process.env.SUBS_BETWEEN_PAUSE_MS || 3000);
 
 // Telegram notifications
 const SUBS_SEND_PHOTO = String(process.env.SUBS_SEND_PHOTO || '0') === '1';
@@ -1469,13 +1471,12 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
     subStates.set(stateKey, st);
   }
 
-  const r = await mrktFeedFetch({
+  const r = await mrktFeedFetchBackground({
     collectionNames: f.gifts,
     modelNames: models,
     backdropNames: backdrops,
     cursor: '',
-    count: MRKT_FEED_COUNT,
-    ordering: 'Latest',
+    count: 50,
     types: ['listing', 'change_price', 'sale'],
   });
 
@@ -1552,6 +1553,104 @@ async function processFeedForSub(userId, sub, stateKey, budget) {
   return sent;
 }
 
+// Отдельная функция для запросов в фоне (подписки/autobuy)
+// НЕ использует mrktRunExclusive — работает параллельно с веб-запросами
+// но с большими паузами чтобы не получать 429
+async function mrktPostJsonBackground(path, bodyObj) {
+  if (!MRKT_AUTH_RUNTIME) return { ok: false, status: 401, data: null, text: 'NO_AUTH' };
+
+  // Ждём если MRKT поставил паузу
+  const now = nowMs();
+  const pauseMs = (mrktState.pauseUntil && now < mrktState.pauseUntil) ? (mrktState.pauseUntil - now) : 0;
+  if (pauseMs > 0) {
+    if (pauseMs > 15000) return { ok: false, status: 429, data: null, text: 'RPS_WAIT', waitMs: pauseMs };
+    await sleep(pauseMs);
+  }
+
+  const reqVal = makeReq();
+  const body = { ...(bodyObj || {}), req: reqVal };
+  const url = `${MRKT_API_URL}${path}?req=${encodeURIComponent(reqVal)}`;
+
+  const res = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: mrktHeadersJson(),
+    body: JSON.stringify(body),
+  }, MRKT_TIMEOUT_MS).catch(() => null);
+
+  if (!res) return { ok: false, status: 0, data: null, text: 'FETCH_ERROR' };
+
+  const txt = await res.text().catch(() => '');
+  let data = null;
+  try { data = txt ? JSON.parse(txt) : null; } catch {}
+
+  if (!res.ok) {
+    if (res.status === 429 || bodyLooksLikeRpsLimit(txt)) {
+      setPauseFrom429(res);
+      const waitMs = mrktState.pauseUntil - nowMs();
+      console.log(`[BG] 429 на ${path}, пауза ${Math.round(waitMs/1000)}s`);
+      return { ok: false, status: 429, data, text: txt, waitMs };
+    }
+    if (res.status === 401 || res.status === 403) {
+      await tryRefreshMrktToken(`BG_${res.status}`, { force: false });
+    }
+    return { ok: false, status: res.status, data, text: txt };
+  }
+
+  markMrktOk();
+  return { ok: true, status: res.status, data, text: txt };
+}
+
+async function mrktFeedFetchBackground({ collectionNames = [], modelNames = [], backdropNames = [], cursor = '', count = 30, types = [] }) {
+  const body = {
+    count: Number(count),
+    cursor: cursor || '',
+    collectionNames: Array.isArray(collectionNames) ? collectionNames : [],
+    modelNames: Array.isArray(modelNames) ? modelNames : [],
+    backdropNames: Array.isArray(backdropNames) ? backdropNames : [],
+    lowToHigh: false,
+    maxPrice: null,
+    minPrice: null,
+    number: null,
+    ordering: 'Latest',
+    query: null,
+    type: Array.isArray(types) ? types : [],
+    types: Array.isArray(types) ? types : [],
+  };
+
+  const r = await mrktPostJsonBackground('/feed', body);
+  if (!r.ok) {
+    return { ok: false, reason: r.status === 429 ? 'RPS_WAIT' : 'FEED_ERROR', waitMs: r.waitMs || 0, items: [], cursor: '' };
+  }
+
+  const items = Array.isArray(r.data?.items) ? r.data.items : [];
+  const nextCursor = r.data?.cursor || r.data?.nextCursor || '';
+  return { ok: true, reason: 'OK', items, cursor: nextCursor };
+}
+
+async function mrktSearchLotsBackground(collectionNames, modelNames, backdropNames, count = 10) {
+  const body = {
+    count: Number(count),
+    cursor: '',
+    collectionNames: Array.isArray(collectionNames) ? collectionNames : [],
+    modelNames: Array.isArray(modelNames) ? modelNames : [],
+    backdropNames: Array.isArray(backdropNames) ? backdropNames : [],
+    symbolNames: [],
+    ordering: 'Price',
+    lowToHigh: true,
+    maxPrice: null,
+    minPrice: null,
+    number: null,
+    query: null,
+    promotedFirst: false,
+  };
+
+  const r = await mrktPostJsonBackground('/gifts/saling', body);
+  if (!r.ok) return { ok: false, reason: r.status === 429 ? 'RPS_WAIT' : 'ERROR', waitMs: r.waitMs || 0, gifts: [] };
+
+  const gifts = Array.isArray(r.data?.gifts) ? r.data.gifts : [];
+  return { ok: true, gifts };
+}
+
 async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
   if (MODE !== 'real') {
     console.log('[SUBS] Пропуск: MODE=', MODE, '(нужно real)');
@@ -1586,6 +1685,11 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
         processedSubs++;
         console.log(`[SUBS] Обрабатываем sub #${sub.num} id=${sub.id} gifts=${JSON.stringify(sub.filters?.gifts)}`);
 
+        // Пауза между подписками — главная защита от 429
+        if (processedSubs > 1) {
+          await sleep(SUBS_BETWEEN_PAUSE_MS);
+        }
+
         // Feed уведомления — идут ПЕРВЫМИ (быстрее чем поиск лотов)
         if (feedBudget > 0) {
           const stateKeyFeed = `${userId}:${sub.id}:feed`;
@@ -1597,6 +1701,9 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
             console.error(`[SUBS] Ошибка feed sub #${sub.num} userId=${userId}:`, e?.message || e);
           }
         }
+
+        // Пауза между feed и floor запросами
+        await sleep(1500);
 
         // Флор уведомления — только если feed не нашёл ничего нового
         const sf = normalizeFilters(sub.filters || {});
@@ -1611,7 +1718,16 @@ async function checkSubscriptionsForAllUsers({ manual = false } = {}) {
           }
 
           try {
-            const r = await mrktSearchLotsByFilters(sf, 1, { ordering: 'Price', lowToHigh: true, count: MRKT_COUNT });
+            const rLots = await mrktSearchLotsBackground(
+              sf.gifts,
+              sf.gifts.length === 1 ? (sf.models || []) : [],
+              sf.gifts.length === 1 ? (sf.backdrops || []) : [],
+              5
+            );
+            const r = {
+              ok: rLots.ok,
+              gifts: rLots.ok ? rLots.gifts.map(g => salingGiftToLot(g)).filter(Boolean).sort((a,b) => a.priceTon - b.priceTon) : []
+            };
             console.log(`[SUBS FLOOR] sub #${sub.num}: ok=${r.ok} lots=${r.gifts?.length} prevFloor=${prev.floor}`);
             if (r.ok) {
               const lot = r.gifts?.length ? r.gifts[0] : null;
@@ -1725,13 +1841,12 @@ async function tryAutoBuyFromFeed(userId, sub) {
     subStates.set(stateKey, st);
   }
 
-  const r = await mrktFeedFetch({
+  const r = await mrktFeedFetchBackground({
     collectionNames: f.gifts,
     modelNames: models,
     backdropNames: backdrops,
     cursor: '',
     count: 50,
-    ordering: 'Latest',
     types: ['listing', 'change_price'],
   });
 
@@ -1925,11 +2040,16 @@ async function autoBuyCycle() {
         const sf = normalizeFilters(sub.filters || {});
         if (!sf.gifts.length) continue;
 
-        const r = await mrktSearchLotsByFilters(sf, 2, {
-          ordering: 'Price',
-          lowToHigh: true,
-          count: Math.max(MRKT_COUNT, 20),
-        });
+        const rBg = await mrktSearchLotsBackground(
+          sf.gifts,
+          sf.gifts.length === 1 ? (sf.models || []) : [],
+          sf.gifts.length === 1 ? (sf.backdrops || []) : [],
+          20
+        );
+        const r = {
+          ok: rBg.ok,
+          gifts: rBg.ok ? rBg.gifts.map(g => salingGiftToLot(g)).filter(Boolean).sort((a,b) => a.priceTon - b.priceTon) : []
+        };
 
         if (!r.ok || !r.gifts?.length) continue;
 
