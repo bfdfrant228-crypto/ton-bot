@@ -668,26 +668,6 @@ async function notifyAdminAuthOk(tokenMask) {
 // ===================== Авто-refresh токена каждые 2 часа =====================
 let autoRefreshRunning = false;
 
-async function autoRefreshToken() {
-  if (autoRefreshRunning) return;
-  autoRefreshRunning = true;
-  try {
-    console.log('[AUTO REFRESH] Запускаем авто-обновление токена...');
-    const r = await tryRefreshMrktToken('auto_2h', { force: true });
-    if (r.ok) {
-      console.log('[AUTO REFRESH] Токен обновлён:', maskToken(MRKT_AUTH_RUNTIME));
-      await notifyAdminAuthOk(maskToken(MRKT_AUTH_RUNTIME));
-    } else {
-      console.error('[AUTO REFRESH] Ошибка:', r.reason);
-      await notifyAdminAuthError(r.reason);
-    }
-  } catch (e) {
-    console.error('[AUTO REFRESH] Исключение:', e?.message);
-  } finally {
-    autoRefreshRunning = false;
-  }
-}
-
 async function ensureMrktAuth() {
   if (MRKT_AUTH_RUNTIME) return true;
   const r = await tryRefreshMrktToken('NO_AUTH', { force: false });
@@ -710,26 +690,24 @@ async function tryAutoSaveInitDataAsSession(initData) {
 
 // Проактивный авторефреш токена каждые 2 часа
 async function autoRefreshToken() {
-  console.log('[AUTO REFRESH] Проактивное обновление токена...');
-  const r = await tryRefreshMrktToken('auto_proactive', { force: true });
-  if (r.ok) {
-    console.log('[AUTO REFRESH] Токен успешно обновлён:', maskToken(MRKT_AUTH_RUNTIME));
-    // Уведомляем только админа
-    if (ADMIN_USER_ID) {
-      sendMessageSafe(ADMIN_USER_ID,
-        `🔑 Токен MRKT обновлён автоматически\n${maskToken(MRKT_AUTH_RUNTIME)}`
-      ).catch(() => {});
+  if (autoRefreshRunning) return;
+  autoRefreshRunning = true;
+  try {
+    console.log('[AUTO REFRESH] Обновляем токен...');
+    const r = await tryRefreshMrktToken('auto_2h', { force: true });
+    if (r.ok) {
+      console.log('[AUTO REFRESH] Токен обновлён:', maskToken(MRKT_AUTH_RUNTIME));
+      lastAuthNotifyAt = 0;
+      await notifyAdminAuthOk(maskToken(MRKT_AUTH_RUNTIME));
+    } else {
+      console.error('[AUTO REFRESH] Ошибка:', r.reason);
+      await notifyAdminAuthError(r.reason);
     }
-  } else {
-    console.error('[AUTO REFRESH] Не удалось обновить токен:', r.reason);
-    // Уведомляем только админа об ошибке
-    if (ADMIN_USER_ID) {
-      sendMessageSafe(ADMIN_USER_ID,
-        `⚠️ Не удалось автоматически обновить токен MRKT\nПричина: ${r.reason}\n\nОткрой WebApp чтобы обновить сессию`
-      ).catch(() => {});
-    }
+  } catch (e) {
+    console.error('[AUTO REFRESH] Исключение:', e?.message);
+  } finally {
+    autoRefreshRunning = false;
   }
-  return r;
 }
 
 // ===================== MRKT queue + gate =====================
@@ -4498,11 +4476,7 @@ async function notifyAdmin(text) {
   }
 }
 
-// ===================== Auto token refresh =====================
-const REDIS_KEY_TOKEN_REFRESHED_AT = 'mrkt:token:refreshed_at';
-
-async function autoRefreshToken() {
-  console.log('[AUTO REFRESH] Проверяем нужно ли обновить токен...');
+async function _removedDuplicate2() {
   try {
     // Проверяем когда последний раз обновляли
     const lastRefreshedRaw = await redisGet(REDIS_KEY_TOKEN_REFRESHED_AT).catch(() => null);
@@ -4534,7 +4508,6 @@ async function autoRefreshToken() {
   }
 }
 
-// Автосохранение initData из WebApp для обновления сессии
 // ===================== start server =====================
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
