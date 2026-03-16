@@ -61,7 +61,7 @@ const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60_000);
 const OFFERS_CACHE_TTL_MS = Number(process.env.OFFERS_CACHE_TTL_MS || 25_000);
 const LOTS_CACHE_TTL_MS = Number(process.env.LOTS_CACHE_TTL_MS || 30000);
 const DETAILS_CACHE_TTL_MS = Number(process.env.DETAILS_CACHE_TTL_MS || 30000);
-const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 25_000);
+const SALES_CACHE_TTL_MS = Number(process.env.SALES_CACHE_TTL_MS || 120_000);
 const SUMMARY_CACHE_TTL_MS = Number(process.env.SUMMARY_CACHE_TTL_MS || 5000);
 
 // subs — максимум 3 секунды для максимальной скорости
@@ -92,8 +92,8 @@ const AUTO_BUY_DISABLE_AFTER_SUCCESS = String(process.env.AUTO_BUY_DISABLE_AFTER
 const SALES_HISTORY_TARGET = Number(process.env.SALES_HISTORY_TARGET || 18);
 const SALES_HISTORY_MAX_PAGES = Number(process.env.SALES_HISTORY_MAX_PAGES || 12);
 const SALES_HISTORY_COUNT_PER_PAGE = Number(process.env.SALES_HISTORY_COUNT_PER_PAGE || 50);
-const SALES_HISTORY_THROTTLE_MS = Number(process.env.SALES_HISTORY_THROTTLE_MS || 200);
-const SALES_HISTORY_TIME_BUDGET_MS = Number(process.env.SALES_HISTORY_TIME_BUDGET_MS || 9000);
+const SALES_HISTORY_THROTTLE_MS = Number(process.env.SALES_HISTORY_THROTTLE_MS || 0);
+const SALES_HISTORY_TIME_BUDGET_MS = Number(process.env.SALES_HISTORY_TIME_BUDGET_MS || 15000);
 
 // MRKT auth refresh
 const MRKT_AUTH_REFRESH_COOLDOWN_MS = Number(process.env.MRKT_AUTH_REFRESH_COOLDOWN_MS || 8000);
@@ -1277,92 +1277,98 @@ async function mrktFeedSales({ gift, modelNames = [], backdropNames = [] }) {
   const cached = salesCache.get(key);
   if (cached && now - cached.time < SALES_CACHE_TTL_MS) return { ...cached.data, cached: true };
 
+  // Быстрый путь — возвращаем кэш пока грузим новый
+  if (cached && now - cached.time < SALES_CACHE_TTL_MS * 3) {
+    // Обновляем в фоне
+    mrktFeedSales._refreshInBackground(key, gift, modelNames, backdropNames).catch(() => {});
+    return { ...cached.data, cached: true, refreshing: true };
+  }
+
   const data = await (async () => {
     if (!gift) return { ok: true, approxPriceTon: null, sales: [], note: 'Выбери 1 gift', waitMs: 0 };
 
     const started = nowMs();
-    let cursor = '';
-    let pages = 0;
     const sales = [];
     const prices = [];
 
-    while (pages < SALES_HISTORY_MAX_PAGES && sales.length < SALES_HISTORY_TARGET) {
+    // Первая страница сразу
+    const r0 = await mrktFeedFetch({
+      collectionNames: [gift],
+      modelNames: Array.isArray(modelNames) ? modelNames : [],
+      backdropNames: Array.isArray(backdropNames) ? backdropNames : [],
+      cursor: '',
+      count: SALES_HISTORY_COUNT_PER_PAGE,
+      ordering: 'Latest',
+      types: [],
+    });
+
+    if (!r0.ok) {
+      if (cached) return { ...cached.data, note: 'RPS limit', waitMs: r0.waitMs || 1000 };
+      return { ok: true, approxPriceTon: null, sales: [], note: 'Ошибка загрузки', waitMs: 0 };
+    }
+
+    const processFeedItems = (items) => {
+      for (const it of items) {
+        const type = String(it?.type || '').toLowerCase();
+        if (type !== 'sale') continue;
+        const g = it?.gift;
+        if (!g) continue;
+        const amountNano = it.amount ?? g.salePriceWithoutFee ?? g.salePrice ?? null;
+        const ton = amountNano != null ? Number(amountNano) / 1e9 : NaN;
+        if (!Number.isFinite(ton) || ton <= 0) continue;
+        const base = (g.collectionTitle || g.collectionName || g.title || gift).trim();
+        const number = g.number ?? null;
+        const title = number != null ? `${base} #${number}` : base;
+        const giftName = g.name || giftNameFallbackFromCollectionAndNumber(base, number) || null;
+        const urlTelegram = giftName && String(giftName).includes('-') ? `https://t.me/nft/${giftName}` : 'https://t.me/mrkt';
+        const urlMarket = g.id ? mrktLotUrlFromId(g.id) : 'https://t.me/mrkt';
+        const thumbKey = g.modelStickerThumbnailKey || g.modelStickerKey || g.stickerThumbnailKey || null;
+        const imgUrl = giftName ? `/img/gift?name=${encodeURIComponent(giftName)}` : (thumbKey ? `/img/cdn?key=${encodeURIComponent(thumbKey)}` : null);
+        prices.push(ton);
+        sales.push({ ts: it.date || null, priceTon: ton, title, giftName, imgUrl, model: g.modelTitle || g.modelName || null, backdrop: g.backdropName || null, urlMarket, urlTelegram });
+        if (sales.length >= SALES_HISTORY_TARGET) return true; // стоп
+      }
+      return false;
+    };
+
+    const done = processFeedItems(r0.items);
+    if (done || !r0.cursor) {
+      prices.sort((a, b) => a - b);
+      return { ok: true, approxPriceTon: median(prices), sales, note: null, waitMs: 0 };
+    }
+
+    // Грузим следующие страницы параллельно (до 3 одновременно)
+    const cursors = [r0.cursor];
+    let pages = 1;
+
+    while (sales.length < SALES_HISTORY_TARGET && pages < SALES_HISTORY_MAX_PAGES) {
       if (nowMs() - started > SALES_HISTORY_TIME_BUDGET_MS) break;
 
-      const r = await mrktFeedFetch({
+      // Берём до 3 страниц параллельно
+      const batch = cursors.splice(0, 3);
+      if (!batch.length) break;
+
+      const results = await Promise.allSettled(batch.map(cursor => mrktFeedFetch({
         collectionNames: [gift],
         modelNames: Array.isArray(modelNames) ? modelNames : [],
         backdropNames: Array.isArray(backdropNames) ? backdropNames : [],
         cursor,
         count: SALES_HISTORY_COUNT_PER_PAGE,
         ordering: 'Latest',
-        types: ['sale'],
-      });
+        types: [],
+      })));
 
-      if (!r.ok) {
-        if (r.reason === 'RPS_WAIT') {
-          if (cached) return { ...cached.data, note: `RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}`, waitMs: r.waitMs || 1000 };
-          return { ok: true, approxPriceTon: null, sales: [], note: `RPS limit, wait ${fmtWaitMs(r.waitMs || 1000)}`, waitMs: r.waitMs || 1000 };
-        }
-        break;
+      let anyDone = false;
+      for (const res of results) {
+        if (res.status !== 'fulfilled' || !res.value.ok) continue;
+        const r = res.value;
+        const stop = processFeedItems(r.items);
+        if (stop) { anyDone = true; break; }
+        if (r.cursor) cursors.push(r.cursor);
       }
 
-      if (!r.items.length) break;
-
-      for (const it of r.items) {
-        const type = String(it?.type || '').toLowerCase();
-        if (type !== 'sale') continue;
-
-        const g = it?.gift;
-        if (!g) continue;
-
-        const amountNano = it.amount ?? g.salePriceWithoutFee ?? g.salePrice ?? null;
-        const ton = amountNano != null ? Number(amountNano) / 1e9 : NaN;
-        if (!Number.isFinite(ton) || ton <= 0) continue;
-
-        const base = (g.collectionTitle || g.collectionName || g.title || gift).trim();
-        const number = g.number ?? null;
-        const title = number != null ? `${base} #${number}` : base;
-
-        const giftName = g.name || giftNameFallbackFromCollectionAndNumber(base, number) || null;
-
-        const urlTelegram = giftName && String(giftName).includes('-')
-          ? `https://t.me/nft/${giftName}`
-          : 'https://t.me/mrkt';
-
-        const urlMarket = g.id ? mrktLotUrlFromId(g.id) : 'https://t.me/mrkt';
-
-        const thumbKey =
-          g.modelStickerThumbnailKey ||
-          g.modelStickerKey ||
-          g.stickerThumbnailKey ||
-          null;
-
-        const imgUrl = giftName
-          ? `/img/gift?name=${encodeURIComponent(giftName)}`
-          : (thumbKey ? `/img/cdn?key=${encodeURIComponent(thumbKey)}` : null);
-
-        prices.push(ton);
-        sales.push({
-          ts: it.date || null,
-          priceTon: ton,
-          title,
-          giftName,
-          imgUrl,
-          model: g.modelTitle || g.modelName || null,
-          backdrop: g.backdropName || null,
-          urlMarket,
-          urlTelegram,
-        });
-
-        if (sales.length >= SALES_HISTORY_TARGET) break;
-      }
-
-      cursor = r.cursor || '';
-      pages++;
-      if (!cursor) break;
-
-      if (SALES_HISTORY_THROTTLE_MS > 0) await sleep(SALES_HISTORY_THROTTLE_MS);
+      pages += batch.length;
+      if (anyDone || !cursors.length) break;
     }
 
     prices.sort((a, b) => a - b);
@@ -1372,6 +1378,13 @@ async function mrktFeedSales({ gift, modelNames = [], backdropNames = [] }) {
   salesCache.set(key, { time: now, data });
   return data;
 }
+
+mrktFeedSales._refreshInBackground = async (key, gift, modelNames, backdropNames) => {
+  try {
+    const data = await mrktFeedSales({ gift, modelNames, backdropNames });
+    salesCache.set(key, { time: nowMs(), data });
+  } catch {}
+};
 
 async function mrktGlobalCheapestLotsReal() {
   const now = nowMs();
@@ -3593,32 +3606,55 @@ const WEBAPP_JS = `(() => {
     function renderSalesList(r) {
       const sales = r.sales || [];
       if (!sales.length) {
-        el('sheetBody').innerHTML = '<div class="emptyState" style="padding:20px 0"><div class="emptyIcon">📭</div><div>Нет данных о продажах</div></div>';
+        el('sheetBody').innerHTML = '<div class="emptyState" style="padding:30px 0;text-align:center"><div style="font-size:32px;opacity:.4;margin-bottom:8px">📭</div><div class="muted">Нет данных о продажах</div><div class="muted" style="font-size:11px;margin-top:4px">Попробуй выбрать другой подарок</div></div>';
         return;
       }
+
+      // Считаем мин/макс/медиану для заголовка
+      const prices = sales.map(s => s.priceTon).sort((a,b) => a-b);
+      const minP = prices[0];
+      const maxP = prices[prices.length-1];
+
+      const statsHtml = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)">' +
+        '<div style="background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:8px;padding:4px 10px;font-size:12px">Мин: <b style="color:#22c55e">' + minP.toFixed(3) + ' TON</b></div>' +
+        '<div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:4px 10px;font-size:12px">Макс: <b style="color:#ef4444">' + maxP.toFixed(3) + ' TON</b></div>' +
+        '<div style="background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:8px;padding:4px 10px;font-size:12px">Продаж: <b>' + sales.length + '</b></div>' +
+        '</div>';
+
       const rows = sales.map((s, idx) => {
         const imgHtml = s.imgUrl
-          ? '<img class="saleThumb" src="' + s.imgUrl + '" referrerpolicy="no-referrer" loading="lazy"/>'
-          : '<div class="saleThumb" style="background:rgba(255,255,255,.04)"></div>';
-        return '<div class="saleRow" data-idx="' + idx + '">' +
+          ? '<img class="saleThumb" src="' + s.imgUrl + '" referrerpolicy="no-referrer" loading="lazy" style="width:48px;height:48px;border-radius:10px;object-fit:cover;border:1px solid var(--border);flex-shrink:0"/>'
+          : '<div style="width:48px;height:48px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid var(--border);flex-shrink:0"></div>';
+
+        const timeStr = s.ts ? (() => {
+          const d = new Date(s.ts);
+          const now = new Date();
+          const diffMs = now - d;
+          const diffMin = Math.floor(diffMs / 60000);
+          const diffH = Math.floor(diffMin / 60);
+          if (diffMin < 1) return 'только что';
+          if (diffMin < 60) return diffMin + ' мин назад';
+          if (diffH < 24) return diffH + ' ч назад';
+          return d.toLocaleDateString('ru-RU');
+        })() : '';
+
+        return '<div class="saleRow" data-idx="' + idx + '" style="display:flex;gap:10px;align-items:center;padding:8px;border-radius:12px;margin-bottom:4px;background:rgba(255,255,255,.02);border:1px solid var(--border)">' +
           imgHtml +
           '<div style="flex:1;min-width:0">' +
             '<div style="font-weight:700;font-size:14px">' + Number(s.priceTon).toFixed(3) + ' TON</div>' +
-            (s.ts ? '<div style="font-size:11px;color:var(--muted)">' + new Date(s.ts).toLocaleString('ru-RU') + '</div>' : '') +
+            (timeStr ? '<div style="font-size:11px;color:var(--muted)">' + timeStr + '</div>' : '') +
             '<div style="font-size:12px;color:var(--muted2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (s.title || '') + '</div>' +
-            (s.model || s.backdrop ? '<div style="font-size:11px;color:var(--muted)">' + [s.model, s.backdrop].filter(Boolean).join(' · ') + '</div>' : '') +
+            (s.model || s.backdrop ? '<div style="font-size:11px;color:var(--muted);margin-top:2px">' + [s.model, s.backdrop].filter(Boolean).join(' · ') + '</div>' : '') +
           '</div>' +
           '<div style="display:flex;flex-direction:column;gap:4px;flex-shrink:0">' +
-            (s.urlMarket ? '<button class="linkBtn sale-mrkt-btn" data-url="' + s.urlMarket + '">MRKT</button>' : '') +
-            (s.urlTelegram ? '<button class="linkBtn sale-tg-btn" data-url="' + s.urlTelegram + '">NFT</button>' : '') +
+            (s.urlMarket ? '<button class="linkBtn sale-mrkt-btn" data-url="' + s.urlMarket + '" style="font-size:11px;padding:4px 8px">MRKT</button>' : '') +
+            (s.urlTelegram ? '<button class="linkBtn sale-tg-btn" data-url="' + s.urlTelegram + '" style="font-size:11px;padding:4px 8px">NFT</button>' : '') +
           '</div>' +
         '</div>';
       }).join('');
-      el('sheetBody').innerHTML = rows;
-      el('sheetBody').querySelectorAll('.sale-tg-btn').forEach(btn => {
-        btn.onclick = () => openTg(btn.getAttribute('data-url'));
-      });
-      el('sheetBody').querySelectorAll('.sale-mrkt-btn').forEach(btn => {
+
+      el('sheetBody').innerHTML = statsHtml + rows;
+      el('sheetBody').querySelectorAll('.sale-tg-btn,.sale-mrkt-btn').forEach(btn => {
         btn.onclick = () => openTg(btn.getAttribute('data-url'));
       });
     }
@@ -3729,16 +3765,35 @@ const WEBAPP_JS = `(() => {
       el('sheetBody').innerHTML = '<div class="loaderLine" style="display:flex"><div class="spinner"></div><div>Загрузка истории продаж...</div></div>';
       const closeBtn = el('salesCloseBtn');
       if (closeBtn) closeBtn.onclick = closeSheet;
-      try {
-        const r = await api('/api/mrkt/sales_by_filters?force=1');
-        if (r.approxPriceTon != null) {
-          el('sheetSub').textContent = 'Медиана: ' + Number(r.approxPriceTon).toFixed(3) + ' TON';
-        } else {
-          el('sheetSub').textContent = 'По текущим фильтрам';
+
+      let attempts = 0;
+      const maxAttempts = 3;
+      while (attempts < maxAttempts) {
+        attempts++;
+        try {
+          const r = await api('/api/mrkt/sales_by_filters?force=1');
+          if (r.approxPriceTon != null) {
+            el('sheetSub').textContent = 'Медиана: ' + Number(r.approxPriceTon).toFixed(3) + ' TON' + (r.cached ? ' (кэш)' : '');
+          } else {
+            el('sheetSub').textContent = 'По текущим фильтрам';
+          }
+          if (r.sales && r.sales.length > 0) {
+            renderSalesList(r);
+            return;
+          }
+          if (attempts < maxAttempts) {
+            el('sheetBody').innerHTML = '<div class="loaderLine" style="display:flex"><div class="spinner"></div><div>Попытка ' + (attempts+1) + ' из ' + maxAttempts + '...</div></div>';
+            await new Promise(res => setTimeout(res, 1500));
+          } else {
+            el('sheetBody').innerHTML = '<div class="muted" style="padding:20px;text-align:center">Нет данных о продажах</div>';
+          }
+        } catch (e) {
+          if (attempts >= maxAttempts) {
+            el('sheetBody').innerHTML = '<div style="color:var(--red);font-size:13px;padding:20px">Ошибка: ' + (e.message || String(e)) + '</div>';
+          } else {
+            await new Promise(res => setTimeout(res, 1500));
+          }
         }
-        renderSalesList(r);
-      } catch (e) {
-        el('sheetBody').innerHTML = '<div style="color:var(--red);font-size:13px">Ошибка: ' + (e.message || String(e)) + '</div>';
       }
     }
 
