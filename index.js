@@ -9,6 +9,18 @@ const express = require('express');
 const crypto = require('crypto');
 const { Readable } = require('stream');
 
+// gramjs для автообновления токена MRKT
+let TelegramClient = null;
+let StringSession = null;
+try {
+  const tg = require('telegram');
+  TelegramClient = tg.TelegramClient;
+  StringSession = require('telegram/sessions').StringSession;
+  console.log('gramjs loaded OK');
+} catch(e) {
+  console.warn('gramjs not available:', e.message);
+}
+
 // ===================== ENV =====================
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) {
@@ -27,6 +39,13 @@ const PUBLIC_URL =
 const WEBAPP_AUTH_MAX_AGE_SEC = Number(process.env.WEBAPP_AUTH_MAX_AGE_SEC || 86400);
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID ? Number(process.env.ADMIN_USER_ID) : null;
 const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL || null;
+
+// Telegram Client (gramjs) для автообновления токена
+const TG_API_ID = process.env.TG_API_ID ? Number(process.env.TG_API_ID) : null;
+const TG_API_HASH = process.env.TG_API_HASH || null;
+const TG_SESSION = process.env.TG_SESSION || '';
+const MRKT_BOT_USERNAME = process.env.MRKT_BOT_USERNAME || 'mrkt';
+const REDIS_KEY_TG_SESSION = 'tg:gramjs:session';
 
 // MRKT
 const MRKT_API_URL = 'https://api.tgmrkt.io/api/v1';
@@ -725,6 +744,147 @@ async function tryRefreshMrktToken(reason = 'auto', { force = false } = {}) {
   }
 }
 
+// ===================== gramjs — автополучение токена MRKT =====================
+let gramjsClient = null;
+let gramjsReady = false;
+
+async function initGramjs() {
+  if (!TelegramClient || !StringSession || !TG_API_ID || !TG_API_HASH) {
+    console.log('[GRAMJS] Не настроен — нужны TG_API_ID и TG_API_HASH');
+    return false;
+  }
+
+  try {
+    // Загружаем сессию из Redis или env
+    let sessionStr = TG_SESSION || '';
+    if (!sessionStr && redis) {
+      sessionStr = await redisGet(REDIS_KEY_TG_SESSION) || '';
+    }
+
+    const session = new StringSession(sessionStr);
+    gramjsClient = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
+      connectionRetries: 3,
+      useWSS: false,
+      timeout: 15,
+    });
+
+    await gramjsClient.connect();
+    gramjsReady = await gramjsClient.isUserAuthorized();
+
+    if (gramjsReady) {
+      // Сохраняем сессию в Redis
+      const newSession = gramjsClient.session.save();
+      if (redis && newSession) await redisSet(REDIS_KEY_TG_SESSION, newSession);
+      console.log('[GRAMJS] Подключён и авторизован!');
+    } else {
+      console.log('[GRAMJS] Не авторизован — нужно пройти /tglogin');
+    }
+
+    return gramjsReady;
+  } catch(e) {
+    console.error('[GRAMJS] Ошибка инициализации:', e.message);
+    return false;
+  }
+}
+
+async function gramjsGetMrktToken() {
+  if (!gramjsClient || !gramjsReady) return null;
+
+  try {
+    console.log('[GRAMJS] Получаем токен MRKT через mini app...');
+
+    // Запрашиваем initData от MRKT mini app
+    const result = await gramjsClient.invoke(
+      new (require('telegram/tl').functions.messages.RequestWebViewClass)({
+        peer: await gramjsClient.getInputEntity(MRKT_BOT_USERNAME),
+        bot: await gramjsClient.getInputEntity(MRKT_BOT_USERNAME),
+        fromBotMenu: false,
+        url: 'https://cdn.tgmrkt.io/',
+        startParam: '',
+      })
+    );
+
+    if (!result || !result.url) {
+      console.error('[GRAMJS] Нет URL в ответе');
+      return null;
+    }
+
+    // Извлекаем tgWebAppData из URL
+    const urlObj = new URL(result.url);
+    const fragment = urlObj.hash.replace('#', '');
+    const params = new URLSearchParams(fragment);
+    const tgWebAppData = params.get('tgWebAppData') || params.get('tgWebAppInitData') || '';
+
+    if (!tgWebAppData) {
+      console.error('[GRAMJS] Нет tgWebAppData в URL:', result.url.slice(0, 100));
+      return null;
+    }
+
+    console.log('[GRAMJS] Получили initData, запрашиваем токен MRKT...');
+
+    // Получаем токен от MRKT
+    const authRes = await fetchWithTimeout(`${MRKT_API_URL}/auth`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Origin': 'https://cdn.tgmrkt.io',
+        'Referer': 'https://cdn.tgmrkt.io/',
+        'User-Agent': 'Mozilla/5.0',
+      },
+      body: JSON.stringify({
+        appId: null,
+        data: tgWebAppData,
+        photo: null,
+      }),
+    }, 15000);
+
+    const txt = await authRes.text();
+    let data = null;
+    try { data = JSON.parse(txt); } catch {}
+
+    if (!authRes.ok || !data?.token) {
+      console.error('[GRAMJS] MRKT auth failed:', authRes.status, txt.slice(0, 200));
+      return null;
+    }
+
+    console.log('[GRAMJS] Токен MRKT получен успешно!', maskToken(data.token));
+
+    // Сохраняем сессию gramjs в Redis
+    if (redis) {
+      const newSession = gramjsClient.session.save();
+      if (newSession) await redisSet(REDIS_KEY_TG_SESSION, newSession);
+    }
+
+    return data.token;
+  } catch(e) {
+    console.error('[GRAMJS] Ошибка получения токена:', e.message);
+    return null;
+  }
+}
+
+async function autoRefreshTokenViaGramjs() {
+  if (!gramjsReady) return false;
+
+  const token = await gramjsGetMrktToken();
+  if (!token) return false;
+
+  MRKT_AUTH_RUNTIME = token;
+  lastSuccessfulTokenAt = Date.now();
+  if (redis) await redisSet(REDIS_KEY_MRKT_AUTH, token);
+
+  // Очищаем кэши
+  collectionsCache = { time: 0, items: [] };
+  lotsCache.clear();
+  salesCache.clear();
+
+  // Уведомляем админа
+  if (ADMIN_USER_ID) {
+    sendMessageSafe(ADMIN_USER_ID, `🔑 Токен MRKT обновлён автоматически через Telegram\n${maskToken(token)}`).catch(() => {});
+  }
+
+  return true;
+}
+
 // ===================== Антиспам уведомлений об авторизации =====================
 let lastAuthNotifyAt = 0;
 let lastSuccessfulTokenAt = 0;
@@ -797,19 +957,33 @@ async function tryAutoSaveInitDataAsSession(initData) {
 
 // Проактивный авторефреш токена каждые 2 часа
 async function autoRefreshToken() {
-  // Если токен обновлялся менее 1.5 часов назад — пропускаем
   if (lastSuccessfulTokenAt && nowMs() - lastSuccessfulTokenAt < 90 * 60 * 1000) return;
   if (autoRefreshRunning) return;
   autoRefreshRunning = true;
   try {
     console.log('[AUTO REFRESH] Обновляем токен...');
+
+    // Способ 1 — gramjs (самый надёжный, полностью автоматический)
+    if (gramjsReady) {
+      console.log('[AUTO REFRESH] Пробуем через gramjs...');
+      const ok = await autoRefreshTokenViaGramjs();
+      if (ok) {
+        console.log('[AUTO REFRESH] gramjs: токен обновлён!', maskToken(MRKT_AUTH_RUNTIME));
+        lastSuccessfulTokenAt = nowMs();
+        lastAuthNotifyAt = 0;
+        return;
+      }
+      console.warn('[AUTO REFRESH] gramjs не сработал, пробуем сессию...');
+    }
+
+    // Способ 2 — сохранённая сессия
     const r = await tryRefreshMrktToken('auto_2h', { force: true });
     if (r.ok) {
-      console.log('[AUTO REFRESH] Токен обновлён:', maskToken(MRKT_AUTH_RUNTIME));
+      console.log('[AUTO REFRESH] Сессия: токен обновлён:', maskToken(MRKT_AUTH_RUNTIME));
+      lastSuccessfulTokenAt = nowMs();
       lastAuthNotifyAt = 0;
-      await notifyAdminAuthOk(maskToken(MRKT_AUTH_RUNTIME));
     } else {
-      console.error('[AUTO REFRESH] Ошибка:', r.reason);
+      console.error('[AUTO REFRESH] Оба способа не сработали:', r.reason);
       await notifyAdminAuthError(r.reason);
     }
   } catch (e) {
@@ -2538,9 +2712,127 @@ bot.onText(/^\/start\b/, async (msg) => {
   }
 });
 
+// Команда /refresh — обновить токен вручную
+bot.onText(/^\/refresh\b/, async (msg) => {
+  if (!isAdmin(msg.from?.id)) return;
+  await sendMessageSafe(msg.chat.id, '🔄 Обновляю токен...');
+
+  // Сначала gramjs
+  if (gramjsReady) {
+    const ok = await autoRefreshTokenViaGramjs();
+    if (ok) {
+      return sendMessageSafe(msg.chat.id, `✅ Токен обновлён через Telegram!\n${maskToken(MRKT_AUTH_RUNTIME)}`);
+    }
+  }
+
+  // Потом сессия
+  const r = await tryRefreshMrktToken('manual_refresh', { force: true });
+  if (r.ok) {
+    await sendMessageSafe(msg.chat.id, `✅ Токен обновлён!\n${maskToken(MRKT_AUTH_RUNTIME)}`);
+  } else {
+    await sendMessageSafe(msg.chat.id, `❌ Не удалось: ${r.reason}\n\nИспользуй /tglogin для первичной настройки`);
+  }
+});
+
+// Команда /tglogin — первичная авторизация gramjs
+bot.onText(/^\/tglogin\b/, async (msg) => {
+  if (!isAdmin(msg.from?.id)) return;
+  if (!TelegramClient || !TG_API_ID || !TG_API_HASH) {
+    return sendMessageSafe(msg.chat.id, '❌ Нужно добавить TG_API_ID и TG_API_HASH в Railway Variables\n\nПолучи их на https://my.telegram.org/apps');
+  }
+
+  await sendMessageSafe(msg.chat.id, '📱 Начинаем авторизацию в Telegram...\nОтправь свой номер телефона (например: +375291234567)');
+
+  // Временно сохраняем что ждём телефон
+  tgLoginState.set(msg.chat.id, { step: 'phone' });
+});
+
+// Состояние процесса логина
+const tgLoginState = new Map();
+let tempPhoneCodeHash = '';
+
 bot.on('message', async (msg) => {
   const userId = msg.from?.id;
   if (!userId) return;
+
+  // Обрабатываем шаги /tglogin
+  if (isAdmin(userId) && tgLoginState.has(msg.chat.id)) {
+    const state = tgLoginState.get(msg.chat.id);
+    const text = (msg.text || '').trim();
+
+    if (state.step === 'phone') {
+      try {
+        if (!gramjsClient) {
+          const session = new StringSession('');
+          gramjsClient = new TelegramClient(session, TG_API_ID, TG_API_HASH, { connectionRetries: 3 });
+          await gramjsClient.connect();
+        }
+        const result = await gramjsClient.sendCode({ apiId: TG_API_ID, apiHash: TG_API_HASH }, text);
+        tempPhoneCodeHash = result.phoneCodeHash;
+        tgLoginState.set(msg.chat.id, { step: 'code', phone: text });
+        await sendMessageSafe(msg.chat.id, '📨 Код отправлен в Telegram. Введи код (цифры через пробел, например: 1 2 3 4 5)');
+      } catch(e) {
+        await sendMessageSafe(msg.chat.id, `❌ Ошибка: ${e.message}`);
+        tgLoginState.delete(msg.chat.id);
+      }
+      return;
+    }
+
+    if (state.step === 'code') {
+      try {
+        const code = text.replace(/\s/g, '');
+        await gramjsClient.signIn({ apiId: TG_API_ID, apiHash: TG_API_HASH }, { phoneNumber: state.phone, phoneCodeHash: tempPhoneCodeHash, phoneCode: code });
+        gramjsReady = true;
+
+        // Сохраняем сессию
+        const sessionStr = gramjsClient.session.save();
+        if (redis) await redisSet(REDIS_KEY_TG_SESSION, sessionStr);
+
+        tgLoginState.delete(msg.chat.id);
+        await sendMessageSafe(msg.chat.id, '✅ Авторизован в Telegram! Теперь токен MRKT будет обновляться автоматически.\n\nПробую получить токен MRKT...');
+
+        const ok = await autoRefreshTokenViaGramjs();
+        if (ok) {
+          await sendMessageSafe(msg.chat.id, `✅ Токен MRKT получен!\n${maskToken(MRKT_AUTH_RUNTIME)}`);
+        } else {
+          await sendMessageSafe(msg.chat.id, '⚠️ Авторизован но не удалось получить токен MRKT. Попробуй /refresh');
+        }
+      } catch(e) {
+        if (e.message?.includes('2FA') || e.message?.includes('password')) {
+          tgLoginState.set(msg.chat.id, { step: 'password', phone: state.phone });
+          await sendMessageSafe(msg.chat.id, '🔐 Введи пароль двухфакторной аутентификации:');
+        } else {
+          await sendMessageSafe(msg.chat.id, `❌ Ошибка: ${e.message}`);
+          tgLoginState.delete(msg.chat.id);
+        }
+      }
+      return;
+    }
+
+    if (state.step === 'password') {
+      try {
+        await gramjsClient.signInWithPassword({ apiId: TG_API_ID, apiHash: TG_API_HASH }, { password: text });
+        gramjsReady = true;
+
+        const sessionStr = gramjsClient.session.save();
+        if (redis) await redisSet(REDIS_KEY_TG_SESSION, sessionStr);
+
+        tgLoginState.delete(msg.chat.id);
+        await sendMessageSafe(msg.chat.id, '✅ Авторизован! Получаю токен MRKT...');
+
+        const ok = await autoRefreshTokenViaGramjs();
+        if (ok) {
+          await sendMessageSafe(msg.chat.id, `✅ Токен MRKT получен!\n${maskToken(MRKT_AUTH_RUNTIME)}`);
+        } else {
+          await sendMessageSafe(msg.chat.id, '⚠️ Авторизован но не удалось получить токен. Попробуй /refresh');
+        }
+      } catch(e) {
+        await sendMessageSafe(msg.chat.id, `❌ Ошибка: ${e.message}`);
+        tgLoginState.delete(msg.chat.id);
+      }
+      return;
+    }
+  }
 
   const u = getOrCreateUser(userId);
   u.chatId = msg.chat.id;
@@ -4713,15 +5005,39 @@ app.listen(PORT, '0.0.0.0', () => console.log('HTTP listening on', PORT));
     checkFloorForAllUsers().catch((e) => console.error('floor boot error:', e));
   }, 15000);
 
+  // Инициализация gramjs для автообновления токена
+  setTimeout(async () => {
+    try {
+      const ok = await initGramjs();
+      if (ok) {
+        console.log('[BOOT] gramjs готов — токен будет обновляться полностью автоматически!');
+        if (ADMIN_USER_ID) {
+          sendMessageSafe(ADMIN_USER_ID, '🤖 gramjs подключён! Токен MRKT теперь обновляется автоматически без вашего участия.').catch(() => {});
+        }
+        // Сразу получаем токен через gramjs
+        await autoRefreshTokenViaGramjs();
+      } else {
+        console.log('[BOOT] gramjs не готов. Используй /tglogin для настройки.');
+        if (ADMIN_USER_ID && TG_API_ID && TG_API_HASH) {
+          sendMessageSafe(ADMIN_USER_ID, '⚠️ gramjs не авторизован.\nОтправь /tglogin чтобы настроить автообновление токена').catch(() => {});
+        } else if (ADMIN_USER_ID) {
+          sendMessageSafe(ADMIN_USER_ID, '💡 Для полной автоматизации добавь в Railway Variables:\n- TG_API_ID\n- TG_API_HASH\n\nПолучи на https://my.telegram.org/apps\n\nПотом отправь /tglogin').catch(() => {});
+        }
+      }
+    } catch(e) {
+      console.error('[BOOT] gramjs init error:', e.message);
+    }
+  }, 5000);
+
   // Автообновление токена каждые 2 часа
   setInterval(() => {
     autoRefreshToken().catch((e) => console.error('[AUTO REFRESH] interval error:', e));
   }, TOKEN_REFRESH_INTERVAL_MS);
 
-  // Первый авторефреш через 30 секунд после старта
+  // Первый авторефреш через 60 секунд после старта (после gramjs init)
   setTimeout(() => {
     autoRefreshToken().catch((e) => console.error('[AUTO REFRESH] boot error:', e));
-  }, 30000);
+  }, 60000);
 
   console.log('[BOOT] Авторефреш токена: каждые 2 часа');
 })();
