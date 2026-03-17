@@ -562,30 +562,26 @@ async function loadMrktSessionFromRedis() {
 async function mrktAuthWithSession(session) {
   const url = `${MRKT_API_URL}/auth`;
 
-  // если нет сессии или data протухла — генерируем initData сами
-  let data_field = String(session?.data || '');
-  let photo_field = session?.photo ?? null;
+  // Используем сессию как есть — не трогаем data
+  // MRKT требует оригинальный initData с signature от Telegram
+  const data_field = String(session?.data || '');
+  const photo_field = session?.photo ?? null;
 
-  if (!data_field || data_field.includes('auth_date=')) {
-    // проверяем не протух ли auth_date
-    try {
-      const p = new URLSearchParams(data_field);
-      const authDate = Number(p.get('auth_date') || 0);
-      const ageSec = Math.floor(Date.now() / 1000) - authDate;
-      if (ageSec > 80000) { // больше 22 часов — генерируем новый
-        console.log('[AUTH] initData протухла (age=' + ageSec + 's), генерируем новую...');
-        if (ADMIN_USER_ID) {
-          const fresh = generateInitData(ADMIN_USER_ID);
-          if (fresh) { data_field = fresh; photo_field = null; }
-        }
-      }
-    } catch {}
+  if (!data_field) {
+    console.log('[AUTH] нет data в сессии!');
+    return { ok: false, status: 0, reason: 'NO_DATA', text: '' };
   }
 
-  if (!data_field && ADMIN_USER_ID) {
-    const fresh = generateInitData(ADMIN_USER_ID);
-    if (fresh) { data_field = fresh; photo_field = null; }
-  }
+  // Логируем возраст auth_date
+  try {
+    const p = new URLSearchParams(data_field);
+    const authDate = Number(p.get('auth_date') || 0);
+    const ageSec = Math.floor(Date.now() / 1000) - authDate;
+    console.log('[AUTH] auth_date возраст=' + ageSec + 's (' + Math.floor(ageSec/3600) + 'ч)');
+    if (ageSec > 86400) {
+      console.log('[AUTH] ⚠️ initData старше 24 часов — MRKT скорее всего отклонит!');
+    }
+  } catch {}
 
   const body = { appId: null, data: data_field, photo: photo_field };
 
@@ -658,7 +654,15 @@ async function tryRefreshMrktToken(reason = 'auto', { force = false } = {}) {
   const now = nowMs();
   mrktAuthDebug.lastAttemptAt = now;
 
-  if (isRefreshing) return { ok: false, reason: 'LOCKED' };
+  // Если refresh завис более 30 секунд — сбрасываем флаг
+  if (isRefreshing) {
+    if (now - lastRefreshAt > 30000) {
+      console.log('[AUTH] isRefreshing завис, сбрасываем...');
+      isRefreshing = false;
+    } else {
+      return { ok: false, reason: 'LOCKED' };
+    }
+  }
   if (!force && now - lastRefreshAt < MRKT_AUTH_REFRESH_COOLDOWN_MS) return { ok: false, reason: 'COOLDOWN' };
   lastRefreshAt = now;
 
