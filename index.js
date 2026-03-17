@@ -2958,6 +2958,7 @@ button:hover{background:rgba(255,255,255,.06)}
         <button id="sessSave" class="btn-primary">Сохранить + обновить токен</button>
         <button id="tokRefresh">Обновить токен</button>
         <button id="testMrkt" class="btn-sm">Test API</button>
+        <button id="exportDataBtn" class="btn-sm" style="background:#1a3a5c;border-color:#2d6a9f">📦 Экспорт данных</button>
       </div>
     </div>
   </div>
@@ -3897,6 +3898,19 @@ const WEBAPP_JS = `(() => {
       alert('Token обновлён: ' + (r.tokenMask || ''));
       await refreshAdmin();
     });
+    if (el('exportDataBtn')) el('exportDataBtn').onclick = async () => {
+      try {
+        const r = await api('/api/admin/export');
+        const blob = new Blob([JSON.stringify(r, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'bot-export-' + new Date().toISOString().slice(0,10) + '.json';
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch(e) { showErr(e.message || String(e)); }
+    };
+
     el('testMrkt').onclick = wrap('admin', async () => {
       const r = await api('/api/admin/test_mrkt');
       alert('Коллекций: ' + r.collectionsCount + '\\nToken: ' + (r.tokenMask || '—') + '\\nОшибка: ' + (r.lastFail || 'нет'));
@@ -4484,6 +4498,26 @@ app.post('/api/admin/refresh_token', auth, async (req, res) => {
   const rr = await tryRefreshMrktToken('admin_manual_refresh', { force: true });
   if (!rr.ok) return res.status(400).json({ ok: false, reason: rr.reason, refresh: { ...mrktAuthDebug } });
   res.json({ ok: true, tokenMask: maskToken(MRKT_AUTH_RUNTIME), refresh: { ...mrktAuthDebug } });
+});
+
+app.get('/api/admin/export', auth, async (req, res) => {
+  if (!isAdmin(req.userId)) return res.status(403).json({ ok: false, reason: 'NOT_ADMIN' });
+  const state = exportState();
+  const sess = mrktSessionRuntime || await loadMrktSessionFromRedis();
+  res.json({
+    ok: true,
+    exportedAt: new Date().toISOString(),
+    state,
+    env: {
+      MRKT_AUTH_MASK: maskToken(MRKT_AUTH_RUNTIME),
+      MRKT_SESSION_SAVED: !!sess,
+      REDIS_URL_SET: !!REDIS_URL,
+      PUBLIC_URL,
+      WEBAPP_URL,
+      ADMIN_USER_ID,
+      MODE,
+    }
+  });
 });
 
 app.get('/api/admin/test_mrkt', auth, async (req, res) => {
