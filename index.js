@@ -604,6 +604,7 @@ async function tryRefreshMrktToken(reason = 'auto', { force = false } = {}) {
     }
 
     MRKT_AUTH_RUNTIME = r.token;
+    lastSuccessfulTokenAt = nowMs();
     mrktAuthDebug.lastOkAt = nowMs();
     mrktAuthDebug.lastStatus = r.status;
     mrktAuthDebug.lastReason = null;
@@ -632,6 +633,7 @@ async function tryRefreshMrktToken(reason = 'auto', { force = false } = {}) {
 
 // ===================== Антиспам уведомлений об авторизации =====================
 let lastAuthNotifyAt = 0;
+let lastSuccessfulTokenAt = 0;
 const AUTH_NOTIFY_COOLDOWN_MS = 60 * 60 * 1000; // не чаще раза в час
 
 async function notifyAdminAuthError(reason) {
@@ -640,16 +642,17 @@ async function notifyAdminAuthError(reason) {
   if (now - lastAuthNotifyAt < AUTH_NOTIFY_COOLDOWN_MS) return; // антиспам
   lastAuthNotifyAt = now;
   const text =
-    `⚠️ MRKT токен истёк\n` +
+    `⚠️ MRKT токен истёк!\n` +
     `Причина: ${reason}\n\n` +
-    `Отправь /refresh боту — попробует обновить автоматически.\n` +
-    `Если не поможет — открой WebApp → Admin → обнови сессию.`;
+    `1️⃣ Нажми /refresh — попробует обновить автоматически\n` +
+    `2️⃣ Или открой WebApp — токен обновится сам`;
+  const opts = WEBAPP_URL ? {
+    reply_markup: { inline_keyboard: [[
+      { text: '📱 Открыть WebApp', web_app: { url: WEBAPP_URL } }
+    ]] }
+  } : {};
   try {
-    await sendMessageSafe(ADMIN_USER_ID, text, {
-      reply_markup: WEBAPP_URL ? {
-        inline_keyboard: [[{ text: '⚙️ Открыть Admin', web_app: { url: WEBAPP_URL } }]]
-      } : undefined
-    });
+    await sendMessageSafe(ADMIN_USER_ID, text, opts);
   } catch (e) {
     console.error('[AUTH NOTIFY] ошибка отправки:', e?.message);
   }
@@ -682,14 +685,26 @@ async function tryAutoSaveInitDataAsSession(initData) {
   if (!initData || !initData.includes('hash=')) return;
   lastAutoSaveAt = nowMs();
 
+  // Сохраняем сессию
   const sess = { data: initData, photo: null };
   mrktSessionRuntime = sess;
   if (redis) await redisSet(REDIS_KEY_MRKT_SESSION, JSON.stringify(sess), { EX: 86400 * 7 }).catch(() => {});
-  console.log('[AUTO SESSION] initData сохранён как сессия');
+  console.log('[AUTO SESSION] initData сохранён, пробуем обновить токен...');
+
+  // Сразу получаем новый токен
+  const rr = await tryRefreshMrktToken('auto_webapp', { force: true });
+  if (rr.ok) {
+    console.log('[AUTO SESSION] токен обновлён через WebApp! mask=', maskToken(MRKT_AUTH_RUNTIME));
+    lastAuthNotifyAt = 0;
+  } else {
+    console.warn('[AUTO SESSION] не удалось обновить токен:', rr.reason);
+  }
 }
 
 // Проактивный авторефреш токена каждые 2 часа
 async function autoRefreshToken() {
+  // Если токен обновлялся менее 1.5 часов назад — пропускаем
+  if (lastSuccessfulTokenAt && nowMs() - lastSuccessfulTokenAt < 90 * 60 * 1000) return;
   if (autoRefreshRunning) return;
   autoRefreshRunning = true;
   try {
@@ -2392,6 +2407,21 @@ bot.onText(/^\/refresh$/, async (msg) => {
     );
   }
 });
+bot.onText(/^\/refresh\b/, async (msg) => {
+  const userId = msg.from?.id;
+  if (!isAdmin(userId)) return;
+  await sendMessageSafe(msg.chat.id, '🔄 Обновляю токен...').catch(() => {});
+  const rr = await tryRefreshMrktToken('manual_refresh_cmd', { force: true });
+  if (rr.ok) {
+    await sendMessageSafe(msg.chat.id, `✅ Токен обновлён!\n${maskToken(MRKT_AUTH_RUNTIME)}`).catch(() => {});
+  } else {
+    await sendMessageSafe(msg.chat.id,
+      `❌ Не удалось обновить токен\nПричина: ${rr.reason}\n\nОткрой WebApp — токен обновится автоматически`,
+      WEBAPP_URL ? { reply_markup: { inline_keyboard: [[{ text: '📱 Открыть WebApp', web_app: { url: WEBAPP_URL } }]] } } : {}
+    ).catch(() => {});
+  }
+});
+
 bot.onText(/^\/start\b/, async (msg) => {
   const u = getOrCreateUser(msg.from.id);
   u.chatId = msg.chat.id;
