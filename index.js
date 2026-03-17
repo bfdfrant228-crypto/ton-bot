@@ -1728,10 +1728,10 @@ async function mrktPostJsonBackground(path, bodyObj) {
       return { ok: false, status: 429, data, text: txt, waitMs: pauseDur };
     }
     if (res.status === 401 || res.status === 403) {
-      const rr = await tryRefreshMrktToken(`BG_${res.status}`, { force: false });
-      if (!rr.ok) {
-        // Токен не удалось обновить — уведомляем только админа
-        notifyAdmin(
+      const rr = await tryRefreshMrktToken(`BG_${res.status}`, { force: true });
+      if (rr.ok) { return mrktPostJsonBackground(path, bodyObj); }
+      notifyAdminAuthError(rr.reason).catch(() => {});
+      // fixed
           `⚠️ MRKT токен истёк и не удалось обновить автоматически\n` +
           `Причина: ${rr.reason}\n\n` +
           `Открой WebApp → Admin → обнови сессию вручную`
