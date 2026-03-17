@@ -561,11 +561,35 @@ async function loadMrktSessionFromRedis() {
 
 async function mrktAuthWithSession(session) {
   const url = `${MRKT_API_URL}/auth`;
-  const body = {
-    appId: null,
-    data: String(session?.data || ''),
-    photo: session?.photo ?? null,
-  };
+
+  // если нет сессии или data протухла — генерируем initData сами
+  let data_field = String(session?.data || '');
+  let photo_field = session?.photo ?? null;
+
+  if (!data_field || data_field.includes('auth_date=')) {
+    // проверяем не протух ли auth_date
+    try {
+      const p = new URLSearchParams(data_field);
+      const authDate = Number(p.get('auth_date') || 0);
+      const ageSec = Math.floor(Date.now() / 1000) - authDate;
+      if (ageSec > 80000) { // больше 22 часов — генерируем новый
+        console.log('[AUTH] initData протухла (age=' + ageSec + 's), генерируем новую...');
+        if (ADMIN_USER_ID) {
+          const fresh = generateInitData(ADMIN_USER_ID);
+          if (fresh) { data_field = fresh; photo_field = null; }
+        }
+      }
+    } catch {}
+  }
+
+  if (!data_field && ADMIN_USER_ID) {
+    const fresh = generateInitData(ADMIN_USER_ID);
+    if (fresh) { data_field = fresh; photo_field = null; }
+  }
+
+  const body = { appId: null, data: data_field, photo: photo_field };
+
+  console.log('[AUTH] отправляем запрос, data длина=' + data_field.length + ' auth_date=' + (new URLSearchParams(data_field).get('auth_date') || '?'));
 
   const res = await fetchWithTimeout(url, {
     method: 'POST',
@@ -583,10 +607,39 @@ async function mrktAuthWithSession(session) {
   if (!res) return { ok: false, status: 0, reason: 'FETCH_ERROR', text: '' };
 
   const txt = await res.text().catch(() => '');
+  console.log('[AUTH] ответ status=' + res.status + ' text=' + txt.slice(0, 200));
   let data = null;
   try { data = txt ? JSON.parse(txt) : null; } catch {}
 
   if (!res.ok) {
+    // если ошибка и есть ADMIN_USER_ID — пробуем с generateInitData
+    if ((res.status === 400 || res.status === 401 || res.status === 500) && ADMIN_USER_ID) {
+      console.log('[AUTH] ошибка ' + res.status + ', пробуем с generateInitData...');
+      const fresh = generateInitData(ADMIN_USER_ID);
+      if (fresh && fresh !== data_field) {
+        const body2 = { appId: null, data: fresh, photo: null };
+        const res2 = await fetchWithTimeout(url, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            Origin: 'https://cdn.tgmrkt.io',
+            Referer: 'https://cdn.tgmrkt.io/',
+            'User-Agent': 'Mozilla/5.0',
+          },
+          body: JSON.stringify(body2),
+        }, MRKT_TIMEOUT_MS).catch(() => null);
+        if (res2) {
+          const txt2 = await res2.text().catch(() => '');
+          console.log('[AUTH] повтор status=' + res2.status + ' text=' + txt2.slice(0, 200));
+          let data2 = null;
+          try { data2 = txt2 ? JSON.parse(txt2) : null; } catch {}
+          if (res2.ok && data2?.token) {
+            return { ok: true, status: res2.status, token: String(data2.token) };
+          }
+        }
+      }
+    }
     return {
       ok: false,
       status: res.status,
