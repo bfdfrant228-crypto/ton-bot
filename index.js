@@ -1731,12 +1731,7 @@ async function mrktPostJsonBackground(path, bodyObj) {
       const rr = await tryRefreshMrktToken(`BG_${res.status}`, { force: true });
       if (rr.ok) { return mrktPostJsonBackground(path, bodyObj); }
       notifyAdminAuthError(rr.reason).catch(() => {});
-      // fixed
-          `⚠️ MRKT токен истёк и не удалось обновить автоматически\n` +
-          `Причина: ${rr.reason}\n\n` +
-          `Открой WebApp → Admin → обнови сессию вручную`
-        ).catch(() => {});
-      }
+      return { ok: false, status: 401, data: null, text: 'AUTH_FAILED' };
     }
     bgState.lastFailMsg = `HTTP_${res.status}`;
     return { ok: false, status: res.status, data, text: txt };
