@@ -183,6 +183,28 @@ function maskToken(t) {
   if (s.length <= 10) return s;
   return s.slice(0, 4) + '…' + s.slice(-4);
 }
+function generateInitData(userId) {
+  try {
+    const authDate = Math.floor(Date.now() / 1000);
+    const userObj = { id: userId, first_name: 'Admin', username: 'admin', language_code: 'ru' };
+    const userStr = JSON.stringify(userObj);
+    const pairs = [
+      ['auth_date', String(authDate)],
+      ['user', userStr],
+    ];
+    pairs.sort((a, b) => a[0].localeCompare(b[0]));
+    const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join('\n');
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(TELEGRAM_TOKEN).digest();
+    const hash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+    const params = new URLSearchParams();
+    for (const [k, v] of pairs) params.set(k, v);
+    params.set('hash', hash);
+    return params.toString();
+  } catch (e) {
+    console.error('[generateInitData] error:', e?.message);
+    return null;
+  }
+}
 function mrktLotUrlFromId(id) {
   return id ? `https://t.me/mrkt/app?startapp=${String(id).replace(/-/g, '')}` : 'https://t.me/mrkt';
 }
@@ -592,8 +614,23 @@ async function tryRefreshMrktToken(reason = 'auto', { force = false } = {}) {
     let session = mrktSessionRuntime;
     if (!session) session = await loadMrktSessionFromRedis();
     if (!session) {
-      mrktAuthDebug.lastReason = 'NO_SESSION';
-      return { ok: false, reason: 'NO_SESSION' };
+      // Пробуем сгенерировать initData автоматически
+      if (ADMIN_USER_ID && TELEGRAM_TOKEN) {
+        console.log('[AUTH] Нет сессии — генерируем initData автоматически');
+        const initData = generateInitData(ADMIN_USER_ID);
+        if (initData) {
+          session = { data: initData, photo: null };
+        }
+      }
+      if (!session) {
+        mrktAuthDebug.lastReason = 'NO_SESSION';
+        return { ok: false, reason: 'NO_SESSION' };
+      }
+    }
+    // Если сессия старше 20 часов — генерируем свежую
+    if (ADMIN_USER_ID && TELEGRAM_TOKEN) {
+      const freshInitData = generateInitData(ADMIN_USER_ID);
+      if (freshInitData) session = { ...session, data: freshInitData };
     }
 
     const r = await mrktAuthWithSession(session);
@@ -2407,20 +2444,7 @@ bot.onText(/^\/refresh$/, async (msg) => {
     );
   }
 });
-bot.onText(/^\/refresh\b/, async (msg) => {
-  const userId = msg.from?.id;
-  if (!isAdmin(userId)) return;
-  await sendMessageSafe(msg.chat.id, '🔄 Обновляю токен...').catch(() => {});
-  const rr = await tryRefreshMrktToken('manual_refresh_cmd', { force: true });
-  if (rr.ok) {
-    await sendMessageSafe(msg.chat.id, `✅ Токен обновлён!\n${maskToken(MRKT_AUTH_RUNTIME)}`).catch(() => {});
-  } else {
-    await sendMessageSafe(msg.chat.id,
-      `❌ Не удалось обновить токен\nПричина: ${rr.reason}\n\nОткрой WebApp — токен обновится автоматически`,
-      WEBAPP_URL ? { reply_markup: { inline_keyboard: [[{ text: '📱 Открыть WebApp', web_app: { url: WEBAPP_URL } }]] } } : {}
-    ).catch(() => {});
-  }
-});
+
 
 bot.onText(/^\/start\b/, async (msg) => {
   const u = getOrCreateUser(msg.from.id);
