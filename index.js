@@ -2766,17 +2766,30 @@ bot.on('message', async (msg) => {
     if (state.step === 'phone') {
       try {
         if (!gramjsClient) {
-          const session = new StringSession('');
-          gramjsClient = new TelegramClient(session, TG_API_ID, TG_API_HASH, { connectionRetries: 3 });
+          const savedSession = redis ? (await redisGet(REDIS_KEY_TG_SESSION).catch(() => null)) : null;
+          const session = new StringSession(savedSession || '');
+          gramjsClient = new TelegramClient(session, Number(TG_API_ID), TG_API_HASH, {
+            connectionRetries: 5,
+            retryDelay: 1000,
+            autoReconnect: true,
+            useWSS: false,
+          });
           await gramjsClient.connect();
         }
-        const result = await gramjsClient.sendCode({ apiId: TG_API_ID, apiHash: TG_API_HASH }, text);
+        const phone = text.trim();
+        const result = await gramjsClient.invoke(new (require('telegram/tl/functions/auth').SendCode)({
+          phoneNumber: phone,
+          apiId: Number(TG_API_ID),
+          apiHash: TG_API_HASH,
+          settings: new (require('telegram/tl/types').CodeSettings)({}),
+        }));
         tempPhoneCodeHash = result.phoneCodeHash;
-        tgLoginState.set(msg.chat.id, { step: 'code', phone: text });
-        await sendMessageSafe(msg.chat.id, '📨 Код отправлен в Telegram. Введи код (цифры через пробел, например: 1 2 3 4 5)');
+        tgLoginState.set(msg.chat.id, { step: 'code', phone });
+        await sendMessageSafe(msg.chat.id, '📨 Код отправлен! Проверь Telegram или SMS.\n\nВведи код цифрами через пробел:\n1 2 3 4 5');
       } catch(e) {
-        await sendMessageSafe(msg.chat.id, `❌ Ошибка: ${e.message}`);
+        await sendMessageSafe(msg.chat.id, `❌ Ошибка: ${e.message}\n\nПопробуй /tglogin снова`);
         tgLoginState.delete(msg.chat.id);
+        gramjsClient = null;
       }
       return;
     }
