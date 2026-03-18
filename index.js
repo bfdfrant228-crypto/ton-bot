@@ -2737,8 +2737,11 @@ bot.onText(/^\/refresh\b/, async (msg) => {
 // Команда /tglogin — первичная авторизация gramjs
 bot.onText(/^\/tglogin\b/, async (msg) => {
   if (!isAdmin(msg.from?.id)) return;
-  if (!TelegramClient || !TG_API_ID || !TG_API_HASH) {
-    return sendMessageSafe(msg.chat.id, '❌ Нужно добавить TG_API_ID и TG_API_HASH в Railway Variables\n\nПолучи их на https://my.telegram.org/apps');
+  if (!TG_API_ID || !TG_API_HASH) {
+    return sendMessageSafe(msg.chat.id, `❌ TG_API_ID или TG_API_HASH не найдены!\n\nТекущие значения:\nTG_API_ID: ${TG_API_ID || 'НЕТ'}\nTG_API_HASH: ${TG_API_HASH ? 'есть' : 'НЕТ'}\n\nПолучи их на https://my.telegram.org/apps`);
+  }
+  if (!TelegramClient) {
+    return sendMessageSafe(msg.chat.id, '❌ gramjs не загружен!\n\nДобавь в package.json:\n"telegram": "^2.26.22"\n\nИ задеплой заново.');
   }
 
   await sendMessageSafe(msg.chat.id, '📱 Начинаем авторизацию в Telegram...\nОтправь свой номер телефона (например: +375291234567)');
