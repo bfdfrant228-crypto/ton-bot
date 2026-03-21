@@ -1,3 +1,4 @@
+require('dotenv').config();
 /**
  * v31-fixed
  * Node 18+
