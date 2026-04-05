@@ -2779,15 +2779,14 @@ if (state.step === 'phone') {
     const phone = text.replace(/\s/g, '').trim();
     await sendMessageSafe(msg.chat.id, `📞 Отправляем код на ${phone}...`);
 
-    const { phoneCodeHash } = await gramjsClient.invoke(
-      new (require('telegram/tl/functions/auth').SendCode)({
-        phoneNumber: phone,
+    const result = await gramjsClient.sendCode(
+      {
         apiId: Number(TG_API_ID),
         apiHash: TG_API_HASH,
-        settings: new (require('telegram/tl/types').CodeSettings)({}),
-      })
+      },
+      phone
     );
-    tempPhoneCodeHash = phoneCodeHash;
+    tempPhoneCodeHash = result.phoneCodeHash;
     tgLoginState.set(msg.chat.id, { step: 'code', phone });
     await sendMessageSafe(msg.chat.id, '📨 Код отправлен!\n\nВведи код без пробелов (например: 12345)');
   } catch(e) {
@@ -2797,12 +2796,12 @@ if (state.step === 'phone') {
   }
   return;
 }
-
+    
 if (state.step === 'code') {
   try {
     const code = text.replace(/\s/g, '').trim();
     await gramjsClient.invoke(
-      new (require('telegram/tl/functions/auth').SignIn)({
+      new (require('telegram').Api.auth.SignIn)({
         phoneNumber: state.phone,
         phoneCodeHash: tempPhoneCodeHash,
         phoneCode: code,
@@ -2815,12 +2814,12 @@ if (state.step === 'code') {
     await sendMessageSafe(msg.chat.id, '✅ Авторизован!\n\nПолучаю токен MRKT...');
     const ok = await autoRefreshTokenViaGramjs();
     if (ok) {
-      await sendMessageSafe(msg.chat.id, `✅ Токен MRKT получен!\n${maskToken(MRKT_AUTH_RUNTIME)}\n\nТеперь обновляется автоматически каждые 2 часа.`);
+      await sendMessageSafe(msg.chat.id, `✅ Токен MRKT получен!\n${maskToken(MRKT_AUTH_RUNTIME)}\n\nОбновляется автоматически каждые 2 часа.`);
     } else {
-      await sendMessageSafe(msg.chat.id, '⚠️ Авторизован, но токен MRKT не получен.\nПопробуй /refresh');
+      await sendMessageSafe(msg.chat.id, '⚠️ Авторизован, но токен не получен. Попробуй /refresh');
     }
   } catch(e) {
-    if (e.message && (e.message.includes('2FA') || e.message.includes('PASSWORD') || e.message.toLowerCase().includes('password') || e.errorMessage === 'SESSION_PASSWORD_NEEDED')) {
+    if (e.errorMessage === 'SESSION_PASSWORD_NEEDED' || (e.message && e.message.toLowerCase().includes('password'))) {
       tgLoginState.set(msg.chat.id, { step: 'password', phone: state.phone });
       await sendMessageSafe(msg.chat.id, '🔐 Введи пароль 2FA:');
     } else {
@@ -2830,18 +2829,15 @@ if (state.step === 'code') {
   }
   return;
 }
+    
 if (state.step === 'password') {
   try {
-    await gramjsClient.invoke(
-      new (require('telegram/tl/functions/account').GetPassword)({})
-    );
-    const { srp_id, current_algo, srp_B } = await gramjsClient.invoke(
-      new (require('telegram/tl/functions/account').GetPassword)({})
-    );
-    await gramjsClient.invoke(
-      new (require('telegram/tl/functions/auth').CheckPassword)({
-        password: await (require('telegram/Password')).computeCheck({ srp_id, current_algo, srp_B }, text.trim()),
-      })
+    await gramjsClient.signInWithPassword(
+      { apiId: Number(TG_API_ID), apiHash: TG_API_HASH },
+      {
+        password: async () => text.trim(),
+        onError: (e) => { throw e; },
+      }
     );
     gramjsReady = true;
     const sessionStr = gramjsClient.session.save();
