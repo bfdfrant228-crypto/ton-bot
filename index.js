@@ -2763,7 +2763,7 @@ bot.on('message', async (msg) => {
     const state = tgLoginState.get(msg.chat.id);
     const text = (msg.text || '').trim();
 
-   if (state.step === 'phone') {
+if (state.step === 'phone') {
   try {
     if (!gramjsClient) {
       const savedSession = redis ? (await redisGet(REDIS_KEY_TG_SESSION).catch(() => null)) : null;
@@ -2778,43 +2778,51 @@ bot.on('message', async (msg) => {
     }
     const phone = text.replace(/\s/g, '').trim();
     await sendMessageSafe(msg.chat.id, `📞 Отправляем код на ${phone}...`);
-    const result = await gramjsClient.sendCode(
-      { apiId: Number(TG_API_ID), apiHash: TG_API_HASH },
-      phone
+
+    const { phoneCodeHash } = await gramjsClient.invoke(
+      new (require('telegram/tl/functions/auth').SendCode)({
+        phoneNumber: phone,
+        apiId: Number(TG_API_ID),
+        apiHash: TG_API_HASH,
+        settings: new (require('telegram/tl/types').CodeSettings)({}),
+      })
     );
-    tempPhoneCodeHash = result.phoneCodeHash;
+    tempPhoneCodeHash = phoneCodeHash;
     tgLoginState.set(msg.chat.id, { step: 'code', phone });
-    await sendMessageSafe(msg.chat.id, '📨 Код отправлен! Проверь Telegram или SMS.\n\nВведи код без пробелов (например: 12345)');
+    await sendMessageSafe(msg.chat.id, '📨 Код отправлен!\n\nВведи код без пробелов (например: 12345)');
   } catch(e) {
-    await sendMessageSafe(msg.chat.id, `❌ Ошибка отправки кода: ${e.message}\n\nПроверь номер и попробуй /tglogin снова`);
+    await sendMessageSafe(msg.chat.id, `❌ Ошибка: ${e.message}\n\nПопробуй /tglogin снова`);
     tgLoginState.delete(msg.chat.id);
     gramjsClient = null;
   }
   return;
 }
 
- if (state.step === 'code') {
+if (state.step === 'code') {
   try {
     const code = text.replace(/\s/g, '').trim();
-    await gramjsClient.signIn(
-      { apiId: Number(TG_API_ID), apiHash: TG_API_HASH },
-      { phoneNumber: state.phone, phoneCodeHash: tempPhoneCodeHash, phoneCode: code }
+    await gramjsClient.invoke(
+      new (require('telegram/tl/functions/auth').SignIn)({
+        phoneNumber: state.phone,
+        phoneCodeHash: tempPhoneCodeHash,
+        phoneCode: code,
+      })
     );
     gramjsReady = true;
     const sessionStr = gramjsClient.session.save();
     if (redis && sessionStr) await redisSet(REDIS_KEY_TG_SESSION, sessionStr);
     tgLoginState.delete(msg.chat.id);
-    await sendMessageSafe(msg.chat.id, '✅ Авторизован в Telegram!\n\nПолучаю токен MRKT...');
+    await sendMessageSafe(msg.chat.id, '✅ Авторизован!\n\nПолучаю токен MRKT...');
     const ok = await autoRefreshTokenViaGramjs();
     if (ok) {
-      await sendMessageSafe(msg.chat.id, `✅ Токен MRKT получен автоматически!\n${maskToken(MRKT_AUTH_RUNTIME)}\n\nТеперь токен будет обновляться сам каждые 2 часа.`);
+      await sendMessageSafe(msg.chat.id, `✅ Токен MRKT получен!\n${maskToken(MRKT_AUTH_RUNTIME)}\n\nТеперь обновляется автоматически каждые 2 часа.`);
     } else {
       await sendMessageSafe(msg.chat.id, '⚠️ Авторизован, но токен MRKT не получен.\nПопробуй /refresh');
     }
   } catch(e) {
-    if (e.message && (e.message.includes('2FA') || e.message.includes('PASSWORD') || e.message.toLowerCase().includes('password'))) {
+    if (e.message && (e.message.includes('2FA') || e.message.includes('PASSWORD') || e.message.toLowerCase().includes('password') || e.errorMessage === 'SESSION_PASSWORD_NEEDED')) {
       tgLoginState.set(msg.chat.id, { step: 'password', phone: state.phone });
-      await sendMessageSafe(msg.chat.id, '🔐 Введи пароль двухфакторной аутентификации (2FA):');
+      await sendMessageSafe(msg.chat.id, '🔐 Введи пароль 2FA:');
     } else {
       await sendMessageSafe(msg.chat.id, `❌ Ошибка: ${e.message}\n\nПопробуй /tglogin снова`);
       tgLoginState.delete(msg.chat.id);
@@ -2822,30 +2830,36 @@ bot.on('message', async (msg) => {
   }
   return;
 }
-
-    if (state.step === 'password') {
-      try {
-        await gramjsClient.signInWithPassword({ apiId: TG_API_ID, apiHash: TG_API_HASH }, { password: text });
-        gramjsReady = true;
-
-        const sessionStr = gramjsClient.session.save();
-        if (redis) await redisSet(REDIS_KEY_TG_SESSION, sessionStr);
-
-        tgLoginState.delete(msg.chat.id);
-        await sendMessageSafe(msg.chat.id, '✅ Авторизован! Получаю токен MRKT...');
-
-        const ok = await autoRefreshTokenViaGramjs();
-        if (ok) {
-          await sendMessageSafe(msg.chat.id, `✅ Токен MRKT получен!\n${maskToken(MRKT_AUTH_RUNTIME)}`);
-        } else {
-          await sendMessageSafe(msg.chat.id, '⚠️ Авторизован но не удалось получить токен. Попробуй /refresh');
-        }
-      } catch(e) {
-        await sendMessageSafe(msg.chat.id, `❌ Ошибка: ${e.message}`);
-        tgLoginState.delete(msg.chat.id);
-      }
-      return;
+if (state.step === 'password') {
+  try {
+    await gramjsClient.invoke(
+      new (require('telegram/tl/functions/account').GetPassword)({})
+    );
+    const { srp_id, current_algo, srp_B } = await gramjsClient.invoke(
+      new (require('telegram/tl/functions/account').GetPassword)({})
+    );
+    await gramjsClient.invoke(
+      new (require('telegram/tl/functions/auth').CheckPassword)({
+        password: await (require('telegram/Password')).computeCheck({ srp_id, current_algo, srp_B }, text.trim()),
+      })
+    );
+    gramjsReady = true;
+    const sessionStr = gramjsClient.session.save();
+    if (redis && sessionStr) await redisSet(REDIS_KEY_TG_SESSION, sessionStr);
+    tgLoginState.delete(msg.chat.id);
+    await sendMessageSafe(msg.chat.id, '✅ Авторизован через 2FA!\n\nПолучаю токен MRKT...');
+    const ok = await autoRefreshTokenViaGramjs();
+    if (ok) {
+      await sendMessageSafe(msg.chat.id, `✅ Токен MRKT получен!\n${maskToken(MRKT_AUTH_RUNTIME)}`);
+    } else {
+      await sendMessageSafe(msg.chat.id, '⚠️ Авторизован, но попробуй /refresh');
     }
+  } catch(e) {
+    await sendMessageSafe(msg.chat.id, `❌ Ошибка 2FA: ${e.message}\n\nПопробуй /tglogin снова`);
+    tgLoginState.delete(msg.chat.id);
+  }
+  return;
+}
   }
 
   const u = getOrCreateUser(userId);
