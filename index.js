@@ -849,14 +849,19 @@ async function gramjsGetMrktToken() {
         'Content-Type': 'application/json',
         'Origin': 'https://cdn.tgmrkt.io',
         'Referer': 'https://cdn.tgmrkt.io/',
-        'User-Agent': 'Mozilla/5.0',
+        'User-Agent': 'TelegramBot (gramjs)',
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        ...(MRKT_AUTH_RUNTIME ? { 'Authorization': MRKT_AUTH_RUNTIME } : {}),
       },
-     body: JSON.stringify({
+      body: JSON.stringify({
         appId: null,
         data: tgWebAppData,
         photo: null,
       }),
     }, 15000);
+
+    console.log('[GRAMJS] MRKT auth запрос отправлен, data начало=' + tgWebAppData.slice(0, 60));
 
     const txt = await authRes.text();
     let data = null;
