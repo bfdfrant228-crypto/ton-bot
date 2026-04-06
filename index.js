@@ -789,18 +789,19 @@ async function initGramjs() {
 
 async function gramjsGetMrktToken() {
   if (!gramjsClient || !gramjsReady) return null;
-
   try {
     console.log('[GRAMJS] Получаем токен MRKT через mini app...');
+    const { Api } = require('telegram');
 
-    // Запрашиваем initData от MRKT mini app
+    const botEntity = await gramjsClient.getInputEntity('mrkt');
+
     const result = await gramjsClient.invoke(
-      new (require('telegram/tl').functions.messages.RequestWebViewClass)({
-        peer: await gramjsClient.getInputEntity(MRKT_BOT_USERNAME),
-        bot: await gramjsClient.getInputEntity(MRKT_BOT_USERNAME),
+      new Api.messages.RequestWebView({
+        peer: botEntity,
+        bot: botEntity,
         fromBotMenu: false,
         url: 'https://cdn.tgmrkt.io/',
-        startParam: '',
+        platform: 'android',
       })
     );
 
@@ -809,7 +810,6 @@ async function gramjsGetMrktToken() {
       return null;
     }
 
-    // Извлекаем tgWebAppData из URL
     const urlObj = new URL(result.url);
     const fragment = urlObj.hash.replace('#', '');
     const params = new URLSearchParams(fragment);
@@ -822,7 +822,6 @@ async function gramjsGetMrktToken() {
 
     console.log('[GRAMJS] Получили initData, запрашиваем токен MRKT...');
 
-    // Получаем токен от MRKT
     const authRes = await fetchWithTimeout(`${MRKT_API_URL}/auth`, {
       method: 'POST',
       headers: {
@@ -833,7 +832,7 @@ async function gramjsGetMrktToken() {
       },
       body: JSON.stringify({
         appId: null,
-        data: tgWebAppData,
+        data: decodeURIComponent(tgWebAppData),
         photo: null,
       }),
     }, 15000);
@@ -849,7 +848,6 @@ async function gramjsGetMrktToken() {
 
     console.log('[GRAMJS] Токен MRKT получен успешно!', maskToken(data.token));
 
-    // Сохраняем сессию gramjs в Redis
     if (redis) {
       const newSession = gramjsClient.session.save();
       if (newSession) await redisSet(REDIS_KEY_TG_SESSION, newSession);
