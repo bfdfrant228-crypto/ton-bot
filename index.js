@@ -791,14 +791,24 @@ async function gramjsGetMrktToken() {
   if (!gramjsClient || !gramjsReady) return null;
   try {
     console.log('[GRAMJS] Получаем токен MRKT через mini app...');
-    const { Api } = require('telegram');
 
-    const botEntity = await gramjsClient.getInputEntity('mrkt');
+    // Сначала находим бота по ID (надёжнее чем по username)
+    const botPeer = await gramjsClient.getInputEntity('MRKTbot').catch(async () => {
+      return await gramjsClient.getInputEntity('mrktbot').catch(async () => {
+        return await gramjsClient.getInputEntity(6372914421).catch(() => null);
+      });
+    });
 
+    if (!botPeer) {
+      console.error('[GRAMJS] Не удалось найти MRKT бота');
+      return null;
+    }
+
+    const tl = require('telegram/tl');
     const result = await gramjsClient.invoke(
-      new Api.messages.RequestWebView({
-        peer: botEntity,
-        bot: botEntity,
+      new tl.functions.messages.RequestWebView({
+        peer: botPeer,
+        bot: botPeer,
         fromBotMenu: false,
         url: 'https://cdn.tgmrkt.io/',
         platform: 'android',
