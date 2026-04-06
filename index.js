@@ -827,11 +827,12 @@ async function gramjsGetMrktToken() {
     const params = new URLSearchParams(fragment);
     
     // Пробуем все варианты ключей
-   const rawData = params.get('tgWebAppData') || 
+  const rawData = params.get('tgWebAppData') || 
       params.get('tgWebAppInitData') ||
       params.get('initData') || 
       '';
-    const tgWebAppData = rawData ? decodeURIComponent(rawData) : '';
+    // Не декодируем — передаём как есть (URL-encoded)
+    const tgWebAppData = rawData;
 
     console.log('[GRAMJS] tgWebAppData длина=' + tgWebAppData.length);
 
