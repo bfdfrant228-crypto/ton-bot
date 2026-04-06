@@ -804,9 +804,9 @@ async function gramjsGetMrktToken() {
       return null;
     }
 
-    const tl = require('telegram/tl');
+    const { Api } = require('telegram');
     const result = await gramjsClient.invoke(
-      new tl.functions.messages.RequestWebView({
+      new Api.messages.RequestWebView({
         peer: botPeer,
         bot: botPeer,
         fromBotMenu: false,
