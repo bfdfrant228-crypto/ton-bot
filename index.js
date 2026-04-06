@@ -830,8 +830,9 @@ async function gramjsGetMrktToken() {
       return null;
     }
 
-    console.log('[GRAMJS] Получили initData, запрашиваем токен MRKT...');
-
+   console.log('[GRAMJS] Получили initData длина=' + tgWebAppData.length + ' начало=' + tgWebAppData.slice(0, 80));
+    console.log('[GRAMJS] Запрашиваем токен MRKT...');
+    
     const authRes = await fetchWithTimeout(`${MRKT_API_URL}/auth`, {
       method: 'POST',
       headers: {
