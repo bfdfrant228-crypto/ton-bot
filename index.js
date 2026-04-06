@@ -840,9 +840,9 @@ async function gramjsGetMrktToken() {
         'Referer': 'https://cdn.tgmrkt.io/',
         'User-Agent': 'Mozilla/5.0',
       },
-      body: JSON.stringify({
+     body: JSON.stringify({
         appId: null,
-        data: decodeURIComponent(tgWebAppData),
+        data: tgWebAppData,
         photo: null,
       }),
     }, 15000);
