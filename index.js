@@ -816,17 +816,27 @@ async function gramjsGetMrktToken() {
     );
 
     if (!result || !result.url) {
-      console.error('[GRAMJS] Нет URL в ответе');
+      console.error('[GRAMJS] Нет URL в ответе, result=', JSON.stringify(result).slice(0, 200));
       return null;
     }
+
+    console.log('[GRAMJS] URL получен:', result.url.slice(0, 150));
 
     const urlObj = new URL(result.url);
     const fragment = urlObj.hash.replace('#', '');
     const params = new URLSearchParams(fragment);
-    const tgWebAppData = params.get('tgWebAppData') || params.get('tgWebAppInitData') || '';
+    
+    // Пробуем все варианты ключей
+    const tgWebAppData = 
+      params.get('tgWebAppData') || 
+      params.get('tgWebAppInitData') ||
+      params.get('initData') || 
+      '';
+
+    console.log('[GRAMJS] tgWebAppData длина=' + tgWebAppData.length);
 
     if (!tgWebAppData) {
-      console.error('[GRAMJS] Нет tgWebAppData в URL:', result.url.slice(0, 100));
+      console.error('[GRAMJS] Нет tgWebAppData. Все params:', fragment.slice(0, 200));
       return null;
     }
 
