@@ -1,0 +1,23 @@
+name: Refresh MRKT Token
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      - run: npm install telegram
+      - run: node .github/workflows/refresh-token.js
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          SERVER_URL: https://tonnftbot.duckdns.org
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
