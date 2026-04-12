@@ -842,6 +842,7 @@ async function gramjsGetMrktToken() {
     }
 
    console.log('[GRAMJS] Получили initData длина=' + tgWebAppData.length + ' начало=' + tgWebAppData.slice(0, 80));
+   console.log('[GRAMJS] Полный initData:', tgWebAppData);
     console.log('[GRAMJS] Запрашиваем токен MRKT...');
     
   const authRes = await fetchWithTimeout('https://gentle-field-b4bc.bfdfrantishek.workers.dev/', {
