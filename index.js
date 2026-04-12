@@ -4346,6 +4346,20 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '4mb' }));
 
 app.get('/health', (req, res) => res.status(200).send('ok'));
+app.post('/api/admin/update-token', async (req, res) => {
+  const secret = req.headers['x-admin-secret'];
+  if (secret !== process.env.ADMIN_SECRET) return res.status(403).json({ ok: false });
+  const token = req.body && req.body.token;
+  if (!token) return res.status(400).json({ ok: false, reason: 'NO_TOKEN' });
+  MRKT_AUTH_RUNTIME = String(token).trim();
+  lastSuccessfulTokenAt = Date.now();
+  if (redis) await redisSet(REDIS_KEY_MRKT_AUTH, MRKT_AUTH_RUNTIME);
+  collectionsCache = { time: 0, items: [] };
+  lotsCache.clear();
+  salesCache.clear();
+  console.log('[UPDATE TOKEN] Токен обновлён через GitHub Actions:', maskToken(MRKT_AUTH_RUNTIME));
+  res.json({ ok: true, tokenMask: maskToken(MRKT_AUTH_RUNTIME) });
+});
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 function auth(req, res, next) {
