@@ -4360,6 +4360,46 @@ app.post('/api/admin/update-token', async (req, res) => {
   console.log('[UPDATE TOKEN] Токен обновлён через GitHub Actions:', maskToken(MRKT_AUTH_RUNTIME));
   res.json({ ok: true, tokenMask: maskToken(MRKT_AUTH_RUNTIME) });
 });
+app.post('/api/admin/refresh-via-initdata', async (req, res) => {
+  const secret = req.headers['x-admin-secret'];
+  if (secret !== process.env.ADMIN_SECRET) return res.status(403).json({ ok: false });
+  const initData = req.body && req.body.initData;
+  if (!initData) return res.status(400).json({ ok: false, reason: 'NO_INIT_DATA' });
+  
+  try {
+    const authRes = await fetchWithTimeout(`${MRKT_API_URL}/auth`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Origin': 'https://cdn.tgmrkt.io',
+        'Referer': 'https://cdn.tgmrkt.io/',
+        'User-Agent': 'Mozilla/5.0',
+      },
+      body: JSON.stringify({ appId: null, data: initData, photo: null }),
+    }, 15000);
+    
+    const txt = await authRes.text();
+    let data = null;
+    try { data = JSON.parse(txt); } catch {}
+    
+    if (!authRes.ok || !data?.token) {
+      console.error('[REFRESH VIA INITDATA] MRKT error:', authRes.status, txt.slice(0, 200));
+      return res.json({ ok: false, reason: `MRKT_${authRes.status}`, text: txt.slice(0, 200) });
+    }
+    
+    MRKT_AUTH_RUNTIME = String(data.token).trim();
+    lastSuccessfulTokenAt = Date.now();
+    if (redis) await redisSet(REDIS_KEY_MRKT_AUTH, MRKT_AUTH_RUNTIME);
+    collectionsCache = { time: 0, items: [] };
+    lotsCache.clear();
+    salesCache.clear();
+    
+    console.log('[REFRESH VIA INITDATA] Токен обновлён:', maskToken(MRKT_AUTH_RUNTIME));
+    res.json({ ok: true, tokenMask: maskToken(MRKT_AUTH_RUNTIME) });
+  } catch(e) {
+    res.status(500).json({ ok: false, reason: e.message });
+  }
+});
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 function auth(req, res, next) {
