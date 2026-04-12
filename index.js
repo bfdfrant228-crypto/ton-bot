@@ -844,16 +844,10 @@ async function gramjsGetMrktToken() {
    console.log('[GRAMJS] Получили initData длина=' + tgWebAppData.length + ' начало=' + tgWebAppData.slice(0, 80));
     console.log('[GRAMJS] Запрашиваем токен MRKT...');
     
-    const authRes = await fetchWithTimeout(`${MRKT_API_URL}/auth`, {
+  const authRes = await fetchWithTimeout('https://gentle-field-b4bc.bfdfrantishek.workers.dev/', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Origin': 'https://cdn.tgmrkt.io',
-        'Referer': 'https://cdn.tgmrkt.io/',
-        'User-Agent': 'TelegramBot (gramjs)',
-        'Accept': 'application/json',
-        'X-Requested-With': 'XMLHttpRequest',
-        ...(MRKT_AUTH_RUNTIME ? { 'Authorization': MRKT_AUTH_RUNTIME } : {}),
       },
       body: JSON.stringify({
         appId: null,
