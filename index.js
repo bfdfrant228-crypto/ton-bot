@@ -805,15 +805,28 @@ async function gramjsGetMrktToken() {
     }
 
     const { Api } = require('telegram');
-    const result = await gramjsClient.invoke(
-      new Api.messages.RequestWebView({
+   const result = await gramjsClient.invoke(
+      new Api.messages.RequestAppWebView({
         peer: botPeer,
-        bot: botPeer,
-        fromBotMenu: false,
-        url: 'https://cdn.tgmrkt.io/',
+        app: new Api.InputBotAppShortName({
+          botId: botPeer,
+          shortName: 'app',
+        }),
         platform: 'android',
+        startParam: '',
       })
-    );
+    ).catch(async () => {
+      // Fallback на RequestWebView
+      return await gramjsClient.invoke(
+        new Api.messages.RequestWebView({
+          peer: botPeer,
+          bot: botPeer,
+          fromBotMenu: false,
+          url: 'https://cdn.tgmrkt.io/',
+          platform: 'android',
+        })
+      );
+    });
 
     if (!result || !result.url) {
       console.error('[GRAMJS] Нет URL в ответе, result=', JSON.stringify(result).slice(0, 200));
